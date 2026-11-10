@@ -68,6 +68,8 @@ WHAT EACH TEST PINS:
       id another's: a reused symbol) stays stopped with a plain ENTERED. c is stopped and resumed by an operator on
       another connection between the pass's read and its guarded UPDATE: the UPDATE matches nothing on READ
       COMMITTED, c's ENTERED is plain and the operator's row stands.
+  PM10 include_otc (ADR tj-ed4t8m, validator tj-7zjov1.364.4, WRITTEN NOT YET RUN): off exits and stops the OTC member
+      only (PANEL_MEMBER_LEFT, RETIRED); on again restarts it (dataset_resumed, RESUMED), no new request.
 
   The PM1 and PM3 idle_in_transaction checks carry a positive control (tj-7zjov1.262 change (A)): at each clamp at
   least one connection is listed under the engine's application_name, so their zero is not vacuous.
@@ -257,6 +259,8 @@ class Asset:
     vendor_asset_id: str
     symbol: str
     tradable: bool = True
+    # The snapshot row's exchange; 'OTC' is the value include_otc governs (ADR tj-ed4t8m D3).
+    exchange: str = 'NYSE'
 
 
 @dataclass(frozen=True)
@@ -715,12 +719,12 @@ class World:
         async with self.engine.connect() as conn:
             return (await conn.execute(sa.select(sa.func.clock_timestamp()))).scalar_one()
 
-    def asset(self, letter: str, *, tradable: bool = True) -> Asset:
+    def asset(self, letter: str, *, tradable: bool = True, exchange: str = 'NYSE') -> Asset:
         symbol = f'{self.base_symbol}{letter}'
         vendor = f'pm-{self.run_id}-{letter}-{uuid.uuid4().hex[:8]}'
         self.written.symbols.append(symbol)
         self.vendor_of[symbol] = vendor
-        return Asset(vendor, symbol, tradable)
+        return Asset(vendor, symbol, tradable, exchange)
 
     async def source_settings(self, *, ramp: int, cap: int) -> uuid.UUID:
         async with AsyncSession(self.engine, expire_on_commit=False) as db:
@@ -754,8 +758,8 @@ class World:
         self.panel_ids.add(record.id)
         return PanelUnderTest(record.id, version.id, record.created_at, settings)
 
-    async def new_version(self, panel: PanelUnderTest, members: list[Asset]) -> uuid.UUID:
-        settings = replace(panel.settings, allow_symbols=tuple(asset.symbol for asset in members))
+    async def new_version(self, panel: PanelUnderTest, members: list[Asset], **changes: Any) -> uuid.UUID:
+        settings = replace(panel.settings, allow_symbols=tuple(asset.symbol for asset in members), **changes)
         async with AsyncSession(self.engine, expire_on_commit=False) as db:
             version = await append_settings_version(
                 db, panel_id=panel.id, settings=settings, actor='operator', reason='panel manager system test change'
@@ -789,7 +793,7 @@ class World:
                         vendor_asset_id=asset.vendor_asset_id,
                         symbol=asset.symbol,
                         name=asset.symbol,
-                        exchange='NYSE',
+                        exchange=asset.exchange,
                         active=status is AssetListStatus.ACTIVE,
                         tradable=asset.tradable,
                         raw_payload=b'{}',
@@ -1418,3 +1422,54 @@ async def test_pm9_a_re_entry_restarts_a_manager_stopped_entry_in_the_commit_of_
     assert after[a.symbol].updated_at > stopped[a.symbol].updated_at
     # A restart writes no request: the gap is the DAILY refresh's.
     assert len(world.requests(a, b, c, kind=IngestRequestKind.BARS)) == 3
+
+
+# --------------------------------------------------------------------------------------------- PM10 include_otc
+
+
+async def test_pm10_include_otc_off_exits_and_stops_the_otc_member_and_on_restarts_it(world):
+    """ADR tj-ed4t8m D3/D5 on asyncpg (validator tj-7zjov1.364.4).
+
+    WRITTEN, NOT YET RUN: the Postgres window is tj-7zjov1.364.7, on a test database dropped and migrated again, since
+    the baseline was edited in place. The include_otc column round-trips through create_panel and append_settings_version on the real schema; turning it
+    off is a filter exit of the OTC member only (its entry stopped PANEL_MEMBER_LEFT, RETIRED); turning it on again
+    re-enters it with dataset_resumed and RESUMED, and writes no request.
+    """
+    a, o = world.asset('A'), world.asset('O', exchange='OTC')
+    await world.source_settings(ramp=10, cap=100)
+    panel = await world.panel('pm10', [a, o], include_otc=True)
+    await world.snapshot([a, o])
+    await world.tick()
+
+    assert [t for _, t in _kinds(world.transitions(panel))].count(PanelTransition.CREATED) == 2
+    await world.deliver_bars()
+    ids = {symbol: entry.id for symbol, entry in world.entries(a, o).items()}
+
+    await world.new_version(panel, [a, o], include_otc=False)
+    await world.next_membership_pass([panel], [a, o])
+    await world.tick()
+
+    assert _kinds(world.transitions(panel))[-1] == (o.symbol, PanelTransition.EXITED)
+    stopped = world.entries(a, o)
+    assert (stopped[o.symbol].collect, stopped[o.symbol].stopped_cause) == (False, LEFT)
+    assert (stopped[a.symbol].collect, stopped[a.symbol].stopped_cause) == (True, None)
+    assert world.published == [DatasetChanged(ids[o.symbol], DatasetChange.RETIRED)]
+
+    await world.new_version(panel, [a, o], include_otc=True)
+    await world.next_membership_pass([panel], [a, o])
+    await world.tick()
+
+    last = world.transitions(panel)[-1]
+    assert (last.symbol, last.transition, last.dataset_id, last.cause) == (
+        o.symbol,
+        PanelTransition.ENTERED,
+        ids[o.symbol],
+        panel_manager.CAUSE_DATASET_RESUMED,
+    )
+    resumed = world.entries(o)[o.symbol]
+    assert (resumed.collect, resumed.stopped_cause) == (True, None)
+    assert world.published == [
+        DatasetChanged(ids[o.symbol], DatasetChange.RETIRED),
+        DatasetChanged(ids[o.symbol], DatasetChange.RESUMED),
+    ]
+    assert len(world.requests(a, o, kind=IngestRequestKind.BARS)) == 2

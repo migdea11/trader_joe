@@ -232,6 +232,7 @@ def _seed_ledger(
         version_no=1,
         enabled=False,  # never a pass of the stack's own panel loop
         cadence=PanelCadence.DAILY,
+        include_otc=False,  # NOT NULL with no database default (ADR tj-ed4t8m D1)
         actor='operator',
         reason='dev seed export system test panel',
     )

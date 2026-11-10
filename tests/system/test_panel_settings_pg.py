@@ -31,6 +31,10 @@ no arrays and no Postgres enums:
       constraint; a value above int32 is refused by the int4 column; a no-limit version round-trips NULL on asyncpg.
       WRITTEN, NOT YET RUN (validator tj-7zjov1.363.4): the test-stack window bead tj-7zjov1.363.7 runs them, on a
       test database dropped and migrated again (a database already at 5d9a3c7e1b84 keeps the old schema);
+  PS12 (ADR tj-ed4t8m D1/D2/D4) include_otc on the real schema: the LAST column, boolean NOT NULL with no default; a raw
+      row without it refused; the crud default false and a true round-trip on asyncpg; the contradiction (false with
+      exchange OTC) refused with nothing written. WRITTEN, NOT YET RUN (validator tj-7zjov1.364.4): the window bead
+      tj-7zjov1.364.7 runs them on a test database dropped and migrated again;
   PS6 enabled_panels_on_source compiles and runs on Postgres (its correlated latest-version subquery);
   PS5 POST /store with the body owner 'panel' on the running data_store: 422 INVALID_REQUEST with the exact message,
       and no ingest_request row written for it.
@@ -267,6 +271,81 @@ async def test_a_version_with_no_reason_is_stored_null_on_postgres_and_a_blank_o
             conn.execute(
                 sa.update(SETTINGS).where(SETTINGS.c.id == version.id).values(reason=blank)
             )  # a test-only write: the CHECK, not the module, refuses it
+
+
+# --------------------------------------------------------------------------------------------- PS12 include_otc
+# ADR tj-ed4t8m D1/D2/D4 (validator tj-7zjov1.364.4). WRITTEN, NOT YET RUN: the Postgres window tj-7zjov1.364.7 runs
+# them on a test database dropped and migrated again (the baseline was edited in place; a database already at
+# 5d9a3c7e1b84 lacks the column).
+
+
+def test_include_otc_is_the_last_column_boolean_not_null_with_no_default_on_postgres(pg_engine):
+    with pg_engine.connect() as conn:
+        columns = conn.execute(
+            sa.text(
+                'SELECT column_name, data_type, is_nullable, column_default FROM information_schema.columns '
+                "WHERE table_schema = current_schema() AND table_name = 'panel_settings_version' "
+                'ORDER BY ordinal_position'
+            )
+        ).all()
+    assert columns[-1] == ('include_otc', 'boolean', 'NO', None), columns
+
+
+def test_a_raw_settings_row_without_include_otc_is_refused_by_postgres(pg_engine, panel):
+    """No schema default: a writer that forgets the column fails loudly (D1), the crud is the one place it is set."""
+    record, _, _ = panel
+    with pg_engine.connect() as conn, pytest.raises(sa.exc.IntegrityError) as raised:
+        conn.execute(
+            SETTINGS.insert().values(
+                panel_id=record.id, version_no=99, enabled=True, cadence=PanelCadence.DAILY, actor='operator'
+            )
+        )  # a test-only write, rolled back with the connection
+    assert 'include_otc' in str(raised.value)
+
+
+@pytest.mark.asyncio
+async def test_include_otc_defaults_false_and_a_true_round_trips_on_asyncpg(pg_async_engine, pg_engine, panel):
+    record, version_1, _ = panel
+    assert version_1.settings.include_otc is False
+    async with AsyncSession(pg_async_engine, expire_on_commit=False) as db:
+        version_2 = await append_settings_version(
+            db,
+            panel_id=record.id,
+            settings=PanelSettings(enabled=True, cadence=PanelCadence.DAILY, include_otc=True),
+            actor='operator',
+            reason='include otc',
+        )
+    async with AsyncSession(pg_async_engine) as db:
+        stored = await current_settings(db, record.id)
+    assert stored == version_2 and stored.settings.include_otc is True
+    with pg_engine.connect() as conn:
+        rows = conn.execute(
+            sa.select(SETTINGS.c.version_no, SETTINGS.c.include_otc)
+            .where(SETTINGS.c.panel_id == record.id)
+            .order_by(SETTINGS.c.version_no)
+        ).all()
+    assert [tuple(row) for row in rows] == [(1, False), (2, True)]
+
+
+@pytest.mark.asyncio
+async def test_the_otc_contradiction_is_refused_and_writes_nothing_on_postgres(pg_async_engine, pg_engine, panel):
+    record, _, _ = panel
+    contradiction = PanelSettings(enabled=True, cadence=PanelCadence.DAILY, exchange='OTC', include_otc=False)
+
+    def count() -> int:
+        with pg_engine.connect() as conn:
+            return conn.execute(
+                sa.select(sa.func.count()).select_from(SETTINGS).where(SETTINGS.c.panel_id == record.id)
+            ).scalar_one()
+
+    before = count()
+    async with AsyncSession(pg_async_engine, expire_on_commit=False) as db:
+        with pytest.raises(InvalidRequestError) as raised:
+            await append_settings_version(
+                db, panel_id=record.id, settings=contradiction, actor='operator', reason='contradiction'
+            )
+    assert raised.value.reason is Reason.INVALID_REQUEST
+    assert count() == before
 
 
 # --------------------------------------------------------------------------------------------- PS7 the source guard

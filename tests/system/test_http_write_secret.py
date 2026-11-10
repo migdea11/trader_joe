@@ -324,6 +324,7 @@ def seeded_panel(pg_engine: Engine, run_identity) -> Iterator[SeededPanel]:
                     version_no=1,
                     enabled=False,
                     cadence=PanelCadence.MONTHLY,
+                    include_otc=False,  # NOT NULL with no database default (ADR tj-ed4t8m D1)
                     actor='operator',
                     reason=reason,
                 )

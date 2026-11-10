@@ -115,6 +115,8 @@ export interface PanelDraft {
   exchange: string
   active: Tri
   tradable: Tri
+  /** Off by default: OTC securities are not selected by the panel. */
+  includeOtc: boolean
 }
 
 export function emptyDraft(): PanelDraft {
@@ -127,6 +129,7 @@ export function emptyDraft(): PanelDraft {
     exchange: '',
     active: '',
     tradable: '',
+    includeOtc: false,
   }
 }
 
@@ -142,6 +145,7 @@ export function draftFromSettings(settings: PanelSettings): PanelDraft {
     exchange: settings.exchange ?? '',
     active: triOf(settings.active),
     tradable: triOf(settings.tradable),
+    includeOtc: settings.includeOtc,
   }
 }
 
@@ -181,6 +185,8 @@ export function settingsInitWithEnabled(saved: PanelSettings, enabled: boolean):
     cadence: saved.cadence,
     allowSymbols: [...saved.allowSymbols],
     denySymbols: [...saved.denySymbols],
+    // A plain bool left out reads as false, so Enable and Disable copy it or they would turn OTC off.
+    includeOtc: saved.includeOtc,
   }
   if (saved.assetClass !== undefined) init.assetClass = saved.assetClass
   if (saved.exchange !== undefined) init.exchange = saved.exchange
@@ -204,6 +210,7 @@ export function draftToSettingsInit(draft: PanelDraft): SettingsInit {
     exchange: exchange === '' ? undefined : exchange,
     active: boolOf(draft.active),
     tradable: boolOf(draft.tradable),
+    includeOtc: draft.includeOtc,
   }
 }
 

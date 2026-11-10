@@ -282,6 +282,7 @@ describe('PanelListView', () => {
       exchange: undefined,
       active: undefined,
       tradable: undefined,
+      includeOtc: false,
       reason: 'pause',
     })
     expect(api.getPanel).toHaveBeenCalledWith(A, expect.any(AbortSignal))

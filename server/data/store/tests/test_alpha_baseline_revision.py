@@ -225,6 +225,30 @@ def test_the_baseline_file_states_it_was_edited_in_place_for_the_rates():
     assert BASELINE_REVISION == '5d9a3c7e1b84'
 
 
+def test_include_otc_is_the_last_settings_column_not_null_boolean_with_no_server_default(recorded):
+    """ADR tj-ed4t8m D1, edited IN PLACE: the baseline declares the column LAST, as the model does.
+
+    The table comparison below matches columns by name, so it is blind to order; the order is pinned here, baseline and
+    model alike, because D1 rules it (the order an ADD COLUMN would give, D7 option B).
+    """
+    built = recorded.metadata.tables[PanelSettingsVersion.__tablename__]
+    declared = PanelSettingsVersion.__table__
+    assert list(built.c.keys()) == list(declared.c.keys())
+    assert list(built.c.keys())[-1] == 'include_otc', list(built.c.keys())
+    column = built.c.include_otc
+    assert isinstance(column.type, sa.Boolean), column.type
+    assert column.nullable is False
+    assert column.server_default is None and _default(column) is None
+    assert not [c for c in built.constraints if isinstance(c, sa.CheckConstraint) and 'include_otc' in str(c.sqltext)]
+
+
+def test_the_baseline_file_states_it_was_edited_in_place_for_include_otc():
+    """The second in-place edit says so too, naming its record, and that a database at the id lacks the column."""
+    text = ' '.join(BASELINE_FILE.read_text().split())
+    assert 'EDITED IN PLACE (2026-11-10, ADR tj-ed4t8m D7)' in text
+    assert 'lacks the column: drop it and migrate again' in text
+
+
 def test_the_entry_id_has_no_unique_beside_its_primary_key(recorded):
     """The redundant single-column UNIQUE on store_dataset_entry.id is not carried (no model declares it)."""
     entry = recorded.metadata.tables[StoreDatasetEntry.__tablename__]

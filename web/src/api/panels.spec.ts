@@ -327,6 +327,32 @@ describe('the three writes: POST on their ruled path with a canonical JSON body'
     expect(version.versionNo).toBe(2)
   })
 
+  // tj-7zjov1.364.5 (ADR tj-ed4t8m D1, D6): include_otc is a plain proto3 bool (implicit presence), so canonical
+  // JSON leaves a false out and the store reads the absence as false (off). A true is sent as includeOtc: true.
+  it.each([
+    ['W1 createPanel', () => createPanel({ name: 'n', source: DataSource.IB_API, includeOtc: true }), () => createPanel({ name: 'n', source: DataSource.IB_API, includeOtc: false })],
+    [
+      'W2 savePanelSettings',
+      () => savePanelSettings(PANEL_ID, { enabled: true, cadence: PanelCadence.DAILY, includeOtc: true }),
+      () => savePanelSettings(PANEL_ID, { enabled: true, cadence: PanelCadence.DAILY, includeOtc: false }),
+    ],
+  ])('%s: includeOtc true is in the body as true; false is absent from the body', async (_label, sendTrue, sendFalse) => {
+    fetchMock.mockImplementation(async () => jsonResponse(DETAIL_JSON, 201))
+    await sendTrue()
+    expect((sentBody(0) as Record<string, unknown>).includeOtc).toBe(true)
+    await sendFalse()
+    expect(sentBody(1)).not.toHaveProperty('includeOtc')
+  })
+
+  it('a read of settings without includeOtc decodes false; with includeOtc true decodes true', async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse(DETAIL_JSON))
+    expect((await getPanel(PANEL_ID)).currentVersion!.settings!.includeOtc).toBe(false)
+    fetchMock.mockResolvedValueOnce(
+      jsonResponse({ ...DETAIL_JSON, currentVersion: { ...DETAIL_JSON.currentVersion, settings: { ...DETAIL_JSON.currentVersion.settings, includeOtc: true } } }),
+    )
+    expect((await getPanel(PANEL_ID)).currentVersion!.settings!.includeOtc).toBe(true)
+  })
+
   // tj-7zjov1.362.4 (ADR tj-46jkey section 2): reason is an implicit-presence proto3 string, so the blank
   // reason the forms pass ('') is the field's default and canonical JSON leaves it out; the store reads an
   // absent reason as none given. Each write still posts.

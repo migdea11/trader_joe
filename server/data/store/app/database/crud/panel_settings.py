@@ -15,7 +15,9 @@ NO FALLBACK NUMBERS. The two hourly rates are optional and None means NO LIMIT (
 refused. current_source_settings still answers None for a source with no version, but create_panel now ALWAYS writes a
 source's first version (from the source settings it is given, else no limits and the 90-day window), so every panel's
 source has one. The only defaults named are DEFAULT_PANEL_CADENCE (MONTHLY, applied by create_panel when the caller
-names no cadence) and the 90-day corporate-action window on both sides. A panel has no size: it selects every asset its
+names no cadence), DEFAULT_INCLUDE_OTC (False: a settings value that does not name include_otc is off, the schema
+column has no default; owner ruling 2026-11-10) and the 90-day corporate-action window on both sides. OTC_EXCHANGES
+({'OTC'}) names the exchange values the include_otc setting governs. A panel has no size: it selects every asset its
 filters match.
 
 Each write commits on its own, through write_transaction, on the session the caller hands in.
@@ -45,6 +47,10 @@ from data.store.app.database.transaction import write_transaction
 
 # The cadence create_panel applies when the caller names none (owner ruling 2026-10-27 (c)). The schema carries no default.
 DEFAULT_PANEL_CADENCE: Final = PanelCadence.MONTHLY
+# Whether a panel selects OTC assets when no value is stated: no (owner ruling 2026-11-10). The schema carries no default.
+DEFAULT_INCLUDE_OTC: Final = False
+# The exchange values include_otc governs: an asset on one is selected only when include_otc is true.
+OTC_EXCHANGES: Final = frozenset({'OTC'})
 
 # The smallest ramp, 1: one creation an hour is a real limit.
 MIN_RAMP_DATASETS_PER_HOUR: Final = 1
@@ -66,7 +72,8 @@ class PanelSettings:
 
     cadence None means 'not named': create_panel applies DEFAULT_PANEL_CADENCE, append_settings_version refuses it
     (a new version states its cadence in full). The filters restrict nothing at their neutral value: an empty
-    allow_symbols, and None for asset_class, exchange, active and tradable.
+    allow_symbols, and None for asset_class, exchange, active and tradable. include_otc is False when not stated and
+    excludes OTC assets; False together with an exchange filter naming an OTC exchange is a contradiction and refused.
     """
 
     enabled: bool
@@ -77,6 +84,7 @@ class PanelSettings:
     exchange: str | None = None
     active: bool | None = None
     tradable: bool | None = None
+    include_otc: bool = DEFAULT_INCLUDE_OTC
 
 
 @dataclass(frozen=True)
@@ -155,6 +163,11 @@ def _marker(actor: str, reason: str | None) -> tuple[str, str | None]:
 def _check_panel_settings(settings: PanelSettings, cadence: PanelCadence | None) -> PanelCadence:
     if cadence is None:
         raise _refuse('A settings version needs a cadence.')
+    if not settings.include_otc and settings.exchange in OTC_EXCHANGES:
+        raise _refuse(
+            f'The exchange filter {settings.exchange} selects only OTC assets, but include_otc is false: '
+            'turn include_otc on or choose another exchange.'
+        )
     return cadence
 
 
@@ -189,6 +202,7 @@ def _panel_settings_values(
         'exchange': settings.exchange,
         'active': settings.active,
         'tradable': settings.tradable,
+        'include_otc': settings.include_otc,
         'actor': actor,
         'reason': reason,
     }
@@ -227,6 +241,7 @@ def _settings_record(row) -> PanelSettingsRecord:
             exchange=row.exchange,
             active=row.active,
             tradable=row.tradable,
+            include_otc=row.include_otc,
         ),
         saved_at=row.saved_at,
         actor=row.actor,
@@ -329,7 +344,7 @@ async def create_panel(
         tuple[PanelRecord, PanelSettingsRecord]: The panel and its version 1.
 
     Raises:
-        InvalidRequestError: INVALID_REQUEST, a blank name or actor, a rate or window out of range, a name already
+        InvalidRequestError: INVALID_REQUEST, include_otc false with an OTC exchange filter, a blank name or actor, a rate or window out of range, a name already
             used, or source settings given for a source that already has a version. Nothing is written.
     """
     trimmed_name = name.strip()
@@ -394,7 +409,8 @@ async def append_settings_version(
         PanelSettingsRecord: The new version.
 
     Raises:
-        InvalidRequestError: NOT_FOUND, no such panel; INVALID_REQUEST, a blank actor or a missing cadence. Nothing is written.
+        InvalidRequestError: NOT_FOUND, no such panel; INVALID_REQUEST, a blank actor, a missing cadence, or include_otc false with an OTC exchange
+            filter. Nothing is written.
     """
     trimmed_actor, trimmed_reason = _marker(actor, reason)
     cadence = _check_panel_settings(settings, settings.cadence)

@@ -240,6 +240,9 @@ class World:
             'deny_symbols': [],
             'actor': 'operator',
             'reason': f'settings {number}',
+            # The column is NOT NULL with no schema default (ADR tj-ed4t8m D1), so a row written behind the crud's back
+            # states it: off, the ruled default, unless the test names it.
+            'include_otc': False,
         } | kw
         return (await self.put(SETTINGS.insert().values(**values).returning(SETTINGS.c.id))).scalar_one()
 

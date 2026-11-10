@@ -182,6 +182,19 @@ const TRI_CHOICES = [
       >
     </div>
   </div>
+  <label class="pn-check">
+    <input
+      :id="`${idPrefix}-include-otc`"
+      v-model="draft.includeOtc"
+      type="checkbox"
+      :disabled="disabled"
+      :data-testid="`${idPrefix}-include-otc`"
+    >
+    {{ titleCase('Include OTC Securities') }}
+  </label>
+  <p class="pn-hint">
+    Off by default. The current market-data feed has no bars for OTC securities.
+  </p>
   <p class="pn-hint">
     Separate symbols with commas or spaces. A filter set to Any is not applied.
   </p>

@@ -273,6 +273,25 @@ async def test_r2_carries_the_current_versions_and_takes_the_source_versions_pas
     assert body.get('counts', {}) == {}
 
 
+async def test_r2_and_r3_carry_a_stored_include_otc_true_and_leave_false_absent(world, client):
+    """ADR tj-ed4t8m D2: the read must carry include_otc, the field a client re-save would otherwise lose.
+
+    The plain bool makes a dropped true read as false, silently. Off is the proto default, so it is absent from the
+    canonical JSON.
+    """
+    seeded = await world.panel('otc')
+    await world.settings_version(seeded.panel_id, include_otc=True, reason='include otc')
+
+    detail = await get(client, path(seeded))
+    versions = await get(client, path(seeded, '/settings-versions'))
+
+    assert detail['currentVersion']['versionNo'] == 2
+    assert detail['currentVersion']['settings']['includeOtc'] is True
+    newest, original = versions['items']
+    assert (newest['versionNo'], newest['settings']['includeOtc']) == (2, True)
+    assert original['versionNo'] == 1 and 'includeOtc' not in original['settings']
+
+
 async def test_r2_is_a_404_for_an_unknown_panel_and_a_422_for_a_malformed_id(world, client):
     problem(await client.get(f'/ui/v1/panels/{uuid.uuid4()}'), status=404, reason='NOT_FOUND')
     problem(await client.get('/ui/v1/panels/not-a-uuid'), status=422, reason='INVALID_REQUEST')

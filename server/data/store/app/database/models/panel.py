@@ -110,7 +110,8 @@ class PanelSettingsVersion(AppBase.DATA_STORE_BASE, CustomTypeTable):
     enabled. A panel has no size: it selects every asset its filters match (ADR tj-46jkey, owner ruling 2026-11-06).
 
     Filters: an empty allow_symbols list restricts nothing; deny_symbols removes; asset_class, exchange, active and
-    tradable are NULL when they do not filter.
+    tradable are NULL when they do not filter. include_otc (not null, no schema default: OTC rows are not selected when
+    false) is the one filter that is never NULL; the repository applies the ruled default, off (owner ruling 2026-11-10).
     """
 
     TABLE_NAME = 'panel_settings_version'
@@ -137,6 +138,8 @@ class PanelSettingsVersion(AppBase.DATA_STORE_BASE, CustomTypeTable):
     actor = Column(String, nullable=False)
     # Optional: NULL when none was given, else stored trimmed and never blank (the CHECK passes a NULL).
     reason = Column(Text, nullable=True)
+    # NO schema default: the crud layer states it (DEFAULT_INCLUDE_OTC), so a writer that forgets it fails loudly.
+    include_otc = Column(Boolean, nullable=False)
 
     __table_args__ = (
         UniqueConstraint('panel_id', 'version_no', name=VERSION_UNIQUE),

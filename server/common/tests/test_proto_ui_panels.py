@@ -24,7 +24,12 @@ The design is the bead's acceptance and the architect's notes on it (13:50 UTC 2
   body, CreatePanelRequest: fields 1-9 (3 reserved) identical to SavePanelSettingsRequest 1-9 (cadence UNSPECIFIED
   excepted: the store applies MONTHLY), reason 10, name 11, source 12 and the optional first source settings 13-16;
   the response is the existing PanelDetail, so no response message is added. The same bead fixes the changed_count
-  (F3) and day-to-instant (F7) comments of the P23 architect gate.
+  (F3) and day-to-instant (F7) comments of the P23 architect gate;
+* INCLUDE OTC (owner ruling 2026-11-10, ADR tj-ed4t8m D2 and D4): one more panel setting, a PLAIN bool (implicit
+  presence: absent is false, the ruled default, under which OTC securities are not selected), numbered
+  PanelSettings 10, SavePanelSettingsRequest 11 (after the reason, which already held 10) and CreatePanelRequest 17
+  (after the first source settings); the two writes document that false with exchange OTC is refused (422). Field 3
+  and the name size stay reserved.
 
 Every message is pinned as its full field list (name, number, type, cardinality, presence), and the file's message
 and enum inventory as an exact set, because the file is new: an extra is a design change, not an append. Descriptors
@@ -183,6 +188,8 @@ PANEL_SETTINGS = [
     _o('exchange', 7, S),
     _o('active', 8, B),
     _o('tradable', 9, B),
+    # ADR tj-ed4t8m D2: a PLAIN bool (no presence): absent is false, which is the ruled default (OTC not selected).
+    _f('include_otc', 10, B),
 ]
 
 SOURCE_SETTINGS = [
@@ -294,6 +301,8 @@ MESSAGES = {
         _o('active', 8, B),
         _o('tradable', 9, B),
         _f('reason', 10, S),
+        # ADR tj-ed4t8m D2: after the reason, plain: a save without it turns OTC off (a save replaces as sent).
+        _f('include_otc', 11, B),
     ],
     'SaveSourceSettingsRequest': [
         _o('ramp_datasets_per_hour', 1, I32),
@@ -320,6 +329,8 @@ MESSAGES = {
         _o('request_cap_per_hour', 14, I32),
         _o('corporate_action_window_pre_days', 15, I32),
         _o('corporate_action_window_post_days', 16, I32),
+        # ADR tj-ed4t8m D2: a panel setting numbered after the source settings, plain: absent is off.
+        _f('include_otc', 17, B),
     ],
 }
 
@@ -507,24 +518,72 @@ def test_every_source_number_carries_its_unit_in_its_name(message: str):
     assert all(name.endswith(UNIT_SUFFIXES) for name in numbers), numbers
 
 
-@pytest.mark.parametrize(
-    ('read', 'write'),
-    [('PanelSettings', 'SavePanelSettingsRequest'), ('PanelSourceSettings', 'SaveSourceSettingsRequest')],
-)
-def test_the_write_body_is_the_read_settings_plus_a_reason(read: str, write: str):
+def test_the_source_write_body_is_the_read_settings_plus_a_reason():
     """Same names, numbers and types as the read, then reason; only presence may differ (absent is refused).
 
-    The reason takes the number after the read's last, NOT the read's field count plus one: PanelSettings skips the
-    reserved 3, so its eight fields end at 9 and the reason is 10.
-
-    Args:
-        read: The settings message a version carries.
-        write: The body that saves a new version.
+    The reason takes the number after the read's last field.
     """
-    read_fields = [_shape(field)[:4] for field in messages(file_named(PANELS))[read].field]
-    write_fields = [_shape(field)[:4] for field in messages(file_named(PANELS))[write].field]
+    read_fields = [_shape(field)[:4] for field in messages(file_named(PANELS))['PanelSourceSettings'].field]
+    write_fields = [_shape(field)[:4] for field in messages(file_named(PANELS))['SaveSourceSettingsRequest'].field]
     assert write_fields[:-1] == read_fields
     assert write_fields[-1] == ('reason', read_fields[-1][1] + 1, S, False)
+
+
+def test_the_panel_write_body_is_the_read_settings_with_the_reason_before_include_otc():
+    """The read's 1-9 (3 reserved) by name, number and type, then reason 10, then the read's include_otc as 11.
+
+    include_otc was added after the reason had taken 10 on the write (ADR tj-ed4t8m D2), so it is 10 on the read and
+    11 on the write: the same name and type, plain on both, and the only field whose number differs. Only presence may
+    differ on 1-9 (absent is refused).
+    """
+    read_fields = [_shape(field) for field in messages(file_named(PANELS))['PanelSettings'].field]
+    write_fields = [_shape(field) for field in messages(file_named(PANELS))['SavePanelSettingsRequest'].field]
+    assert [shape[:4] for shape in write_fields[:-2]] == [shape[:4] for shape in read_fields[:-1]]
+    assert read_fields[-1] == ('include_otc', 10, B, False, False)
+    assert write_fields[-2:] == [('reason', 10, S, False, False), ('include_otc', 11, B, False, False)]
+
+
+@pytest.mark.parametrize(
+    ('message', 'number'), [('PanelSettings', 10), ('SavePanelSettingsRequest', 11), ('CreatePanelRequest', 17)]
+)
+def test_include_otc_is_a_plain_bool_with_implicit_presence(message: str, number: int):
+    """ADR tj-ed4t8m D2: no `optional`, so the generated class has no HasField for it and absent IS false (the default).
+
+    Args:
+        message: A message carrying the panel setting.
+        number: Its field number there.
+    """
+    field = _fields(message)['include_otc']
+    assert (field.number, field.type, field.label, field.proto3_optional) == (
+        number,
+        FIELD.TYPE_BOOL,
+        FIELD.LABEL_OPTIONAL,
+        False,
+    )
+    assert not field.HasField('oneof_index'), field
+
+
+@pytest.mark.parametrize('message', ['PanelSettings', 'SavePanelSettingsRequest', 'CreatePanelRequest'])
+def test_include_otc_is_documented_absent_false_and_off_excludes_otc(message: str):
+    """The comment says the rule the plain bool carries: absent is false, and false means OTC is not selected.
+
+    Args:
+        message: A message carrying the panel setting.
+    """
+    text = _comments(_path(message, 'include_otc'))
+    assert 'an absent value is false' in text, text
+    assert 'false (the default) means OTC securities are not selected' in text, text
+
+
+@pytest.mark.parametrize('message', ['SavePanelSettingsRequest', 'CreatePanelRequest'])
+def test_the_writes_document_the_otc_contradiction_as_refused(message: str):
+    """ADR tj-ed4t8m D4: false together with exchange OTC selects nothing, so both writes refuse it.
+
+    Args:
+        message: A panel settings write body.
+    """
+    text = _comments(_path(message, 'include_otc'))
+    assert 'A false value with exchange OTC is refused (422)' in text, text
 
 
 def test_the_create_body_1_to_9_are_the_settings_write_1_to_9_with_presence():
@@ -540,23 +599,26 @@ def test_the_create_body_1_to_9_are_the_settings_write_1_to_9_with_presence():
 
 
 def test_the_create_body_is_the_read_settings_plus_reason_name_source_and_the_first_source_settings():
-    """Exactly the difference from the settings write: name and source, then the source settings, all four optional.
+    """Exactly the difference from the settings write: name and source, the source settings, then include_otc.
 
-    1-9 are PanelSettings' names, numbers and types (eight fields: 3 is reserved in both); 10 is the same plain reason;
-    11 name and 12 source are plain (presence-free, so blank and UNSPECIFIED are what the route refuses); 13-16 are
-    PanelSourceSettings 1-4 shifted by 12, each `optional`, because all four absent means 'not given'.
+    1-9 are PanelSettings' 1-9 names, numbers and types (eight fields: 3 is reserved in both); 10 is the same plain
+    reason; 11 name and 12 source are plain (presence-free, so blank and UNSPECIFIED are what the route refuses);
+    13-16 are PanelSourceSettings 1-4 shifted by 12, each `optional`, because all four absent means 'not given'; 17 is
+    PanelSettings' include_otc (10 there), the same name and plain bool (ADR tj-ed4t8m D2).
     """
-    panel = [_shape(field)[:4] for field in messages(file_named(PANELS))['PanelSettings'].field]
+    panel = [_shape(field) for field in messages(file_named(PANELS))['PanelSettings'].field]
     source = [_shape(field) for field in messages(file_named(PANELS))['PanelSourceSettings'].field]
     create = [_shape(field) for field in messages(file_named(PANELS))['CreatePanelRequest'].field]
-    assert len(panel) == 8, panel
-    assert [shape[:4] for shape in create[:8]] == panel
+    assert len(panel) == 9, panel
+    assert [shape[:4] for shape in create[:8]] == [shape[:4] for shape in panel[:8]]
     assert create[8:11] == [
         ('reason', 10, S, False, False),
         ('name', 11, S, False, False),
         ('source', 12, f'{M}DataSource', False, False),
     ]
-    assert create[11:] == [(name, number + 12, kind, False, True) for name, number, kind, _, _ in source]
+    assert create[11:15] == [(name, number + 12, kind, False, True) for name, number, kind, _, _ in source]
+    assert panel[8] == ('include_otc', 10, B, False, False)
+    assert create[15:] == [('include_otc', 17, B, False, False)]
 
 
 # ---------------------------------------------------------------------------------------------------
@@ -1008,6 +1070,21 @@ def round_trip(message):
     return json_format.Parse(json_format.MessageToJson(message), type(message)()) == message
 
 
+def include_otc(cls):
+    try:
+        cls().HasField('include_otc')
+        has_field = 'answered'
+    except ValueError:
+        has_field = 'refused'
+    return {
+        'absent': json_format.Parse('{}', cls()).include_otc,
+        'sent_true': json_format.Parse('{"includeOtc": true}', cls()).include_otc,
+        'true_json': json_format.MessageToDict(cls(include_otc=True)),
+        'false_json': json_format.MessageToDict(cls(include_otc=False)),
+        'has_field': has_field,
+    }
+
+
 every = (detail, member, day, marker, listing, disable, pause, no_limit, pending, create, create_first, zero_read)
 json.dump(
     {
@@ -1058,6 +1135,10 @@ json.dump(
         },
         'empty_create_plain': [empty_create.reason, empty_create.name, empty_create.source, empty_create.cadence],
         'round_trips': [round_trip(m) for m in every],
+        'include_otc': {
+            cls.__name__: include_otc(cls)
+            for cls in (panels_pb2.PanelSettings, panels_pb2.SavePanelSettingsRequest, panels_pb2.CreatePanelRequest)
+        },
         'old_size': {
             cls.__name__: old_size(cls)
             for cls in (panels_pb2.PanelSettings, panels_pb2.SavePanelSettingsRequest, panels_pb2.CreatePanelRequest)
@@ -1093,6 +1174,25 @@ def test_the_panel_messages_generate_and_import_from_gen_alone():
     seen = _probe()
     assert all(Path(path).is_relative_to(GENERATED_ROOT) for path in seen['files_from']), seen['files_from']
     assert all(seen['round_trips']), 'a panel message does not parse back from its canonical JSON'
+
+
+@pytest.mark.parametrize('message', ['PanelSettings', 'SavePanelSettingsRequest', 'CreatePanelRequest'])
+def test_include_otc_absent_parses_false_and_a_true_is_on_the_wire(message: str):
+    """ADR tj-ed4t8m D2 at the generated code: a body without includeOtc is off, a true is the key includeOtc.
+
+    No HasField: implicit presence, so the false default is never on the wire and nothing can tell it from absent.
+
+    Args:
+        message: A message carrying the panel setting.
+    """
+    seen = _probe()['include_otc'][message]
+    assert seen == {
+        'absent': False,
+        'sent_true': True,
+        'true_json': {'includeOtc': True},
+        'false_json': {},
+        'has_field': 'refused',
+    }
 
 
 def test_a_panel_detail_renders_as_the_canonical_json_the_ui_reads():

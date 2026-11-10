@@ -25,6 +25,12 @@ is unchanged on purpose: nothing is persisted, and the owner drops every databas
 is needed. A database already at this id is NOT upgraded by `make migrate` (a no-op) and keeps the old schema: drop it
 and migrate again.
 
+EDITED IN PLACE (2026-11-10, ADR tj-ed4t8m D7): panel_settings_version gained include_otc, BOOLEAN NOT NULL with NO schema
+default, the last column of the table (the panel setting 'include OTC', off by default in the repository: owner ruling
+2026-11-10). The id is unchanged on purpose: nothing is persisted, and every database is dropped after the merge, so no
+new revision is needed. A database already at this id is NOT upgraded by `make migrate` (a no-op) and lacks the column:
+drop it and migrate again.
+
 NO DOWNGRADE. downgrade() raises: recovery is a restore of make migrate's pre-migrate dump (ADR tj-x3ig38), and this
 revision has no parent to return to.
 
@@ -378,6 +384,7 @@ def upgrade() -> None:
     sa.Column('saved_at', sa.DateTime(timezone=True), server_default=sa.text('now()'), nullable=False),
     sa.Column('actor', sa.String(), nullable=False),
     sa.Column('reason', sa.Text(), nullable=True),
+    sa.Column('include_otc', sa.Boolean(), nullable=False),
     sa.CheckConstraint("btrim(actor) <> ''", name='ck_panel_settings_version_actor_not_blank'),
     sa.CheckConstraint("btrim(reason) <> ''", name='ck_panel_settings_version_reason_not_blank'),
     sa.CheckConstraint('version_no >= 1', name='ck_panel_settings_version_version_no_positive'),

@@ -2,7 +2,7 @@
 // request, the marker placement and the join of the boundary read's markers with the settings versions'
 // effective passes (by version number; a version no pass has run under is pending, not a boundary), and
 // the words a refused panel write is shown in (the server's text is never shown, tj-fa1rpu D8).
-import { create, toJson } from '@bufbuild/protobuf'
+import { create, fromJson, toJson } from '@bufbuild/protobuf'
 import { timestampFromMs } from '@bufbuild/protobuf/wkt'
 import { describe, expect, it } from 'vitest'
 
@@ -237,8 +237,14 @@ describe('the settings draft', () => {
       exchange: '',
       active: '',
       tradable: '',
+      includeOtc: false,
     })
     expect(emptyDraft()).not.toBe(emptyDraft())
+  })
+
+  // tj-7zjov1.364.5 (ADR tj-ed4t8m D6): Include OTC is off by default. A strict false, not merely falsy.
+  it('emptyDraft: Include OTC is off (false, not absent)', () => {
+    expect(emptyDraft().includeOtc).toBe(false)
   })
 
   it('draftFromSettings words the saved settings as the form edits them', () => {
@@ -251,7 +257,37 @@ describe('the settings draft', () => {
       exchange: 'NASDAQ',
       active: 'true',
       tradable: 'false',
+      includeOtc: false,
     })
+  })
+
+  it.each([true, false])('draftFromSettings reads a saved includeOtc %s, and draftToSettingsInit sends it back', (includeOtc) => {
+    const saved = create(PanelSettingsSchema, { ...SAVED, includeOtc })
+    const draft = draftFromSettings(saved)
+    expect(draft.includeOtc).toBe(includeOtc)
+    const init = draftToSettingsInit(draft)
+    expect(Object.hasOwn(init, 'includeOtc')).toBe(true)
+    expect(init.includeOtc).toBe(includeOtc)
+    expect(create(PanelSettingsSchema, init)).toEqual(saved)
+  })
+
+  it('draftToSettingsInit sends the draft includeOtc, not a constant', () => {
+    expect(draftToSettingsInit({ ...emptyDraft(), includeOtc: true }).includeOtc).toBe(true)
+    expect(draftToSettingsInit({ ...emptyDraft(), includeOtc: false }).includeOtc).toBe(false)
+  })
+
+  // The wire: proto3 canonical JSON (toJson, as api/panels.ts bodyOf sends it) leaves out a plain bool that is
+  // false, and a read without the key decodes false. So "off" travels as absence and still reads as off.
+  it('on the wire a false includeOtc is absent from the JSON, a true one is present, and absence decodes false', () => {
+    const json = (includeOtc: boolean) =>
+      toJson(SavePanelSettingsRequestSchema, create(SavePanelSettingsRequestSchema, { ...draftToSettingsInit({ ...emptyDraft(), includeOtc }), reason: '' })) as Record<
+        string,
+        unknown
+      >
+    expect(Object.hasOwn(json(false), 'includeOtc')).toBe(false)
+    expect(json(true).includeOtc).toBe(true)
+    expect(fromJson(PanelSettingsSchema, { enabled: true }).includeOtc).toBe(false)
+    expect(fromJson(PanelSettingsSchema, { enabled: true, includeOtc: true }).includeOtc).toBe(true)
   })
 
   it('draftFromSettings: absent filters are absent in the draft', () => {
@@ -270,6 +306,7 @@ describe('the settings draft', () => {
       exchange: 'NASDAQ',
       active: true,
       tradable: false,
+      includeOtc: false,
     })
   })
 
@@ -284,6 +321,7 @@ describe('the settings draft', () => {
       exchange: undefined,
       active: undefined,
       tradable: undefined,
+      includeOtc: false,
     })
   })
 
@@ -515,6 +553,9 @@ describe('settingsInitWithEnabled: the saved settings with only enabled flipped'
     ['symbols as saved, not re-parsed', { allowSymbols: [' aapl ', 'B,C', ''], denySymbols: ['x y'] }, {}],
     ['no cadence named', { cadence: PanelCadence.UNSPECIFIED }, {}],
     ['a disabled panel', { enabled: false }, {}],
+    // tj-7zjov1.364.5 (ADR tj-ed4t8m D6): a plain bool left out reads false, so a dropped copy would turn OTC off.
+    ['OTC included', { includeOtc: true }, {}],
+    ['OTC included on a disabled panel', { includeOtc: true, enabled: false }, {}],
   ]
 
   it.each(ROWS)('%s: the init is every saved field, optionals only if saved', (_label, fields, optionals) => {
@@ -525,6 +566,7 @@ describe('settingsInitWithEnabled: the saved settings with only enabled flipped'
       cadence: saved.cadence,
       allowSymbols: saved.allowSymbols,
       denySymbols: saved.denySymbols,
+      includeOtc: saved.includeOtc,
       ...optionals,
     })
     for (const key of ['assetClass', 'exchange', 'active', 'tradable'] as const) {
@@ -542,6 +584,15 @@ describe('settingsInitWithEnabled: the saved settings with only enabled flipped'
     // And read back as settings, the message is the saved one with only enabled changed.
     const back = create(PanelSettingsSchema, settingsInitWithEnabled(saved, !saved.enabled))
     expect(back).toEqual(create(PanelSettingsSchema, { ...BASE, ...fields, enabled: !saved.enabled }))
+  })
+
+  it.each([true, false])('keeps a saved includeOtc %s through Enable and Disable alike', (includeOtc) => {
+    const saved = create(PanelSettingsSchema, { ...BASE, includeOtc })
+    for (const enabled of [true, false]) {
+      const init = settingsInitWithEnabled(saved, enabled)
+      expect(Object.hasOwn(init, 'includeOtc')).toBe(true)
+      expect(init.includeOtc).toBe(includeOtc)
+    }
   })
 
   it('sends the enabled it is given, not the saved one, either way', () => {

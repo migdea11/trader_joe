@@ -588,6 +588,85 @@ async def test_an_append_refuses_a_missing_cadence(world):
     assert await world.counts() == before
 
 
+# --------------------------------------------------------------------------------------------- S12 include_otc
+
+
+async def test_default_include_otc_is_false_and_the_dataclass_defaults_to_it():
+    """ADR tj-ed4t8m D2(a): off by default, applied by the repository (the column has no default)."""
+    assert panel_settings.DEFAULT_INCLUDE_OTC is False
+    assert PanelSettings(enabled=True).include_otc is False
+
+
+async def test_settings_that_do_not_name_include_otc_store_false_on_create_and_on_append(world):
+    """The default reaches the row on both writes: the NOT NULL column with no default is always given a value."""
+    await _source(world)
+    panel, created = await _panel(world, settings=PanelSettings(enabled=True))
+    appended = await _append(world, panel.id, PanelSettings(enabled=True, cadence=PanelCadence.DAILY))
+
+    assert created.settings.include_otc is False and appended.settings.include_otc is False
+    rows = sorted(await world.rows(SETTINGS), key=lambda row: row.version_no)
+    assert [row.include_otc for row in rows] == [False, False]
+    for statement in world.statements:
+        if isinstance(statement, Insert) and statement.table.name == SETTINGS.name:
+            assert statement.compile(dialect=postgresql.dialect()).params['include_otc'] is False
+
+
+async def test_include_otc_true_is_stored_and_read_back_by_current_settings_and_enabled_panels(world):
+    await _source(world)
+    panel, created = await _panel(world, settings=PanelSettings(enabled=True, include_otc=True))
+    appended = await _append(world, panel.id, PanelSettings(enabled=True, cadence=PanelCadence.DAILY, include_otc=True))
+
+    assert created.settings.include_otc is True and appended.settings.include_otc is True
+    assert [row.include_otc for row in await world.rows(SETTINGS)] == [True, True]
+    async with world.session() as db:
+        assert (await current_settings(db, panel.id)).settings.include_otc is True
+    (enabled,) = await _enabled(world)
+    assert enabled.current.settings.include_otc is True
+
+
+@pytest.mark.parametrize('write', ['create', 'append'])
+async def test_include_otc_false_with_the_otc_exchange_is_refused_and_writes_nothing(world, write):
+    """ADR tj-ed4t8m D4: the contradiction selects nothing and would exit every member: 422 naming both fields."""
+    await _source(world)
+    panel, _ = await _panel(world)
+    before = await world.counts()
+    contradiction = PanelSettings(enabled=True, cadence=PanelCadence.WEEKLY, exchange='OTC', include_otc=False)
+
+    with pytest.raises(InvalidRequestError) as excinfo:
+        if write == 'create':
+            await _panel(world, name='beta', settings=contradiction)
+        else:
+            await _append(world, panel.id, contradiction)
+
+    _refused(excinfo)
+    assert REASONS[excinfo.value.reason].http_status == 422
+    assert 'include_otc' in str(excinfo.value) and 'exchange' in str(excinfo.value), excinfo.value
+    assert await world.counts() == before
+
+
+@pytest.mark.parametrize('write', ['create', 'append'])
+@pytest.mark.parametrize(
+    'settings',
+    [
+        PanelSettings(enabled=True, cadence=PanelCadence.WEEKLY, exchange='OTC', include_otc=True),
+        # Exact and case-sensitive like the exchange filter: 'otc' is not an OTC exchange, so no contradiction.
+        PanelSettings(enabled=True, cadence=PanelCadence.WEEKLY, exchange='otc', include_otc=False),
+        PanelSettings(enabled=True, cadence=PanelCadence.WEEKLY, exchange='NASDAQ', include_otc=False),
+    ],
+    ids=['otc-only-panel', 'lower-case-otc', 'other-exchange'],
+)
+async def test_the_otc_refusal_is_only_false_with_the_exact_otc_exchange(world, write, settings):
+    await _source(world)
+    panel, _ = await _panel(world)
+
+    if write == 'create':
+        _, version = await _panel(world, name='beta', settings=settings)
+    else:
+        version = await _append(world, panel.id, settings)
+
+    assert (version.settings.exchange, version.settings.include_otc) == (settings.exchange, settings.include_otc)
+
+
 @pytest.mark.parametrize(
     'settings',
     [
@@ -854,7 +933,13 @@ async def test_no_constant_names_a_rate_and_the_only_defaults_are_the_ruled_ones
         'MIN_RAMP_DATASETS_PER_HOUR',
         'MIN_REQUEST_CAP_PER_HOUR',
         'INT32_MAX',
+        # ADR tj-ed4t8m D2 and D3 (owner ruling 2026-11-10): the include_otc default (off, a ruled default, not a rate)
+        # and the exchange values it governs (a predicate, not a default).
+        'DEFAULT_INCLUDE_OTC',
+        'OTC_EXCHANGES',
     }
+    assert panel_settings.DEFAULT_INCLUDE_OTC is False
+    assert frozenset({'OTC'}) == panel_settings.OTC_EXCHANGES
     assert DEFAULT_CORPORATE_ACTION_WINDOW_DAYS == 90
     source_defaults = {f.name: f.default for f in dataclasses.fields(SourceSettings)}
     assert source_defaults == {
@@ -869,6 +954,7 @@ async def test_no_constant_names_a_rate_and_the_only_defaults_are_the_ruled_ones
     assert panel_defaults['cadence'] is None, 'the default cadence is applied by create_panel, not the dataclass'
     assert panel_defaults['allow_symbols'] == panel_defaults['deny_symbols'] == ()
     assert all(panel_defaults[name] is None for name in ('asset_class', 'exchange', 'active', 'tradable'))
+    assert panel_defaults['include_otc'] is panel_settings.DEFAULT_INCLUDE_OTC
 
 
 # --------------------------------------------------------------------------------------------- S7 numbering locks

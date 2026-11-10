@@ -40,9 +40,12 @@ from typing import Any
 import httpx
 import pytest
 import pytest_asyncio
+from google.protobuf import json_format
 
 from data.store.app.client_label import OPERATOR_PRINCIPAL, PANEL_OWNER
+from data.store.app.database.crud.panel_settings import PanelSettings
 from data.store.app.database.database import async_db
+from data.store.app.database.models.panel import PanelCadence
 from data.store.app.events import EventHub
 from data.store.app.main import app
 from data.store.tests.panel_ui_harness import (
@@ -543,3 +546,115 @@ async def test_w3_with_no_reason_is_a_201_storing_null(world, client, reason):
     assert body['versionNo'] == 2 and 'reason' not in body and body['actor'] == OPERATOR_PRINCIPAL
     (stored,) = [row for row in await world.rows(SOURCE_SETTINGS) if row.version_no == 2]
     assert stored.reason is None
+
+
+# --------------------------------------------------------------------------------------------- include_otc (tj-ed4t8m)
+# ADR tj-ed4t8m D2: a plain bool on both write bodies, absent is false (off), the ruled default; D4: false with exchange
+# OTC is refused (422, nothing written); the read carries it (absent from the canonical JSON when false).
+
+
+async def test_w1_without_include_otc_stores_false_and_reads_back_no_key(world, client):
+    body = await created(await post(client, CREATE, PANEL_BODY))
+
+    assert 'includeOtc' not in body['currentVersion']['settings']
+    (stored,) = await world.rows(SETTINGS)
+    assert stored.include_otc is False
+
+
+async def test_w2_without_include_otc_stores_false_even_when_the_current_version_has_it_on(world, client):
+    """A save replaces the settings as sent (D2(b)): a body that leaves include_otc out turns it off."""
+    seeded = await world.panel('etfs', include_otc=True)
+
+    body = await created(await post(client, settings_path(seeded.panel_id), SETTINGS_BODY))
+
+    assert 'includeOtc' not in body['settings']
+    (stored,) = [row for row in await world.rows(SETTINGS) if row.version_no == 2]
+    assert stored.include_otc is False
+
+
+@pytest.mark.parametrize('write', ['create', 'save'])
+async def test_include_otc_true_is_stored_and_served_back_on_both_writes(world, client, write):
+    if write == 'create':
+        body = await created(await post(client, CREATE, PANEL_BODY | {'includeOtc': True}))
+        served = body['currentVersion']['settings']
+        (stored,) = await world.rows(SETTINGS)
+    else:
+        seeded = await world.panel('etfs')
+        path = settings_path(seeded.panel_id)
+        served = (await created(await post(client, path, SETTINGS_BODY | {'includeOtc': True})))['settings']
+        (stored,) = [row for row in await world.rows(SETTINGS) if row.version_no == 2]
+    assert served['includeOtc'] is True
+    assert stored.include_otc is True
+
+
+async def test_a_save_of_an_unrelated_change_built_from_the_read_keeps_include_otc(world, client):
+    """The silent-loss risk (D6): the read must carry include_otc, so a client re-sending what it read keeps it on."""
+    created_body = await created(await post(client, CREATE, PANEL_BODY | {'includeOtc': True}))
+    panel_id = created_body['id']
+
+    read = (await client.get(f'/ui/v1/panels/{panel_id}')).json()['currentVersion']['settings']
+    assert read['includeOtc'] is True
+    resent = read | {'cadence': 'PANEL_CADENCE_WEEKLY', 'reason': 'weekly now'}
+    body = await created(await post(client, settings_path(panel_id), resent))
+
+    assert body['settings']['includeOtc'] is True and body['settings']['cadence'] == 'PANEL_CADENCE_WEEKLY'
+    (stored,) = [row for row in await world.rows(SETTINGS) if row.version_no == 2]
+    assert stored.include_otc is True
+
+
+@pytest.mark.parametrize('include_otc', [None, False], ids=['absent', 'false'])
+async def test_w1_refuses_the_otc_exchange_without_include_otc_and_writes_nothing(world, client, include_otc):
+    before = await world.counts()
+    body = PANEL_BODY | {'exchange': 'OTC'} | ({} if include_otc is None else {'includeOtc': include_otc})
+
+    response = await post(client, CREATE, body)
+
+    problem(response, status=422, reason='INVALID_REQUEST')
+    assert 'include_otc' in response.text, response.text
+    await nothing_written(world, before)
+
+
+@pytest.mark.parametrize('include_otc', [None, False], ids=['absent', 'false'])
+async def test_w2_refuses_the_otc_exchange_without_include_otc_and_writes_nothing(world, client, include_otc):
+    seeded = await world.panel('etfs')
+    before = await world.counts()
+    body = SETTINGS_BODY | {'exchange': 'OTC'} | ({} if include_otc is None else {'includeOtc': include_otc})
+
+    response = await post(client, settings_path(seeded.panel_id), body)
+
+    problem(response, status=422, reason='INVALID_REQUEST')
+    assert 'include_otc' in response.text, response.text
+    await nothing_written(world, before)
+
+
+@pytest.mark.parametrize(('extra', 'expected'), [({}, False), ({'includeOtc': True}, True)], ids=['absent', 'true'])
+async def test_the_mapping_reads_include_otc_from_both_bodies(extra, expected):
+    """ui_mapping at the wire, in: an absent key is false (no HasField: a plain bool), a true is true.
+
+    The message classes are reached through ui_mapping (the generated code is private to the edge, TID251).
+    """
+    base = {'enabled': True, 'cadence': 'PANEL_CADENCE_DAILY'} | extra
+    save = json_format.Parse(json.dumps(base), ui_mapping.panels_pb2.SavePanelSettingsRequest())
+    create_body = base | {'name': 'n', 'source': 'DATA_SOURCE_ALPACA_API'}
+    create = json_format.Parse(json.dumps(create_body), ui_mapping.panels_pb2.CreatePanelRequest())
+    settings, _ = ui_mapping.save_panel_settings_values(save)
+    assert settings.include_otc is expected
+    assert ui_mapping.create_panel_values(create).settings.include_otc is expected
+
+
+@pytest.mark.parametrize('include_otc', [False, True])
+async def test_the_mapping_writes_include_otc_into_the_settings_message(include_otc):
+    """ui_mapping at the wire, out: the stored value is set on PanelSettings, so a true reaches the canonical JSON."""
+    message = ui_mapping._panel_settings_message(
+        PanelSettings(enabled=True, cadence=PanelCadence.DAILY, include_otc=include_otc)
+    )
+    assert message.include_otc is include_otc
+    assert json_format.MessageToDict(message).get('includeOtc', False) is include_otc
+
+
+async def test_an_otc_only_panel_is_accepted_on_both_writes(world, client):
+    body = await created(await post(client, CREATE, PANEL_BODY | {'exchange': 'OTC', 'includeOtc': True}))
+    saved = await created(
+        await post(client, settings_path(body['id']), SETTINGS_BODY | {'exchange': 'OTC', 'includeOtc': True})
+    )
+    assert saved['settings']['exchange'] == 'OTC' and saved['settings']['includeOtc'] is True

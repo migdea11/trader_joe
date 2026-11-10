@@ -489,6 +489,7 @@ def _seed(db: ScratchDb, entry_values: Callable[..., dict[str, Any]], bar_values
                 version_no=1,
                 enabled=False,
                 cadence=PanelCadence.DAILY,
+                include_otc=False,  # NOT NULL with no database default (ADR tj-ed4t8m D1)
                 actor='operator',
                 reason='dev seed reset system test panel',
             ),

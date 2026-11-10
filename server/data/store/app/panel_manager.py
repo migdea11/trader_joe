@@ -93,6 +93,7 @@ from data.store.app.database.crud.panel_manager_reads import (
     stop_collecting,
 )
 from data.store.app.database.crud.panel_settings import (
+    OTC_EXCHANGES,
     EnabledPanel,
     PanelSettings,
     SourceSettingsRecord,
@@ -285,7 +286,7 @@ def row_selected(
     An empty allow list restricts nothing, a non-empty one restricts to those symbols; the deny list removes; the asset
     class, exchange, active and tradable filters do not filter at None. A row whose active flag the vendor did not say is
     active exactly when the snapshot is the active list; a tradable flag the vendor did not say never matches a
-    tradable filter.
+    tradable filter. With include_otc false a row on an OTC exchange is not selected, whatever the other filters say.
     """
     if settings.asset_class is not None and settings.asset_class is not asset_type:
         return False
@@ -296,6 +297,8 @@ def row_selected(
     if symbol in {name.upper() for name in settings.deny_symbols}:
         return False
     if settings.exchange is not None and row.exchange != settings.exchange:
+        return False
+    if not settings.include_otc and row.exchange in OTC_EXCHANGES:
         return False
     if settings.active is not None:
         active = row.active if row.active is not None else list_status is AssetListStatus.ACTIVE

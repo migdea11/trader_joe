@@ -957,6 +957,129 @@ async def test_a_disabled_panel_does_not_hold_a_symbol(world, clock):
     assert (await world.entry_row(entry_id)).collect is False
 
 
+# ===================================================================================== include_otc (ADR tj-ed4t8m)
+
+OTC = {'exchange': 'OTC'}
+
+
+async def test_include_otc_off_by_default_the_first_pass_leaves_an_otc_row_out(world, clock):
+    """D2/D3: a panel saved without include_otc selects no OTC row: no ledger row, no request for it."""
+    seeded, _, _ = await basic(world, assets=[('v1', 'AAA'), ('v2', 'BBB', OTC), ('v3', 'CCC')])
+
+    await manager(clock).tick()
+
+    assert kinds(await world.transitions(seeded)) == [
+        ('v1', 'ENTERED'),
+        ('v1', 'CREATED'),
+        ('v3', 'ENTERED'),
+        ('v3', 'CREATED'),
+    ]
+    assert sorted(r.asset_symbol for r in await world.requests(BARS)) == ['AAA', 'CCC']
+
+
+async def test_include_otc_on_the_first_pass_creates_the_otc_row_too(world, clock):
+    seeded, _, _ = await basic(world, include_otc=True, assets=[('v1', 'AAA'), ('v2', 'BBB', OTC)])
+
+    await manager(clock).tick()
+
+    assert kinds(await world.transitions(seeded)) == [
+        ('v1', 'ENTERED'),
+        ('v1', 'CREATED'),
+        ('v2', 'ENTERED'),
+        ('v2', 'CREATED'),
+    ]
+
+
+async def test_turning_include_otc_off_exits_the_otc_member_and_stops_its_dataset_then_on_restarts_it(world, clock):
+    """D5: off is a filter exit of the OTC member only; on again restarts its dataset.
+
+    Off: EXITED, collect false, PANEL_MEMBER_LEFT, RETIRED after the pass, and a listed non-OTC member stays. On again:
+    ENTERED with dataset_resumed and RESUMED, and nothing new requested.
+    """
+    seeded, _, snapshot_id = await basic(world, include_otc=True, assets=[('v1', 'AAA'), ('v2', 'BBB', OTC)])
+    keep_id, keep_rows = await _member_with_entry(world, seeded, snapshot_id, 'v1', 'AAA')
+    otc_id, otc_rows = await _member_with_entry(world, seeded, snapshot_id, 'v2', 'BBB')
+    await world.ledger_pass(seeded, snapshot_id, keep_rows + otc_rows, started_at=now() - 3 * DAY)
+    await world.settings(seeded.panel_id, include_otc=False)
+    await world.age_window()
+
+    await manager(clock).tick()
+
+    assert kinds(await world.transitions(seeded))[-1:] == [('v2', 'EXITED')]
+    otc_entry, kept = await world.entry_row(otc_id), await world.entry_row(keep_id)
+    assert (otc_entry.collect, otc_entry.stopped_cause) == (False, LEFT)
+    assert (kept.collect, kept.stopped_cause) == (True, None)
+    assert [(e.id, e.change) for e in world.published] == [(otc_id, DatasetChange.RETIRED)]
+
+    await world.settings(seeded.panel_id, include_otc=True)
+    await due_again(world, seeded)
+    await manager(clock).tick()
+
+    last = (await world.transitions(seeded))[-1]
+    assert (last.vendor_asset_id, last.transition, last.dataset_id, last.cause) == (
+        'v2',
+        ENTERED,
+        otc_id,
+        CAUSE_DATASET_RESUMED,
+    )
+    otc_entry = await world.entry_row(otc_id)
+    assert (otc_entry.collect, otc_entry.stopped_cause) == (True, None)
+    assert [(e.id, e.change) for e in world.published] == [
+        (otc_id, DatasetChange.RETIRED),
+        (otc_id, DatasetChange.RESUMED),
+    ]
+    assert world.clamps == [] and len(await world.requests(BARS)) == 2, 'a restart writes no request'
+
+
+async def test_an_otc_member_turned_off_on_one_panel_keeps_collecting_while_another_enabled_panel_includes_otc(
+    world, clock
+):
+    """D3: the exits' 'held by another enabled panel' set goes through row_selected, so it judges include_otc too."""
+    await world.source_settings()
+    first = await world.panel(now() - 3 * DAY, include_otc=True)
+    second = await world.panel(now() - 2 * DAY, include_otc=True)
+    old = await world.snapshot(now() - 3 * DAY, [('vx', 'XXX', OTC)])
+    await world.snapshot(now() - HOUR, [('vx', 'XXX', OTC)])
+    entry_id, rows = await _member_with_entry(world, first, old, 'vx', 'XXX')
+    for seeded in (first, second):
+        await world.ledger_pass(seeded, old, rows, started_at=now() - 3 * DAY)
+
+    await world.settings(first.panel_id, include_otc=False)
+    await world.age_window()
+    await manager(clock).tick()
+
+    assert kinds(await world.transitions(first))[-1] == ('vx', 'EXITED')
+    assert (await world.entry_row(entry_id)).collect is True, 'the second panel still includes OTC and selects it'
+    assert not world.published
+
+    await world.settings(second.panel_id, include_otc=False)
+    await due_again(world, second)
+    await manager(clock).tick()
+
+    assert kinds(await world.transitions(second))[-1] == ('vx', 'EXITED')
+    entry = await world.entry_row(entry_id)
+    assert (entry.collect, entry.stopped_cause) == (False, LEFT)
+    assert [(e.id, e.change) for e in world.published] == [(entry_id, DatasetChange.RETIRED)]
+
+
+async def test_an_enabled_panel_without_include_otc_does_not_hold_an_otc_symbol(world, clock):
+    """The other panel selects the symbol by every filter but include_otc: it does not hold the dataset."""
+    await world.source_settings()
+    first = await world.panel(now() - 3 * DAY, include_otc=True)
+    await world.panel(now() - 2 * DAY)
+    old = await world.snapshot(now() - 3 * DAY, [('vx', 'XXX', OTC)])
+    await world.snapshot(now() - HOUR, [('vx', 'XXX', OTC)])
+    entry_id, rows = await _member_with_entry(world, first, old, 'vx', 'XXX')
+    await world.ledger_pass(first, old, rows, started_at=now() - 3 * DAY)
+    await world.settings(first.panel_id, include_otc=False)
+    await world.age_window()
+
+    await manager(clock).tick()
+
+    entry = await world.entry_row(entry_id)
+    assert (entry.collect, entry.stopped_cause) == (False, LEFT)
+
+
 async def test_a_vanished_member_with_no_entry_exits(world, clock):
     seeded, _, _ = await basic(world, assets=[('v9', 'ZZZ')])
     old = await world.snapshot(now() - 3 * DAY, [('v1', 'AAA'), ('v9', 'ZZZ')])

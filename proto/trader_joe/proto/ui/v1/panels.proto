@@ -125,6 +125,10 @@ message PanelSettings {
   optional string exchange = 7;
   optional bool active = 8;
   optional bool tradable = 9;
+  // Whether the panel selects assets whose exchange is OTC. Plain bool, no presence: an absent value is
+  // false, and false (the default) means OTC securities are not selected. The current market-data feed
+  // carries no bars for OTC securities.
+  bool include_otc = 10;
 }
 
 // A source's settings, shared by every panel on it. The two rates are optional: UNSET MEANS NO LIMIT, and
@@ -338,6 +342,11 @@ message SavePanelSettingsRequest {
   optional bool tradable = 9;
   // Optional: trimmed; blank or absent means none was given (never refused).
   string reason = 10;
+  // Whether the panel selects assets whose exchange is OTC. Plain bool, no presence: an absent value is
+  // false, and false (the default) means OTC securities are not selected. The current market-data feed
+  // carries no bars for OTC securities. A false value with exchange OTC is refused (422): it would select
+  // nothing.
+  bool include_otc = 11;
 }
 
 // The body of a source's settings write: a new source settings version.
@@ -355,7 +364,8 @@ message SaveSourceSettingsRequest {
 
 // The body of a panel create: the new panel's first settings version (1) and, optionally, the first
 // settings of its source. FLAT, because a nested PanelSettings cannot carry presence. Fields 1-9 (3 is
-// reserved) are identical in name, number, type and presence to SavePanelSettingsRequest 1-9. The server stamps
+// reserved) are identical in name, number, type and presence to SavePanelSettingsRequest 1-9. include_otc is the one more shared panel setting (10 in PanelSettings, 11 in
+// SavePanelSettingsRequest, 17 here), identical in name, type and plain-bool presence. The server stamps
 // created_at, saved_at and actor; version 1 is written with the panel in one transaction. The RESPONSE is
 // the created PanelDetail: current_version is version 1 with effective_pass unset, counts all zero. The
 // FIRST PASS is not run by this write and is never in its response: the store's panel manager (one
@@ -395,4 +405,9 @@ message CreatePanelRequest {
   optional int32 request_cap_per_hour = 14;
   optional int32 corporate_action_window_pre_days = 15;
   optional int32 corporate_action_window_post_days = 16;
+  // Whether the panel selects assets whose exchange is OTC. Plain bool, no presence: an absent value is
+  // false, and false (the default) means OTC securities are not selected. The current market-data feed
+  // carries no bars for OTC securities. A false value with exchange OTC is refused (422): it would select
+  // nothing. It is a panel setting, so it is numbered after 13-16 but is not one of the source settings.
+  bool include_otc = 17;
 }

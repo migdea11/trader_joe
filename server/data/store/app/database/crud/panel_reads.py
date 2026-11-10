@@ -148,6 +148,7 @@ def _settings_record(row) -> PanelSettingsRecord:
             exchange=row.exchange,
             active=row.active,
             tradable=row.tradable,
+            include_otc=row.include_otc,
         ),
         saved_at=row.saved_at,
         actor=row.actor,

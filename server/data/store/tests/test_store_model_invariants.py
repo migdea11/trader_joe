@@ -771,6 +771,8 @@ PANEL_DESIGN_COLUMNS = {
     'panel_settings_version': {
         'id', 'panel_id', 'version_no', 'enabled', 'cadence', 'allow_symbols', 'deny_symbols',
         'asset_class', 'exchange', 'active', 'tradable', 'saved_at', 'actor', 'reason',
+        # ADR tj-ed4t8m D1 (owner ruling 2026-11-10): the include OTC toggle, NOT NULL, no default of any kind.
+        'include_otc',
     },
     'panel_source_settings_version': {
         'id', 'source', 'version_no', 'ramp_datasets_per_hour', 'request_cap_per_hour',
@@ -796,7 +798,8 @@ PANEL_DESIGN_NULLABLE = {
 }
 # NO POLICY DEFAULT (owner ruling 2026-10-27): none of these may carry a default of any kind.
 PANEL_POLICY_COLUMNS = {
-    'panel_settings_version': {'enabled', 'cadence'},
+    # include_otc: ADR tj-ed4t8m D1, the default (off) is applied by the crud where a row is created, never the schema.
+    'panel_settings_version': {'enabled', 'cadence', 'include_otc'},
     'panel_source_settings_version': {
         'ramp_datasets_per_hour',
         'request_cap_per_hour',
@@ -868,6 +871,21 @@ def test_each_panel_table_has_the_designs_columns_and_nullability(table_name):
     assert set(table.c.keys()) == PANEL_DESIGN_COLUMNS[table_name], table
     assert {c.name for c in table.columns if c.nullable} == PANEL_DESIGN_NULLABLE[table_name], table
     assert not {'ramp', 'per_pass_cap', 'size'} & set(table.c.keys())
+
+
+def test_include_otc_is_the_last_settings_column_a_not_null_boolean_with_no_default():
+    """ADR tj-ed4t8m D1: declared LAST, BOOLEAN NOT NULL, no default of any kind, and no CHECK names it.
+
+    Last is the order an ADD COLUMN gives, which keeps D7 option B open; the D4 refusal lives in the crud.
+    """
+    table = PANEL_TABLES['panel_settings_version']
+    column = table.c.include_otc
+    assert list(table.c.keys())[-1] == 'include_otc', list(table.c.keys())
+    assert isinstance(column.type, sa.Boolean), column.type
+    assert not column.nullable
+    assert column.server_default is None and column.default is None
+    checks = [c for c in table.constraints if isinstance(c, sa.CheckConstraint)]
+    assert not any('include_otc' in str(c.sqltext) for c in checks), [str(c.sqltext) for c in checks]
 
 
 @pytest.mark.parametrize('table_name', list(PANEL_DESIGN_COLUMNS))

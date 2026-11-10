@@ -200,6 +200,8 @@ class World:
             'cadence': PanelCadence.DAILY,
             'actor': 'operator',
             'reason': f'settings {number}',
+            # NOT NULL with no schema default (ADR tj-ed4t8m D1): a row written behind the crud's back states it, off.
+            'include_otc': False,
         } | kw
         result = await self.put(SETTINGS.insert().values(**values).returning(SETTINGS.c.id))
         return result.scalar_one()

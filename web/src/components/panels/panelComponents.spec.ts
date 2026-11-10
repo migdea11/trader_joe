@@ -92,6 +92,7 @@ const SAVED_INIT = {
   exchange: 'NASDAQ',
   active: true,
   tradable: false,
+  includeOtc: false,
 }
 
 function detail(
@@ -306,6 +307,7 @@ describe('PanelSettingsForm', () => {
       exchange: undefined,
       active: undefined,
       tradable: false,
+      includeOtc: false,
       reason: 'narrow',
     })
   })
@@ -414,7 +416,7 @@ describe('PanelSettingsForm: Enable or Disable sends the saved settings exactly'
     return saveSettings.mock.calls[0]![0] as Record<string, unknown>
   }
 
-  const base = (enabled: boolean) => ({ enabled, ...BARE, reason: 'flip' })
+  const base = (enabled: boolean) => ({ enabled, ...BARE, includeOtc: false, reason: 'flip' })
 
   it.each([
     ["exchange ' X ' (not trimmed)", { exchange: ' X ' }, { exchange: ' X ' }],
@@ -470,6 +472,162 @@ describe('PanelSettingsForm: Enable or Disable sends the saved settings exactly'
     await form.find('form').trigger('submit')
     await flushPromises()
     expect(saveSettings.mock.calls[0]![0]).toMatchObject({ exchange: undefined })
+  })
+})
+
+// ---------------------------------------------------------------------------------------------------
+
+// tj-7zjov1.364.5 (ADR tj-ed4t8m D6, owner ruling 2026-11-10): one Include OTC Securities checkbox in the
+// shared filter fields, off by default, never required, disabled with the other fields. Enable and Disable
+// copy the saved value: a plain bool left out reads as false, so a dropped copy would turn OTC off silently.
+// No client-side check: an OTC exchange with the box off is refused by the store and shown by the existing
+// refusal display.
+describe('the Include OTC Securities checkbox', () => {
+  const OTC_HINT = 'Off by default. The current market-data feed has no bars for OTC securities.'
+  const HELD_PAGE = create(PanelSourceSettingsVersionPageSchema, { items: [create(PanelSourceSettingsVersionSchema, { versionNo: 1 })] })
+
+  const box = (form: VueWrapper, prefix: string) => byId(form, `${prefix}-include-otc`)
+  const ticked = (form: VueWrapper, prefix: string) => (box(form, prefix).element as HTMLInputElement).checked
+  const settingsWith = (includeOtc: boolean, enabled = true) => detail({ settings: create(PanelSettingsSchema, { ...SAVED, enabled, includeOtc }) })
+
+  async function createBody(tick: boolean[]): Promise<Record<string, unknown>> {
+    api.getSourceSettingsVersions.mockResolvedValue(HELD_PAGE)
+    const { create: createPanel } = stubWrites({ kind: 'created', detail: detail() })
+    const form = mountCreate()
+    await byId(form, 'create-name').setValue('n')
+    await byId(form, 'create-source').findAll('option')[1]!.setValue()
+    await flushPromises()
+    for (const value of tick) await box(form, 'create').setValue(value)
+    await press(form)
+    expect(createPanel).toHaveBeenCalledTimes(1)
+    return createPanel.mock.calls[0]![0] as Record<string, unknown>
+  }
+
+  it.each(['create', 'settings'])('on the %s form: a checkbox with its id, the label in Title Case and the sentence-case hint', (prefix) => {
+    stubWrites()
+    const form = prefix === 'create' ? mountCreate() : mount(PanelSettingsForm, { props: { detail: detail() } })
+    const input = box(form, prefix)
+    expect(input.exists()).toBe(true)
+    expect(input.attributes('type')).toBe('checkbox')
+    expect(input.attributes('id')).toBe(`${prefix}-include-otc`)
+    expect(input.element.closest('label')!.textContent!.trim()).toBe('Include OTC Securities')
+    expect(form.findAll('p.pn-hint').map((p) => p.text())).toContain(OTC_HINT)
+  })
+
+  it.each(['create', 'settings'])('on the %s form the box is never required and never marked, pressed or not', async (prefix) => {
+    api.getSourceSettingsVersions.mockResolvedValue(HELD_PAGE)
+    stubWrites()
+    const form = prefix === 'create' ? mountCreate() : mount(PanelSettingsForm, { props: { detail: detail() }, attachTo: document.body })
+    for (const pressed of [false, true]) {
+      if (pressed) {
+        if (prefix === 'create') await press(form)
+        else await form.find('form').trigger('submit')
+        await flushPromises()
+      }
+      const input = box(form, prefix)
+      expect(input.attributes('required')).toBeUndefined()
+      expect(input.attributes('aria-required')).toBeUndefined()
+      expect(input.attributes('aria-invalid')).toBeUndefined()
+      expect(input.element.closest('label')!.querySelector('.pn-required')).toBeNull()
+      expect(form.find(`label[for="${prefix}-include-otc"]`).exists()).toBe(false)
+    }
+  })
+
+  it('the create form: the required set and the press marks stay name and source, whatever the box', async () => {
+    stubWrites()
+    const form = mountCreate()
+    await box(form, 'create').setValue(true)
+    await press(form)
+    expect(form.findAll('[aria-required="true"]').map((el) => el.attributes('id'))).toEqual(['create-name', 'create-source'])
+    expect(form.findAll('[aria-invalid="true"]').map((el) => el.attributes('id'))).toEqual(['create-name', 'create-source'])
+    expect(form.findAll('label .pn-required')).toHaveLength(2)
+  })
+
+  it('the create form opens with the box unticked, and an untouched create sends includeOtc false', async () => {
+    stubWrites()
+    const form = mountCreate()
+    expect(ticked(form, 'create')).toBe(false)
+    form.unmount()
+    const body = await createBody([])
+    expect(Object.hasOwn(body, 'includeOtc')).toBe(true)
+    expect(body.includeOtc).toBe(false)
+  })
+
+  it('ticking the box on the create form sends includeOtc true; ticked then unticked sends false', async () => {
+    expect((await createBody([true])).includeOtc).toBe(true)
+    expect((await createBody([true, false])).includeOtc).toBe(false)
+  })
+
+  it.each([true, false])('the settings form shows a saved includeOtc %s as the box state', (includeOtc) => {
+    stubWrites()
+    const form = mount(PanelSettingsForm, { props: { detail: settingsWith(includeOtc) } })
+    expect(ticked(form, 'settings')).toBe(includeOtc)
+  })
+
+  it.each([true, false])('Save Settings sends the box as toggled from a saved %s', async (includeOtc) => {
+    const { saveSettings } = stubWrites()
+    const form = mount(PanelSettingsForm, { props: { detail: settingsWith(includeOtc) } })
+    await box(form, 'settings').setValue(!includeOtc)
+    await form.find('form').trigger('submit')
+    await flushPromises()
+    expect(saveSettings).toHaveBeenCalledTimes(1)
+    expect(saveSettings).toHaveBeenCalledWith({ ...SAVED_INIT, includeOtc: !includeOtc, reason: '' })
+  })
+
+  it.each([
+    ['Disable', true, true],
+    ['Disable', true, false],
+    ['Enable', false, true],
+    ['Enable', false, false],
+  ])('%s keeps a saved includeOtc: enabled %s, includeOtc %s', async (label, enabled, includeOtc) => {
+    const { saveSettings } = stubWrites()
+    const form = mount(PanelSettingsForm, { props: { detail: settingsWith(includeOtc, enabled) } })
+    expect(byId(form, 'settings-toggle').text()).toBe(`${label} Panel`)
+    await byId(form, 'settings-toggle').trigger('click')
+    await flushPromises()
+    expect(saveSettings).toHaveBeenCalledTimes(1)
+    expect(saveSettings.mock.calls[0]![0]).toStrictEqual({ ...SAVED_INIT, enabled: !enabled, includeOtc, reason: '' })
+  })
+
+  it('Disable sends the SAVED includeOtc, not an unsaved tick or untick of the box', async () => {
+    for (const includeOtc of [true, false]) {
+      const { saveSettings } = stubWrites()
+      const form = mount(PanelSettingsForm, { props: { detail: settingsWith(includeOtc) } })
+      await box(form, 'settings').setValue(!includeOtc)
+      await byId(form, 'settings-toggle').trigger('click')
+      await flushPromises()
+      expect(saveSettings.mock.calls[0]![0]).toMatchObject({ enabled: false, includeOtc })
+      form.unmount()
+    }
+  })
+
+  it.each(['create', 'settings'])('on the %s form the box is disabled while a write is out, like the other fields, and on otherwise', (prefix) => {
+    const { store } = stubWrites()
+    const mountIt = () => (prefix === 'create' ? mountCreate() : mount(PanelSettingsForm, { props: { detail: detail() } }))
+    const idle = mountIt()
+    expect(box(idle, prefix).attributes('disabled')).toBeUndefined()
+    idle.unmount()
+    store.writing = true
+    const busy = mountIt()
+    expect(box(busy, prefix).attributes('disabled')).toBeDefined()
+    expect(byId(busy, `${prefix}-exchange`).attributes('disabled')).toBeDefined()
+  })
+
+  it('an OTC exchange with the box off is sent as is, and the store refusal shows through the existing display', async () => {
+    api.getSourceSettingsVersions.mockResolvedValue(HELD_PAGE)
+    const { create: createPanel } = stubWrites({ kind: 'invalid', error: { message: 'Request failed (HTTP 422)', errorId: 'e-otc' } })
+    const form = mountCreate()
+    await byId(form, 'create-name').setValue('n')
+    await byId(form, 'create-source').findAll('option')[1]!.setValue()
+    await flushPromises()
+    await byId(form, 'create-exchange').setValue('OTC')
+    await press(form)
+    expect(createPanel).toHaveBeenCalledTimes(1)
+    expect(createPanel.mock.calls[0]![0]).toMatchObject({ exchange: 'OTC', includeOtc: false })
+    expect(byId(form, 'create-notice').text()).toContain('The store refused the panel, so nothing was created. Check the fields.')
+    expect(byId(form, 'create-notice').text()).toContain('Error ID: e-otc')
+    expect(form.emitted('close')).toBeUndefined()
+    expect(ticked(form, 'create')).toBe(false)
   })
 })
 
@@ -568,6 +726,7 @@ describe('PanelCreateForm', () => {
       exchange: undefined,
       active: undefined,
       tradable: undefined,
+      includeOtc: false,
       name: 'Large caps',
       source: DataSource.ALPACA_API,
       reason: 'first panel',

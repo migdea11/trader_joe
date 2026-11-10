@@ -245,6 +245,78 @@ def test_the_exchange_filter():
     assert not row_selected(row(exchange='NASDAQ'), settings(exchange='NYSE'), STOCK, ACTIVE)
 
 
+# ADR tj-ed4t8m D3 (owner ruling 2026-11-10): with include_otc false (the default) a row whose exchange is exactly 'OTC'
+# is not selected, whatever the other filters say; with it true the row is judged by the other filters alone.
+
+
+def test_an_otc_row_is_not_selected_at_the_default_and_is_with_include_otc():
+    assert settings().include_otc is False
+    assert not row_selected(row(exchange='OTC'), settings(), STOCK, ACTIVE)
+    assert row_selected(row(exchange='OTC'), settings(include_otc=True), STOCK, ACTIVE)
+
+
+@pytest.mark.parametrize('exchange', ['NYSE', 'NASDAQ', 'ARCA', None])
+@pytest.mark.parametrize('include_otc', [False, True])
+def test_a_non_otc_row_is_unaffected_by_include_otc(exchange, include_otc):
+    assert row_selected(row(exchange=exchange), settings(include_otc=include_otc), STOCK, ACTIVE)
+
+
+@pytest.mark.parametrize('exchange', ['otc', 'Otc', 'OTC ', ' OTC', 'OTCQX'])
+def test_the_otc_match_is_exact_and_case_sensitive(exchange):
+    """Like the exchange filter: the vendor's exact string. 'otc' is not OTC, so it is selected at the default."""
+    assert row_selected(row(exchange=exchange), settings(), STOCK, ACTIVE)
+
+
+def test_include_otc_false_excludes_an_otc_row_the_other_filters_would_select():
+    """'whatever the other filters say': an allow list naming the symbol does not bring an OTC row back."""
+    otc = row(symbol='PINK', exchange='OTC')
+    assert not row_selected(otc, settings(allow_symbols=('PINK',), asset_class=STOCK, active=True), STOCK, ACTIVE)
+    assert row_selected(
+        otc, settings(allow_symbols=('PINK',), asset_class=STOCK, active=True, include_otc=True), STOCK, ACTIVE
+    )
+
+
+@pytest.mark.parametrize(
+    ('exchange_filter', 'include_otc', 'selected'),
+    [
+        # The exchange filter still applies with include_otc on: an NYSE panel never takes OTC rows.
+        ('NYSE', True, {'NYSE'}),
+        ('NYSE', False, {'NYSE'}),
+        # An OTC-only panel (valid, D4): only the OTC row.
+        ('OTC', True, {'OTC'}),
+        # No exchange filter: include_otc alone decides the OTC row.
+        (None, True, {'NYSE', 'OTC'}),
+        (None, False, {'NYSE'}),
+    ],
+)
+def test_include_otc_and_the_exchange_filter_together(exchange_filter, include_otc, selected):
+    rows = {'NYSE': row('v1', 'AAA', exchange='NYSE'), 'OTC': row('v2', 'BBB', exchange='OTC')}
+    chosen = settings(exchange=exchange_filter, include_otc=include_otc)
+    assert {name for name, r in rows.items() if row_selected(r, chosen, STOCK, ACTIVE)} == selected
+
+
+def test_select_members_leaves_otc_rows_out_at_the_default_and_keeps_them_with_include_otc():
+    rows = [
+        row('v1', 'AAA', exchange='NYSE'),
+        row('v2', 'BBB', exchange='OTC'),
+        row('v3', 'CCC', exchange='NASDAQ'),
+        row('v4', 'DDD', exchange='OTC'),
+    ]
+    off = select_members(rows, settings(), STOCK, ACTIVE)
+    on = select_members(rows, settings(include_otc=True), STOCK, ACTIVE)
+    assert [member.symbol for member in off] == ['AAA', 'CCC']
+    assert [member.symbol for member in on] == ['AAA', 'BBB', 'CCC', 'DDD']
+
+
+def test_evidence_judges_include_otc_like_any_filter():
+    """evidence_as_of goes through row_selected: an OTC row is 'not selected' evidence at the default."""
+    s1, s2 = snapshot(1), snapshot(2)
+    rows = {(s1.id, 'v1'): row(exchange='NYSE'), (s2.id, 'v1'): row(exchange='OTC')}
+    default = utc(2026, 10, 9)
+    assert evidence_as_of('v1', False, [s1, s2], rows, settings(), STOCK, ACTIVE, default) == s2.as_of
+    assert evidence_as_of('v1', False, [s1, s2], rows, settings(include_otc=True), STOCK, ACTIVE, default) == default
+
+
 @pytest.mark.parametrize(
     ('flag', 'status', 'wanted', 'selected'),
     [

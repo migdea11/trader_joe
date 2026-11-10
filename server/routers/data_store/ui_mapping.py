@@ -713,6 +713,7 @@ def _panel_settings_message(settings: PanelSettings) -> panels_pb2.PanelSettings
         message.active = settings.active
     if settings.tradable is not None:
         message.tradable = settings.tradable
+    message.include_otc = settings.include_otc
     return message
 
 
@@ -888,7 +889,10 @@ def corporate_action_page_message(page: ActionPageView) -> panels_pb2.CorporateA
 
 
 def _panel_settings_of(request: Any) -> PanelSettings:
-    """The panel settings fields 1 to 9 shared by the save and create bodies; an absent enabled is a 422."""
+    """The panel settings shared by the save and create bodies (save 1-9 and 11, create the same by name); an absent enabled is a 422.
+
+    include_otc is a plain bool: absent reads as false (off), the ruled default.
+    """
     if not request.HasField('enabled'):
         raise _refuse('enabled is required.')
     try:
@@ -907,6 +911,7 @@ def _panel_settings_of(request: Any) -> PanelSettings:
         exchange=request.exchange if request.HasField('exchange') else None,
         active=request.active if request.HasField('active') else None,
         tradable=request.tradable if request.HasField('tradable') else None,
+        include_otc=request.include_otc,
     )
 
 
