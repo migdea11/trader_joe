@@ -386,7 +386,10 @@ SEED_CASES = {
         SEED_WRITTEN,
         DatasetHealthStatus.LATE,
     ),
-    'at the close itself, written mid-session: LATE': (OCT20_CLOSE, SEED_WRITTEN, DatasetHealthStatus.LATE),
+    # 'at the close itself, written mid-session: LATE' was removed on 2026-11-10: the owner's ruling (addendum on
+    # decision tj-grna9p.8, built in 8ecbb33a) owes the 20th only from its close plus SETTLE, so at the bare close the
+    # expected period is the 19th and the provisional bar of the 20th reads FRESH. That row is
+    # test_the_seed_s_provisional_bar_reads_fresh_until_the_close_plus_the_margin below.
     'a tick before the next open: still LATE': (OCT21_OPEN - TICK, SEED_WRITTEN, DatasetHealthStatus.LATE),
     'at the next open: OVERDUE': (OCT21_OPEN, SEED_WRITTEN, DatasetHealthStatus.OVERDUE),
     'during the next session: OVERDUE': (z('2026-10-21T17:00:00Z'), SEED_WRITTEN, DatasetHealthStatus.OVERDUE),
@@ -431,6 +434,20 @@ def test_the_seed_scenario(now, written, status):
     assert daily(SUB_START, now, SEED_BAR, DAY, written) == DatasetHealth(status, d('2026-10-20'), SEED_BAR)
 
 
+def test_the_seed_s_provisional_bar_reads_fresh_until_the_close_plus_the_margin():
+    """A provisional bar must not read LATE before the trigger (the 2026-11-10 ruling).
+
+    Between the close and close plus SETTLE the 20th is not owed, so its provisional bar is newer than the expected
+    period (the 19th) and reads FRESH; from 20:30Z it is the expected period and LATE.
+    """
+    fresh = DatasetHealth(DatasetHealthStatus.FRESH, d('2026-10-19'), m(d('2026-10-19')))
+    for now in (OCT20_CLOSE, z('2026-10-20T20:15:00Z'), OCT20_SETTLED - TICK):
+        assert daily(SUB_START, now, SEED_BAR, DAY, SEED_WRITTEN) == fresh, now
+    assert daily(SUB_START, OCT20_SETTLED, SEED_BAR, DAY, SEED_WRITTEN) == DatasetHealth(
+        DatasetHealthStatus.LATE, d('2026-10-20'), SEED_BAR
+    )
+
+
 def test_during_the_open_session_the_provisional_bar_of_that_session_reads_as_before():
     """At 16:30Z on the 20th the expected period is the 19th; the 20th's still-open bar is newer and owes nothing."""
     now = z('2026-10-20T16:30:00Z')
@@ -448,11 +465,18 @@ def test_a_missed_pass_reads_as_before_the_change():
 
 
 def test_the_provisional_deadline_is_the_next_open_after_an_early_close_and_a_holiday():
-    """Fri 27 Nov closes 18:00Z; the next session is Mon 30 Nov, opening 14:30Z (EST)."""
+    """Fri 27 Nov closes 18:00Z; the next session is Mon 30 Nov, opening 14:30Z (EST).
+
+    Since the 2026-11-10 ruling the half-day is owed from ITS close plus SETTLE, 18:30Z: at the bare close the bar is
+    newer than the expected period (Wed 25 Nov) and reads FRESH. The deadline did not move.
+    """
     friday = m(d('2026-11-27'))
     written = z('2026-11-27T17:00:00Z')
     expected = DatasetHealth(DatasetHealthStatus.LATE, d('2026-11-27'), friday)
-    assert daily(SUB_START, z('2026-11-27T18:00:00Z'), friday, DAY, written) == expected
+    wednesday = DatasetHealth(DatasetHealthStatus.FRESH, d('2026-11-25'), m(d('2026-11-25')))
+    assert daily(SUB_START, z('2026-11-27T18:00:00Z'), friday, DAY, written) == wednesday
+    assert daily(SUB_START, z('2026-11-27T18:30:00Z') - TICK, friday, DAY, written) == wednesday
+    assert daily(SUB_START, z('2026-11-27T18:30:00Z'), friday, DAY, written) == expected
     assert daily(SUB_START, z('2026-11-30T14:30:00Z') - TICK, friday, DAY, written) == expected
     assert daily(SUB_START, z('2026-11-30T14:30:00Z'), friday, DAY, written).status is DatasetHealthStatus.OVERDUE
 
@@ -485,7 +509,12 @@ def test_fixed_a_30min_daily_dataset_fetched_mid_session_reads_late_then_overdue
     late = DatasetHealth(DatasetHealthStatus.LATE, d('2026-10-20'), SEED_BAR)
     # While the session is open the expected period is the 19th; the 20th's bars are newer and owe nothing yet.
     assert daily(SUB_START, z('2026-10-20T16:30:00Z'), last, THIRTY, written).status is DatasetHealthStatus.FRESH
-    assert daily(SUB_START, OCT20_CLOSE, last, THIRTY, written) == late
+    # 2026-11-10 ruling: the 20th is owed only from its close plus SETTLE, so at the bare close the bars are still
+    # newer than the expected period (the 19th) and read FRESH; LATE starts at 20:30Z, when the refresh fires.
+    assert daily(SUB_START, OCT20_CLOSE, last, THIRTY, written) == DatasetHealth(
+        DatasetHealthStatus.FRESH, d('2026-10-19'), m(d('2026-10-19'))
+    )
+    assert daily(SUB_START, OCT20_SETTLED - TICK, last, THIRTY, written).status is DatasetHealthStatus.FRESH
     assert daily(SUB_START, OCT20_SETTLED, last, THIRTY, written) == late
     assert daily(SUB_START, OCT21_OPEN - TICK, last, THIRTY, written) == late
     assert daily(SUB_START, OCT21_OPEN, last, THIRTY, written).status is DatasetHealthStatus.OVERDUE
@@ -758,7 +787,9 @@ def test_a_completed_bar_gives_exactly_the_pre_change_result(granularity):
     for start, end in GRID_RANGES:
         for now in GRID_NOWS:
             for last_bar in GRID_LAST_BARS:
-                old = _old_daily(start, end, last_bar, XNYS, now)
+                # The oracle owes a session from its close plus SETTLE (2026-11-10 ruling, 8ecbb33a); the deadline is
+                # the real now's. Before that ruling the oracle judged both at now.
+                old = _old_daily(start, end, last_bar, XNYS, now, owed_now=now - SETTLE)
                 close = None if last_bar is None else bar_period_close(last_bar, XNYS, granularity)
                 settled = None if close is None else close + SETTLE
                 long_after = None if close is None else close + timedelta(days=3)
@@ -789,7 +820,8 @@ def test_a_provisional_bar_only_ever_withholds_fresh_for_its_own_expected_period
             for last_bar in GRID_LAST_BARS:
                 if last_bar is None:
                     continue
-                old = _old_daily(start, end, last_bar, XNYS, now)
+                # Owed from the close plus SETTLE (2026-11-10 ruling, 8ecbb33a); the deadline at the real now.
+                old = _old_daily(start, end, last_bar, XNYS, now, owed_now=now - SETTLE)
                 written = write(last_bar, bar_period_close(last_bar, XNYS, granularity))
                 assert last_bar_is_provisional(last_bar, written, XNYS, granularity), (last_bar, written)
                 got = daily(start, now, last_bar, granularity, written, end)
@@ -1192,7 +1224,12 @@ def test_the_evaluation_never_reads_the_environment(monkeypatch):
     assert daily(WEEKLY_SUB_START, z('2026-10-17T12:00:00Z'), WEEK_BAR, WEEK, z('2026-10-16T20:30:00Z')).status is (
         DatasetHealthStatus.FRESH
     )
-    assert daily(SUB_START, now, SEED_BAR, DAY, settled, config=HealthConfig.from_env()).status is (
+    # Judged at the close plus the configured 120 minutes (22:00Z): since the 2026-11-10 ruling the 20th is owed only
+    # from then, so at 21:00Z it read FRESH against the 19th whatever the bar's write time. At 22:00Z the bar written
+    # at 20:30Z is provisional under the 120-minute margin taken from the config the caller built.
+    after_long_margin = z('2026-10-20T22:00:00Z')
+    assert daily(SUB_START, after_long_margin, SEED_BAR, DAY, settled).status is DatasetHealthStatus.FRESH
+    assert daily(SUB_START, after_long_margin, SEED_BAR, DAY, settled, config=HealthConfig.from_env()).status is (
         DatasetHealthStatus.LATE
     )
 

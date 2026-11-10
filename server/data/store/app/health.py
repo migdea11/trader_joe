@@ -9,8 +9,10 @@ STATUSES AND THE RULING THEY COME FROM (tj-grna9p.8 addendum, final form; tj-grn
 
     DAILY   owes only the completed sessions inside the dataset's [start, end); none closed yet is FRESH.
             FRESH    the last COMPLETED session in range is stored.
-            LATE     not stored yet, and the next session has not opened (pending, not a failure;
-                     many datasets are collected overnight).
+            LATE     a period is owed (its close plus the settle margin has passed) and not stored yet, and the
+                     next session has not opened (pending, not a failure; many datasets are collected overnight).
+                     Between a close and close plus the settle margin that period is not yet owed: the dataset
+                     is judged against the previous period (FRESH when that is stored).
             OVERDUE  not stored by the next session's open. A FAILURE. (The ruling calls this
                      STALE; the owner-approved design renamed it OVERDUE, because STALE is now the
                      UI word for an unread dataset.) There is no close + grace rule.
@@ -25,11 +27,12 @@ STATUSES AND THE RULING THEY COME FROM (tj-grna9p.8 addendum, final form; tj-grn
                      CompletenessStatus, not redefined here.
     RETIRED collect is false on a DAILY or STREAM dataset (the expiry is irrelevant): no recency judgement is computed.
 
-A DAILY bar counts only once FINAL: written at or after the close of its period (the session for 1min..1day, the
+A DAILY period is owed from its close plus the settle margin, inclusive (the scheduler's own trigger fires then);
+the deadline, OVERDUE at the next session's open, does not move. A DAILY bar counts only once FINAL: written at or after the close of its period (the session for 1min..1day, the
 last session of the week or month for 1week and 1month) PLUS the settle margin (`HealthConfig.settle_margin`,
 DAILY_REFRESH_SETTLE_MINUTES, default 30), because a vendor's bar can still change after the close (closing auction,
 late corrections) and clocks skew. A newest bar of the expected period written earlier is provisional: the dataset
-reads LATE until the next session after the expected period opens, then OVERDUE, and the refresh re-fetches from that
+reads LATE (from close plus the settle margin) until the next session after the expected period opens, then OVERDUE, and the refresh re-fetches from that
 bar inclusively. A STATIC dataset has no such rule.
 
 Any status other than FRESH, COMPLETE and RETIRED is unhealthy, and LATE is the only unhealthy one
@@ -235,10 +238,13 @@ def _daily(
     last_bar_written_at: datetime | None = None,
     settle_margin: timedelta = DEFAULT_SETTLE_MARGIN,
 ) -> DatasetHealth:
-    # A DAILY dataset owes only the completed periods inside [start, end) (a period is a session for 1min..1day).
-    # Capping the range at `now` loses nothing (a session that has closed opened before now) and keeps the calendar
-    # query short for a far end.
-    _, owed_sessions = judged(start, min(end, now), calendar, now, granularity)
+    # A DAILY dataset owes only the completed periods inside [start, end) (a period is a session for 1min..1day), and a
+    # period is owed only once its close plus the settle margin has passed (inclusive): the scheduler's own trigger
+    # fires at that instant, so a dataset it has not yet had the chance to refresh cannot be late. `owed_now` is the
+    # instant the owed periods are judged at; the deadline below keeps the real `now`. Capping the range at it loses
+    # nothing (a session that has closed opened before it) and keeps the calendar query short for a far end.
+    owed_now = now - settle_margin
+    _, owed_sessions = judged(start, min(end, owed_now), calendar, owed_now, granularity)
     if not owed_sessions:
         # Nothing in range has closed yet (created today, or before its first session): nothing is owed.
         return DatasetHealth(DatasetHealthStatus.FRESH)

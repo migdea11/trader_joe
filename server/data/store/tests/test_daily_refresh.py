@@ -1883,6 +1883,60 @@ def test_a_provisional_weekly_bar_is_asked_for_again_from_itself_across_the_chan
     assert _fetch_start(row, XNYS) == last_bar
 
 
+# ------------------------------------------------------------------------- the selection at close plus settle
+#
+# The 2026-11-10 ruling (addendum on decision tj-grna9p.8, built in 8ecbb33a): a DAILY session is owed only from its
+# close plus the settle margin. _behind judges with HealthConfig(settle_margin=settle_margin_from_env()), the value
+# settle_delay() paces the pass with, so the pass the scheduler fires at close plus settle still selects the session
+# that just closed. Wed 18 Nov 2026 closes 21:00Z (EST); the newest stored bar is Tue 17 Nov's, final.
+
+NOV18_CLOSE = _z('2026-11-18T21:00:00Z')
+
+
+def _behind_at(row: CatalogRow, now: datetime) -> bool:
+    return [r.id for r in DailyRefresher._behind([row], frozenset(), XNYS, now)] == [row.id]
+
+
+@pytest.mark.parametrize(
+    ('now', 'selected'),
+    [
+        (NOV18_CLOSE, False),
+        (_z('2026-11-18T21:15:00Z'), False),
+        (_z('2026-11-18T21:30:00Z') - timedelta(seconds=1), False),
+        (_z('2026-11-18T21:30:00Z') - timedelta(microseconds=1), False),
+        (_z('2026-11-18T21:30:00Z'), True),
+        (_z('2026-11-19T14:30:00Z'), True),
+    ],
+    ids=['at the close', '21:15Z', 'a second before 21:30Z', 'a tick before 21:30Z', 'exactly 21:30Z', 'next open'],
+)
+def test_the_refresh_selects_a_just_closed_session_from_exactly_close_plus_settle(monkeypatch, now, selected):
+    monkeypatch.delenv(refresh_module.SETTLE_ENV, raising=False)
+    assert NOV18_CLOSE + refresh_module.settle_delay() == _z('2026-11-18T21:30:00Z'), 'the default margin, 30 min'
+    row = _catalog_row(Granularity.ONE_DAY, _z('2026-11-17T05:00:00Z'))
+    assert _behind_at(row, now) is selected
+
+
+def test_the_refresh_selects_a_provisional_bar_of_the_closed_session_only_from_close_plus_settle(monkeypatch):
+    """The 18th fetched mid-session (provisional): not re-asked for at 21:15Z, re-asked for at the trigger."""
+    monkeypatch.delenv(refresh_module.SETTLE_ENV, raising=False)
+    row = _catalog_row(Granularity.ONE_DAY, _z('2026-11-18T05:00:00Z'), written=_z('2026-11-18T17:00:00Z'))
+    assert not _behind_at(row, _z('2026-11-18T21:15:00Z'))
+    assert _behind_at(row, _z('2026-11-18T21:30:00Z'))
+
+
+@pytest.mark.parametrize(
+    ('minutes', 'fires'), [('0', '2026-11-18T21:00:00Z'), ('90', '2026-11-18T22:30:00Z')], ids=['zero', '90 minutes']
+)
+def test_the_refresh_selection_moves_with_the_configured_margin_as_its_trigger_does(monkeypatch, minutes, fires):
+    """The selection and the trigger read one setting: a pass at the configured trigger selects, one tick before not."""
+    monkeypatch.setenv(refresh_module.SETTLE_ENV, minutes)
+    trigger = AfterTradingEvent(XNYS, TradingEvent.CLOSE, refresh_module.settle_delay())
+    assert trigger.next_fire(_z('2026-11-18T15:00:00Z'), None) == _z(fires)
+    row = _catalog_row(Granularity.ONE_DAY, _z('2026-11-17T05:00:00Z'))
+    assert not _behind_at(row, _z(fires) - timedelta(microseconds=1))
+    assert _behind_at(row, _z(fires))
+
+
 @pytest.mark.asyncio
 async def test_a_pass_after_spring_forward_asks_for_and_records_the_next_local_midnight(world: World):
     """End to end: the request ingest gets and the request row read back both name 2026-03-09T04:00Z."""

@@ -20,6 +20,12 @@ A daily bar is stamped at its session's local midnight, as trading_calendar.sess
 WHAT THE RULING SAYS, as the acceptance on tj-grna9p.19 words it after the 2026-10-01 amendment: DAILY is FRESH
 when the last completed session is stored, LATE (pending, not a failure) from that session's close until the NEXT
 SESSION'S OPEN, and OVERDUE (the ruling's STALE, renamed 2026-10-06) from that open. There is no close + grace.
+
+AMENDED 2026-11-10 (owner ruling on decision tj-grna9p.8, built in 8ecbb33a): LATE begins at the close PLUS THE SETTLE
+MARGIN (HealthConfig.settle_margin, default 30 minutes), inclusive, because the scheduler's own refresh fires then;
+between the close and close plus the margin the session is not owed yet. The deadline (the next session's open) did
+not move. Rows that asserted LATE at a close were moved to close plus SETTLE, and each now has a twin inside the
+window; the ruling's own table is the "LATE FROM CLOSE PLUS SETTLE" section below.
 """
 
 import dataclasses
@@ -57,6 +63,8 @@ pytestmark = pytest.mark.data_store
 XNYS = calendar_for_source(DataSource.ALPACA_API)
 NEW_YORK = ZoneInfo('America/New_York')
 TICK = timedelta(microseconds=1)
+# The default settle margin, written by hand (DAILY_REFRESH_SETTLE_MINUTES unset), never read from the module.
+SETTLE = timedelta(minutes=30)
 
 
 def z(text: str) -> datetime:
@@ -93,15 +101,27 @@ DAILY_CASES = {
     'mon in session, fri stored': (z('2026-10-05T15:00:00Z'), OCT_2, DatasetHealthStatus.FRESH, OCT_2),
     # ...and Friday's bar still missing at that point is already a failure: Monday has opened.
     'mon in session, thu stored': (z('2026-10-05T15:00:00Z'), OCT_1, DatasetHealthStatus.OVERDUE, OCT_2),
-    # At the close the expectation moves to Monday; Friday's bar is no longer enough, but it is only LATE.
+    # From the close PLUS SETTLE the expectation moves to Monday; Friday's bar is no longer enough, but it is only
+    # LATE. (Before 2026-11-10 this moved at the close itself; inside the margin Monday is not owed yet.)
     'mon one tick before close, fri stored': (
         z('2026-10-05T20:00:00Z') - TICK,
         OCT_2,
         DatasetHealthStatus.FRESH,
         OCT_2,
     ),
-    'mon at close, fri stored': (z('2026-10-05T20:00:00Z'), OCT_2, DatasetHealthStatus.LATE, OCT_5),
-    'mon at close, mon stored': (z('2026-10-05T20:00:00Z'), OCT_5, DatasetHealthStatus.FRESH, OCT_5),
+    'mon at close, fri stored: not owed yet': (z('2026-10-05T20:00:00Z'), OCT_2, DatasetHealthStatus.FRESH, OCT_2),
+    'mon at close plus settle, fri stored': (
+        z('2026-10-05T20:00:00Z') + SETTLE,
+        OCT_2,
+        DatasetHealthStatus.LATE,
+        OCT_5,
+    ),
+    'mon at close plus settle, mon stored': (
+        z('2026-10-05T20:00:00Z') + SETTLE,
+        OCT_5,
+        DatasetHealthStatus.FRESH,
+        OCT_5,
+    ),
     # The amendment's own case: incomplete at 23:59 the same day is LATE, not a failure. The old close+2h
     # rule would have failed it at 22:00Z.
     'mon 23:59 ET, fri stored': (z('2026-10-06T03:59:00Z'), OCT_2, DatasetHealthStatus.LATE, OCT_5),
@@ -133,7 +153,25 @@ DAILY_CASES = {
         DatasetHealthStatus.FRESH,
         NOV_25,
     ),
-    'fri half-day at its close, wed stored': (z('2026-11-27T18:00:00Z'), NOV_25, DatasetHealthStatus.LATE, NOV_27),
+    # ...plus the settle margin, from the half-day's own close (2026-11-10 ruling): 18:30Z, not 18:00Z or 21:30Z.
+    'fri half-day at its close, wed stored: not owed yet': (
+        z('2026-11-27T18:00:00Z'),
+        NOV_25,
+        DatasetHealthStatus.FRESH,
+        NOV_25,
+    ),
+    'fri half-day one tick before its close plus settle, wed stored': (
+        z('2026-11-27T18:00:00Z') + SETTLE - TICK,
+        NOV_25,
+        DatasetHealthStatus.FRESH,
+        NOV_25,
+    ),
+    'fri half-day at its close plus settle, wed stored': (
+        z('2026-11-27T18:00:00Z') + SETTLE,
+        NOV_25,
+        DatasetHealthStatus.LATE,
+        NOV_27,
+    ),
     # A WEEKEND AND A HOLIDAY TOGETHER: Christmas Eve's bar is due by Monday 28 Dec's open, four days on.
     'christmas day, wed stored': (z('2026-12-25T15:00:00Z'), DEC_23, DatasetHealthStatus.LATE, DEC_24),
     'sun 27 dec, wed stored': (z('2026-12-27T15:00:00Z'), DEC_23, DatasetHealthStatus.LATE, DEC_24),
@@ -236,8 +274,20 @@ CREATED_MONDAY = daily_bar(OCT_5)
 
 @pytest.mark.parametrize(
     'now',
-    [z('2026-10-05T12:00:00Z'), z('2026-10-05T15:00:00Z'), z('2026-10-05T20:00:00Z') - TICK],
-    ids=['before the open', 'in session', 'one tick before the close'],
+    [
+        z('2026-10-05T12:00:00Z'),
+        z('2026-10-05T15:00:00Z'),
+        z('2026-10-05T20:00:00Z') - TICK,
+        z('2026-10-05T20:00:00Z'),
+        z('2026-10-05T20:00:00Z') + SETTLE - TICK,
+    ],
+    ids=[
+        'before the open',
+        'in session',
+        'one tick before the close',
+        'at the close',
+        'a tick before close plus settle',
+    ],
 )
 def test_daily_created_today_owes_nothing_before_its_first_session_closes(now):
     """Friday is the last completed session, but it is before start: nothing is owed, so FRESH with no expectation."""
@@ -246,17 +296,24 @@ def test_daily_created_today_owes_nothing_before_its_first_session_closes(now):
 
 @pytest.mark.parametrize(
     'now',
-    [z('2026-10-05T20:00:00Z'), z('2026-10-06T03:59:00Z'), z('2026-10-06T13:30:00Z') - TICK],
-    ids=['at the close', 'that night', 'one tick before the next open'],
+    [z('2026-10-05T20:00:00Z') + SETTLE, z('2026-10-06T03:59:00Z'), z('2026-10-06T13:30:00Z') - TICK],
+    ids=['at the close plus settle', 'that night', 'one tick before the next open'],
 )
 def test_daily_created_today_is_late_from_its_first_close_until_the_next_open(now):
+    """Owed from the first close plus SETTLE (2026-11-10 ruling; the row was at the close itself before)."""
     assert_owes(daily_in(CREATED_MONDAY, OPEN_ENDED, now), DatasetHealthStatus.LATE, OCT_5)
 
 
 def test_daily_created_today_is_overdue_from_the_next_open_and_stays_so():
-    """Overdue at Tuesday's open, and Tuesday's close (a later session owed) must not flip it back to LATE."""
+    """Overdue at Tuesday's open, and Tuesday's close (a later session owed) must not flip it back to LATE.
+
+    Tuesday is owed from its close plus SETTLE (2026-11-10 ruling), so at 20:00Z the expectation is still Monday.
+    """
     assert_owes(daily_in(CREATED_MONDAY, OPEN_ENDED, z('2026-10-06T13:30:00Z')), DatasetHealthStatus.OVERDUE, OCT_5)
-    assert_owes(daily_in(CREATED_MONDAY, OPEN_ENDED, z('2026-10-06T20:00:00Z')), DatasetHealthStatus.OVERDUE, OCT_6)
+    assert_owes(daily_in(CREATED_MONDAY, OPEN_ENDED, z('2026-10-06T20:00:00Z')), DatasetHealthStatus.OVERDUE, OCT_5)
+    assert_owes(
+        daily_in(CREATED_MONDAY, OPEN_ENDED, z('2026-10-06T20:00:00Z') + SETTLE), DatasetHealthStatus.OVERDUE, OCT_6
+    )
 
 
 def test_daily_no_bars_with_a_past_start_is_overdue_from_the_first_in_range_deadline():
@@ -266,18 +323,23 @@ def test_daily_no_bars_with_a_past_start_is_overdue_from_the_first_in_range_dead
     status never recovers to LATE after Monday's close (which, judged only against Monday, would be LATE).
     """
     start = daily_bar(OCT_1)
-    assert_owes(daily_in(start, OPEN_ENDED, z('2026-10-01T20:00:00Z')), DatasetHealthStatus.LATE, OCT_1)
+    # Owed from the close plus SETTLE (2026-11-10 ruling): nothing is owed at Thursday's close itself.
+    assert_nothing_owed(daily_in(start, OPEN_ENDED, z('2026-10-01T20:00:00Z')))
+    assert_owes(daily_in(start, OPEN_ENDED, z('2026-10-01T20:00:00Z') + SETTLE), DatasetHealthStatus.LATE, OCT_1)
     assert_owes(daily_in(start, OPEN_ENDED, z('2026-10-02T13:30:00Z') - TICK), DatasetHealthStatus.LATE, OCT_1)
     assert_owes(daily_in(start, OPEN_ENDED, z('2026-10-02T13:30:00Z')), DatasetHealthStatus.OVERDUE, OCT_1)
-    assert_owes(daily_in(start, OPEN_ENDED, z('2026-10-05T20:00:00Z')), DatasetHealthStatus.OVERDUE, OCT_5)
+    # Inside Monday's settle window the expectation is still Friday; the deadline already passed either way.
+    assert_owes(daily_in(start, OPEN_ENDED, z('2026-10-05T20:00:00Z')), DatasetHealthStatus.OVERDUE, OCT_2)
+    assert_owes(daily_in(start, OPEN_ENDED, z('2026-10-05T20:00:00Z') + SETTLE), DatasetHealthStatus.OVERDUE, OCT_5)
     assert_owes(daily_in(start, OPEN_ENDED, z('2026-10-06T03:59:00Z')), DatasetHealthStatus.OVERDUE, OCT_5)
 
 
 def test_daily_starting_mid_session_owes_that_session_once_it_closes():
-    """Start Monday 15:00Z: Monday overlaps [start, end), so it is owed at its close; Friday never is."""
+    """Start Monday 15:00Z: Monday overlaps [start, end), so it is owed at its close plus SETTLE; Friday never is."""
     start = z('2026-10-05T15:00:00Z')
     assert_nothing_owed(daily_in(start, OPEN_ENDED, z('2026-10-05T20:00:00Z') - TICK))
-    assert_owes(daily_in(start, OPEN_ENDED, z('2026-10-05T20:00:00Z')), DatasetHealthStatus.LATE, OCT_5)
+    assert_nothing_owed(daily_in(start, OPEN_ENDED, z('2026-10-05T20:00:00Z') + SETTLE - TICK))
+    assert_owes(daily_in(start, OPEN_ENDED, z('2026-10-05T20:00:00Z') + SETTLE), DatasetHealthStatus.LATE, OCT_5)
     assert_owes(daily_in(start, OPEN_ENDED, z('2026-10-06T13:30:00Z')), DatasetHealthStatus.OVERDUE, OCT_5)
 
 
@@ -298,7 +360,11 @@ def test_daily_whose_end_has_passed_is_judged_against_its_last_in_range_session(
     The expectation stays Monday rather than moving to a session past end.
     """
     last = daily_bar(OCT_2)
-    assert_owes(daily_in(ENDED_START, ENDED_END, z('2026-10-05T20:00:00Z'), last), DatasetHealthStatus.LATE, OCT_5)
+    # Monday is owed from its close plus SETTLE (2026-11-10 ruling): at the close itself Friday is still enough.
+    assert_owes(daily_in(ENDED_START, ENDED_END, z('2026-10-05T20:00:00Z'), last), DatasetHealthStatus.FRESH, OCT_2)
+    assert_owes(
+        daily_in(ENDED_START, ENDED_END, z('2026-10-05T20:00:00Z') + SETTLE, last), DatasetHealthStatus.LATE, OCT_5
+    )
     assert_owes(
         daily_in(ENDED_START, ENDED_END, z('2026-10-06T13:30:00Z') - TICK, last), DatasetHealthStatus.LATE, OCT_5
     )
@@ -313,13 +379,15 @@ def test_daily_starting_after_now_owes_nothing():
 
 
 def test_daily_starting_on_a_non_session_day_expects_the_next_session():
-    """Saturday 3 Oct owes Monday 5 Oct; Thanksgiving owes the Friday half-day, from its 18:00Z close."""
+    """Saturday 3 Oct owes Monday 5 Oct; Thanksgiving owes the Friday half-day, from its 18:00Z close plus SETTLE."""
     saturday = daily_bar(date(2026, 10, 3))
-    assert_nothing_owed(daily_in(saturday, OPEN_ENDED, z('2026-10-05T20:00:00Z') - TICK))
-    assert_owes(daily_in(saturday, OPEN_ENDED, z('2026-10-05T20:00:00Z')), DatasetHealthStatus.LATE, OCT_5)
+    assert_nothing_owed(daily_in(saturday, OPEN_ENDED, z('2026-10-05T20:00:00Z') + SETTLE - TICK))
+    assert_owes(daily_in(saturday, OPEN_ENDED, z('2026-10-05T20:00:00Z') + SETTLE), DatasetHealthStatus.LATE, OCT_5)
     thanksgiving = daily_bar(date(2026, 11, 26))
-    assert_nothing_owed(daily_in(thanksgiving, OPEN_ENDED, z('2026-11-27T18:00:00Z') - TICK))
-    assert_owes(daily_in(thanksgiving, OPEN_ENDED, z('2026-11-27T18:00:00Z')), DatasetHealthStatus.LATE, NOV_27)
+    assert_nothing_owed(daily_in(thanksgiving, OPEN_ENDED, z('2026-11-27T18:00:00Z') + SETTLE - TICK))
+    assert_owes(
+        daily_in(thanksgiving, OPEN_ENDED, z('2026-11-27T18:00:00Z') + SETTLE), DatasetHealthStatus.LATE, NOV_27
+    )
 
 
 @pytest.mark.parametrize(
@@ -331,6 +399,374 @@ def test_daily_with_a_far_future_end_evaluates(end):
     assert_owes(
         daily_in(CREATED_MONDAY, end, z('2026-10-06T22:00:00Z'), daily_bar(OCT_6)), DatasetHealthStatus.FRESH, OCT_6
     )
+
+
+# ------------------------------------------------------------------------------------- LATE FROM CLOSE PLUS SETTLE
+#
+# THE RULING (owner, 2026-11-10, addendum on decision tj-grna9p.8; built in 8ecbb33a, task tj-7zjov1.366; these rows
+# are tj-7zjov1.367's): a DAILY period is owed only once its close PLUS THE SETTLE MARGIN has passed, inclusive,
+# because the scheduler's own trigger (AfterTradingEvent CLOSE plus settle_delay()) fires then: "If a dataset hasn't
+# been triggered by the scheduler to update, it can't be late." The deadline (OVERDUE at the next session's open) is
+# judged against the real now, unchanged. STREAM and STATIC are unchanged.
+#
+# THE DATES, by hand, a winter (EST) week of 2026: Tue 17 Nov and Wed 18 Nov close 21:00Z; Thu 19 Nov opens 14:30Z.
+# The week of Mon 16 Nov ends at Fri 20 Nov's 21:00Z close; Mon 23 Nov opens 14:30Z. Thanksgiving week (Mon 23 Nov)
+# ends at Fri 27 Nov's EARLY close, 18:00Z. November's last session is Mon 30 Nov (close 21:00Z); Tue 1 Dec opens
+# 14:30Z. The margin is SETTLE (30 minutes) unless a row says otherwise.
+
+NOV_16, NOV_17, NOV_18, NOV_23 = date(2026, 11, 16), date(2026, 11, 17), date(2026, 11, 18), date(2026, 11, 23)
+NOV18_CLOSE = z('2026-11-18T21:00:00Z')
+NOV18_SETTLED = z('2026-11-18T21:30:00Z')
+NOV19_OPEN = z('2026-11-19T14:30:00Z')
+WINTER_START = z('2026-09-01T04:00:00Z')
+
+
+def winter(
+    now: datetime,
+    last_bar: datetime | None,
+    written: datetime | None = None,
+    *,
+    start: datetime = WINTER_START,
+    granularity: Granularity = Granularity.ONE_DAY,
+    margin: timedelta | None = None,
+):
+    return evaluate_dataset(
+        update_type=UpdateType.DAILY,
+        granularity=granularity,
+        collect=True,
+        start=start,
+        end=OPEN_ENDED,
+        last_bar=last_bar,
+        covered=None,
+        calendar=XNYS,
+        now=now,
+        config=None if margin is None else HealthConfig(settle_margin=margin),
+        last_bar_written_at=written,
+    )
+
+
+def assert_health(health, status: DatasetHealthStatus, period: date | None) -> None:
+    assert health.status is status, health
+    assert health.expected_last_session == period, health
+    assert health.expected_last_bar == (None if period is None else daily_bar(period)), health
+
+
+# (now, written time of the 18th's bar or None for 'the 18th is not stored', status, expected period)
+# The stored bar is Tue 17 Nov's (final, unknown write time) when the 18th is not stored.
+SETTLE_RULE_CASES = {
+    # (1) The 18th not stored: FRESH (judged against the 17th) before the trigger, LATE from it.
+    'not stored, at the close: FRESH': (NOV18_CLOSE, None, DatasetHealthStatus.FRESH, NOV_17),
+    'not stored, 21:15Z: FRESH': (z('2026-11-18T21:15:00Z'), None, DatasetHealthStatus.FRESH, NOV_17),
+    # (2) The boundary, inclusive.
+    'not stored, a tick before 21:30Z: FRESH': (NOV18_SETTLED - TICK, None, DatasetHealthStatus.FRESH, NOV_17),
+    'not stored, exactly 21:30Z: LATE': (NOV18_SETTLED, None, DatasetHealthStatus.LATE, NOV_18),
+    # (5) The deadline did not move: LATE until the next open, OVERDUE at it.
+    'not stored, a tick before the next open: LATE': (NOV19_OPEN - TICK, None, DatasetHealthStatus.LATE, NOV_18),
+    'not stored, at the next open: OVERDUE': (NOV19_OPEN, None, DatasetHealthStatus.OVERDUE, NOV_18),
+    # (3) The 18th stored, its bar provisional (written mid-session, or after the close but inside the margin): a
+    # provisional bar must not read LATE before the trigger. From 21:30Z it is the expected period and provisional.
+    'provisional (mid-session), 21:15Z: FRESH': (
+        z('2026-11-18T21:15:00Z'),
+        z('2026-11-18T17:00:00Z'),
+        DatasetHealthStatus.FRESH,
+        NOV_17,
+    ),
+    'provisional (21:05Z), 21:15Z: FRESH': (
+        z('2026-11-18T21:15:00Z'),
+        z('2026-11-18T21:05:00Z'),
+        DatasetHealthStatus.FRESH,
+        NOV_17,
+    ),
+    'provisional (21:05Z), a tick before 21:30Z: FRESH': (
+        NOV18_SETTLED - TICK,
+        z('2026-11-18T21:05:00Z'),
+        DatasetHealthStatus.FRESH,
+        NOV_17,
+    ),
+    'provisional (mid-session), 21:30Z: LATE': (
+        NOV18_SETTLED,
+        z('2026-11-18T17:00:00Z'),
+        DatasetHealthStatus.LATE,
+        NOV_18,
+    ),
+    'provisional (21:05Z), 21:30Z: LATE': (NOV18_SETTLED, z('2026-11-18T21:05:00Z'), DatasetHealthStatus.LATE, NOV_18),
+    'provisional, at the next open: OVERDUE': (
+        NOV19_OPEN,
+        z('2026-11-18T17:00:00Z'),
+        DatasetHealthStatus.OVERDUE,
+        NOV_18,
+    ),
+    # The trigger's own fetch, written at 21:30Z, is final: FRESH from then on.
+    'final (written 21:30Z), 21:30Z: FRESH': (NOV18_SETTLED, NOV18_SETTLED, DatasetHealthStatus.FRESH, NOV_18),
+    'final (written 21:30Z), 22:00Z: FRESH': (
+        z('2026-11-18T22:00:00Z'),
+        NOV18_SETTLED,
+        DatasetHealthStatus.FRESH,
+        NOV_18,
+    ),
+}
+
+
+@pytest.mark.parametrize(('now', 'written', 'status', 'period'), SETTLE_RULE_CASES.values(), ids=SETTLE_RULE_CASES)
+def test_a_daily_session_is_owed_from_its_close_plus_the_settle_margin(now, written, status, period):
+    last_bar = daily_bar(NOV_17) if written is None else daily_bar(NOV_18)
+    health = winter(now, last_bar, written)
+    assert_health(health, status, period)
+    assert health.is_failure is (status is DatasetHealthStatus.OVERDUE)
+
+
+def test_the_default_margin_is_the_one_these_rows_assume():
+    """The rows above pass no config: they hold only while the default margin is SETTLE."""
+    assert HealthConfig().settle_margin == SETTLE
+
+
+# (4) Created at 21:10Z on the 18th (after the close, inside the margin), declared start the 18th's local midnight, no
+# bars: the 18th is in range, so it is owed from 21:30Z, but not before.
+CREATED_AT_2110 = {
+    'at creation, 21:10Z': (z('2026-11-18T21:10:00Z'), DatasetHealthStatus.FRESH, None),
+    '21:15Z': (z('2026-11-18T21:15:00Z'), DatasetHealthStatus.FRESH, None),
+    'a tick before 21:30Z': (NOV18_SETTLED - TICK, DatasetHealthStatus.FRESH, None),
+    '21:30Z': (NOV18_SETTLED, DatasetHealthStatus.LATE, NOV_18),
+    'a tick before the next open': (NOV19_OPEN - TICK, DatasetHealthStatus.LATE, NOV_18),
+    'the next open': (NOV19_OPEN, DatasetHealthStatus.OVERDUE, NOV_18),
+}
+
+
+@pytest.mark.parametrize(('now', 'status', 'period'), CREATED_AT_2110.values(), ids=CREATED_AT_2110)
+def test_a_dataset_created_inside_the_margin_owes_its_session_only_from_close_plus_settle(now, status, period):
+    assert_health(winter(now, None, start=daily_bar(NOV_18)), status, period)
+
+
+def test_a_dataset_already_overdue_stays_overdue_inside_the_next_settle_window():
+    """The deadline is the FIRST missed session's, against the real now: the window never hides an older failure.
+
+    Tue 17 Nov never stored (the 16th is): OVERDUE from Wed 18 Nov's open, and still OVERDUE at the 18th's close and
+    inside its margin, where the expectation is still the 17th.
+    """
+    stored = daily_bar(NOV_16)
+    assert_health(winter(z('2026-11-18T14:30:00Z'), stored), DatasetHealthStatus.OVERDUE, NOV_17)
+    assert_health(winter(NOV18_CLOSE, stored), DatasetHealthStatus.OVERDUE, NOV_17)
+    assert_health(winter(z('2026-11-18T21:15:00Z'), stored), DatasetHealthStatus.OVERDUE, NOV_17)
+    assert_health(winter(NOV18_SETTLED, stored), DatasetHealthStatus.OVERDUE, NOV_18)
+
+
+# (6) The margin comes from the config: zero is the pre-ruling rule (LATE at the close itself), and another margin
+# moves the instant with it.
+MARGIN_CASES = {
+    'zero, a tick before the close: FRESH': (timedelta(0), NOV18_CLOSE - TICK, DatasetHealthStatus.FRESH, NOV_17),
+    'zero, at the close: LATE': (timedelta(0), NOV18_CLOSE, DatasetHealthStatus.LATE, NOV_18),
+    'zero, at the next open: OVERDUE': (timedelta(0), NOV19_OPEN, DatasetHealthStatus.OVERDUE, NOV_18),
+    'two hours, 22:59:59.999999Z: FRESH': (
+        timedelta(hours=2),
+        z('2026-11-18T23:00:00Z') - TICK,
+        DatasetHealthStatus.FRESH,
+        NOV_17,
+    ),
+    'two hours, 23:00Z: LATE': (timedelta(hours=2), z('2026-11-18T23:00:00Z'), DatasetHealthStatus.LATE, NOV_18),
+    'two hours, at the next open: OVERDUE': (timedelta(hours=2), NOV19_OPEN, DatasetHealthStatus.OVERDUE, NOV_18),
+}
+
+
+@pytest.mark.parametrize(('margin', 'now', 'status', 'period'), MARGIN_CASES.values(), ids=MARGIN_CASES)
+def test_the_owed_instant_follows_the_configured_margin_and_zero_is_the_old_rule(margin, now, status, period):
+    assert_health(winter(now, daily_bar(NOV_17), margin=margin), status, period)
+
+
+AT_CLOSE_PLUS_SETTLE_ROWS = [
+    'mon at close plus settle, fri stored',
+    'mon at close plus settle, mon stored',
+    'fri half-day at its close plus settle, wed stored',
+]
+
+
+@pytest.mark.parametrize('row', AT_CLOSE_PLUS_SETTLE_ROWS)
+def test_a_zero_margin_gives_at_the_bare_close_what_the_default_gives_at_close_plus_settle(row):
+    """The DAILY_CASES rows moved to close plus SETTLE on 2026-11-10 read the same at the bare close with margin 0."""
+    now, stored, status, session = DAILY_CASES[row]
+    old = winter(now - SETTLE, daily_bar(stored), start=z('2026-01-02T00:00:00Z'), margin=timedelta(0))
+    assert (old.status, old.expected_last_session) == (status, session)
+
+
+# (7) 1week and 1month: the period's LAST close plus the margin decides when it is owed; its deadline is the open of
+# the first session after the period.
+PERIODIC_SETTLE_CASES = {
+    'week of 16 Nov, Fri 21:15Z: FRESH against the week of 9 Nov': (
+        Granularity.ONE_WEEK,
+        date(2026, 11, 9),
+        None,
+        z('2026-11-20T21:15:00Z'),
+        DatasetHealthStatus.FRESH,
+        date(2026, 11, 9),
+    ),
+    'week of 16 Nov, a tick before Fri 21:30Z: FRESH': (
+        Granularity.ONE_WEEK,
+        date(2026, 11, 9),
+        None,
+        z('2026-11-20T21:30:00Z') - TICK,
+        DatasetHealthStatus.FRESH,
+        date(2026, 11, 9),
+    ),
+    'week of 16 Nov, Fri 21:30Z: LATE': (
+        Granularity.ONE_WEEK,
+        date(2026, 11, 9),
+        None,
+        z('2026-11-20T21:30:00Z'),
+        DatasetHealthStatus.LATE,
+        NOV_16,
+    ),
+    'week of 16 Nov, a tick before Mon 23 Nov open: LATE': (
+        Granularity.ONE_WEEK,
+        date(2026, 11, 9),
+        None,
+        z('2026-11-23T14:30:00Z') - TICK,
+        DatasetHealthStatus.LATE,
+        NOV_16,
+    ),
+    'week of 16 Nov, Mon 23 Nov open: OVERDUE': (
+        Granularity.ONE_WEEK,
+        date(2026, 11, 9),
+        None,
+        z('2026-11-23T14:30:00Z'),
+        DatasetHealthStatus.OVERDUE,
+        NOV_16,
+    ),
+    'week of 16 Nov stored provisional (Fri 20:00Z), Fri 21:15Z: FRESH': (
+        Granularity.ONE_WEEK,
+        NOV_16,
+        z('2026-11-20T20:00:00Z'),
+        z('2026-11-20T21:15:00Z'),
+        DatasetHealthStatus.FRESH,
+        date(2026, 11, 9),
+    ),
+    'week of 16 Nov stored provisional (Fri 20:00Z), Fri 21:30Z: LATE': (
+        Granularity.ONE_WEEK,
+        NOV_16,
+        z('2026-11-20T20:00:00Z'),
+        z('2026-11-20T21:30:00Z'),
+        DatasetHealthStatus.LATE,
+        NOV_16,
+    ),
+    # Thanksgiving week ends at the Friday EARLY close, 18:00Z: owed from 18:30Z, not 21:30Z.
+    'thanksgiving week, Fri 18:15Z: FRESH': (
+        Granularity.ONE_WEEK,
+        NOV_16,
+        None,
+        z('2026-11-27T18:15:00Z'),
+        DatasetHealthStatus.FRESH,
+        NOV_16,
+    ),
+    'thanksgiving week, Fri 18:30Z: LATE': (
+        Granularity.ONE_WEEK,
+        NOV_16,
+        None,
+        z('2026-11-27T18:30:00Z'),
+        DatasetHealthStatus.LATE,
+        NOV_23,
+    ),
+    'november, Mon 30 Nov 21:15Z: FRESH against october': (
+        Granularity.ONE_MONTH,
+        date(2026, 10, 1),
+        None,
+        z('2026-11-30T21:15:00Z'),
+        DatasetHealthStatus.FRESH,
+        date(2026, 10, 1),
+    ),
+    'november, a tick before Mon 30 Nov 21:30Z: FRESH': (
+        Granularity.ONE_MONTH,
+        date(2026, 10, 1),
+        None,
+        z('2026-11-30T21:30:00Z') - TICK,
+        DatasetHealthStatus.FRESH,
+        date(2026, 10, 1),
+    ),
+    'november, Mon 30 Nov 21:30Z: LATE': (
+        Granularity.ONE_MONTH,
+        date(2026, 10, 1),
+        None,
+        z('2026-11-30T21:30:00Z'),
+        DatasetHealthStatus.LATE,
+        date(2026, 11, 1),
+    ),
+    'november, Tue 1 Dec open: OVERDUE': (
+        Granularity.ONE_MONTH,
+        date(2026, 10, 1),
+        None,
+        z('2026-12-01T14:30:00Z'),
+        DatasetHealthStatus.OVERDUE,
+        date(2026, 11, 1),
+    ),
+    'november stored provisional (Mon 30 Nov 21:10Z), 21:15Z: FRESH': (
+        Granularity.ONE_MONTH,
+        date(2026, 11, 2),
+        z('2026-11-30T21:10:00Z'),
+        z('2026-11-30T21:15:00Z'),
+        DatasetHealthStatus.FRESH,
+        date(2026, 10, 1),
+    ),
+    'november stored provisional (Mon 30 Nov 21:10Z), 21:30Z: LATE': (
+        Granularity.ONE_MONTH,
+        date(2026, 11, 2),
+        z('2026-11-30T21:10:00Z'),
+        z('2026-11-30T21:30:00Z'),
+        DatasetHealthStatus.LATE,
+        date(2026, 11, 1),
+    ),
+}
+
+
+@pytest.mark.parametrize(
+    ('granularity', 'stored', 'written', 'now', 'status', 'period'),
+    PERIODIC_SETTLE_CASES.values(),
+    ids=PERIODIC_SETTLE_CASES,
+)
+def test_a_weekly_or_monthly_period_is_owed_from_its_last_close_plus_the_margin(
+    granularity, stored, written, now, status, period
+):
+    assert_health(winter(now, daily_bar(stored), written, granularity=granularity), status, period)
+
+
+# (9) STREAM and STATIC do not take the margin: inside the 18th's window they read exactly as at the bare close.
+
+
+def test_stream_ignores_the_settle_window():
+    """After the close a STREAM 1min dataset owes the session's last bar (20:59Z) at once, margin or not."""
+    threshold = z('2026-11-18T20:59:00Z')
+    for now in (NOV18_CLOSE, z('2026-11-18T21:15:00Z'), NOV18_SETTLED - TICK):
+        for margin in (None, timedelta(0), timedelta(hours=2)):
+            for last_bar, status in ((threshold, DatasetHealthStatus.FRESH), (z('2026-11-18T20:58:00Z'), None)):
+                got = evaluate_dataset(
+                    update_type=UpdateType.STREAM,
+                    granularity=Granularity.ONE_MINUTE,
+                    collect=True,
+                    start=WINTER_START,
+                    end=OPEN_ENDED,
+                    last_bar=last_bar,
+                    covered=None,
+                    calendar=XNYS,
+                    now=now,
+                    config=None if margin is None else HealthConfig(settle_margin=margin),
+                )
+                want = DatasetHealthStatus.OVERDUE if status is None else status
+                assert got == DatasetHealth(want, expected_last_bar=threshold), (now, margin, last_bar)
+
+
+def test_static_ignores_the_settle_window():
+    """[Mon 16 Nov, Thu 19 Nov) holding the 16th and 17th: the 18th is a gap from its close, margin or not."""
+    for now in (NOV18_CLOSE, z('2026-11-18T21:15:00Z'), NOV18_SETTLED - TICK):
+        for margin in (None, timedelta(hours=2)):
+            got = evaluate_dataset(
+                update_type=UpdateType.STATIC,
+                granularity=Granularity.ONE_DAY,
+                collect=None,
+                start=daily_bar(NOV_16),
+                end=daily_bar(date(2026, 11, 19)),
+                last_bar=daily_bar(NOV_17),
+                covered=frozenset({NOV_16, NOV_17}),
+                calendar=XNYS,
+                now=now,
+                config=None if margin is None else HealthConfig(settle_margin=margin),
+            )
+            assert got == DatasetHealth(DatasetHealthStatus.GAPS, gap_count=1), (now, margin)
 
 
 # ------------------------------------------------------------------------------------------------- STREAM

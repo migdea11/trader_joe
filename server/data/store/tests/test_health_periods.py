@@ -47,7 +47,7 @@ from data.store.app.completeness import (
 )
 from data.store.app.daily_refresh import DailyRefresher
 from data.store.app.database.crud.stock.dataset_catalog import CatalogRow
-from data.store.app.health import DatasetHealth, DatasetHealthStatus, evaluate_dataset
+from data.store.app.health import DatasetHealth, DatasetHealthStatus, HealthConfig, evaluate_dataset
 from data.store.app.trading_calendar import TradingCalendar, calendar_for_source, session_of
 
 
@@ -56,6 +56,9 @@ pytestmark = pytest.mark.data_store
 XNYS = calendar_for_source(DataSource.ALPACA_API)
 NEW_YORK = ZoneInfo('America/New_York')
 TICK = timedelta(microseconds=1)
+# The default settle margin, by hand. Since the 2026-11-10 ruling (addendum on decision tj-grna9p.8, built in
+# 8ecbb33a) a DAILY period is owed only from its last close PLUS this margin; the deadline did not move.
+SETTLE = timedelta(minutes=30)
 WEEK = Granularity.ONE_WEEK
 MONTH = Granularity.ONE_MONTH
 OPEN_ENDED = datetime(2100, 1, 1, tzinfo=ZoneInfo('UTC'))
@@ -108,7 +111,7 @@ def static(start, end, covered, granularity, now=NOW) -> DatasetHealth:
     )
 
 
-def subscription(start, now, last_bar, granularity, end=OPEN_ENDED) -> DatasetHealth:
+def subscription(start, now, last_bar, granularity, end=OPEN_ENDED, config=None) -> DatasetHealth:
     return evaluate_dataset(
         update_type=UpdateType.DAILY,
         granularity=granularity,
@@ -119,6 +122,7 @@ def subscription(start, now, last_bar, granularity, end=OPEN_ENDED) -> DatasetHe
         covered=None,
         calendar=XNYS,
         now=now,
+        config=config,
     )
 
 
@@ -704,14 +708,29 @@ DAILY_WEEK_CASES = {
         'FRESH',
         '2026-10-05',
     ),
-    'at friday close the week ends: late': (z('2026-10-16T20:00:00Z'), m(d('2026-10-05')), 'LATE', '2026-10-12'),
+    # The week ends at Friday's close but is owed only from the close plus SETTLE (2026-11-10 ruling; this row was
+    # LATE at the bare close before).
+    'at friday close the week is not owed yet': (z('2026-10-16T20:00:00Z'), m(d('2026-10-05')), 'FRESH', '2026-10-05'),
+    'a tick before friday close plus settle': (
+        z('2026-10-16T20:00:00Z') + SETTLE - TICK,
+        m(d('2026-10-05')),
+        'FRESH',
+        '2026-10-05',
+    ),
+    'at friday close plus settle the week is owed: late': (
+        z('2026-10-16T20:00:00Z') + SETTLE,
+        m(d('2026-10-05')),
+        'LATE',
+        '2026-10-12',
+    ),
     'all weekend: late': (z('2026-10-18T12:00:00Z'), m(d('2026-10-05')), 'LATE', '2026-10-12'),
     'a tick before monday open: late': (z('2026-10-19T13:30:00Z') - TICK, m(d('2026-10-05')), 'LATE', '2026-10-12'),
     'at monday open: overdue': (z('2026-10-19T13:30:00Z'), m(d('2026-10-05')), 'OVERDUE', '2026-10-12'),
     'at monday open, the week stored': (z('2026-10-19T13:30:00Z'), m(d('2026-10-12')), 'FRESH', '2026-10-12'),
-    # A missed week stays OVERDUE when the following week ends: the deadline is the FIRST missed week's.
+    # A missed week stays OVERDUE when the following week ends: the deadline is the FIRST missed week's. (Judged at
+    # the close plus SETTLE, where the week of 19 Oct becomes the expected one; at the bare close it is still 12 Oct.)
     'a missed week stays overdue after the next week ends': (
-        z('2026-10-23T20:00:00Z'),
+        z('2026-10-23T20:00:00Z') + SETTLE,
         m(d('2026-10-05')),
         'OVERDUE',
         '2026-10-19',
@@ -779,15 +798,18 @@ def test_a_weekly_subscription_does_not_care_which_day_of_the_week_is_stamped(of
 
 
 def test_a_weekly_subscription_started_mid_week_owes_nothing_until_its_first_whole_week_ends():
-    """Started Wed 14 Oct: the week of 12 Oct is a partial first period. Nothing is owed until Fri 23 Oct closes."""
+    """Started Wed 14 Oct: the week of 12 Oct is a partial first period. Nothing is owed until Fri 23 Oct closes.
+
+    ...plus SETTLE (2026-11-10 ruling): the edge moved from 20:00Z to 20:30Z.
+    """
     start = m(d('2026-10-14'))
-    nothing = subscription(start, z('2026-10-23T20:00:00Z') - TICK, None, WEEK)
+    nothing = subscription(start, z('2026-10-23T20:00:00Z') + SETTLE - TICK, None, WEEK)
     assert (nothing.status, nothing.expected_last_session, nothing.expected_last_bar) == (
         DatasetHealthStatus.FRESH,
         None,
         None,
     )
-    owed = subscription(start, z('2026-10-23T20:00:00Z'), None, WEEK)
+    owed = subscription(start, z('2026-10-23T20:00:00Z') + SETTLE, None, WEEK)
     assert (owed.status, owed.expected_last_session) == (DatasetHealthStatus.LATE, d('2026-10-19'))
     assert subscription(start, z('2026-10-26T13:30:00Z'), None, WEEK).status is DatasetHealthStatus.OVERDUE
 
@@ -813,7 +835,20 @@ DAILY_MONTH_CASES = {
         'FRESH',
         '2026-08-01',
     ),
-    'at september s last close: late': (z('2026-09-30T20:00:00Z'), m(d('2026-08-03')), 'LATE', '2026-09-01'),
+    # Owed from the last close plus SETTLE (2026-11-10 ruling; LATE at the bare close before).
+    'at september s last close: not owed yet': (z('2026-09-30T20:00:00Z'), m(d('2026-08-03')), 'FRESH', '2026-08-01'),
+    'a tick before september s last close plus settle': (
+        z('2026-09-30T20:00:00Z') + SETTLE - TICK,
+        m(d('2026-08-03')),
+        'FRESH',
+        '2026-08-01',
+    ),
+    'at september s last close plus settle: late': (
+        z('2026-09-30T20:00:00Z') + SETTLE,
+        m(d('2026-08-03')),
+        'LATE',
+        '2026-09-01',
+    ),
     'a tick before october s first open: late': (
         z('2026-10-01T13:30:00Z') - TICK,
         m(d('2026-08-03')),
@@ -821,8 +856,9 @@ DAILY_MONTH_CASES = {
         '2026-09-01',
     ),
     'at october s first open: overdue': (z('2026-10-01T13:30:00Z'), m(d('2026-08-03')), 'OVERDUE', '2026-09-01'),
+    # Judged at October's last close plus SETTLE, where October becomes the expected month.
     'a missed month stays overdue after the next month ends': (
-        z('2026-10-30T20:00:00Z'),
+        z('2026-10-30T20:00:00Z') + SETTLE,
         m(d('2026-08-03')),
         'OVERDUE',
         '2026-10-01',
@@ -863,7 +899,9 @@ def test_a_monthly_subscription_started_on_the_15th_owes_nothing_for_that_month(
     start = m(d('2026-09-15'))
     assert subscription(start, NOW, None, MONTH).expected_last_session is None
     assert subscription(start, NOW, None, MONTH).status is DatasetHealthStatus.FRESH
-    late = subscription(start, z('2026-10-30T20:00:00Z'), None, MONTH)
+    # October is owed from its last close plus SETTLE (2026-11-10 ruling), not at the bare close.
+    assert subscription(start, z('2026-10-30T20:00:00Z'), None, MONTH).expected_last_session is None
+    late = subscription(start, z('2026-10-30T20:00:00Z') + SETTLE, None, MONTH)
     assert (late.status, late.expected_last_session) == (DatasetHealthStatus.LATE, d('2026-10-01'))
     # The first session after October is Mon 2 Nov, opening 14:30Z (EST).
     assert subscription(start, z('2026-11-02T14:30:00Z') - TICK, None, MONTH).status is DatasetHealthStatus.LATE
@@ -971,8 +1009,17 @@ def _old_buckets(start, end, covered, calendar: TradingCalendar, now, buckets):
     return out
 
 
-def _old_daily(start, end, last_bar, calendar: TradingCalendar, now):
-    owed = [s for s in calendar.sessions_overlapping(start, min(end, now)) if calendar.session_close(s) <= now]
+def _old_daily(start, end, last_bar, calendar: TradingCalendar, now, owed_now=None):
+    """The pre-change DAILY rule. `owed_now` (default `now`) is the instant the OWED sessions are judged at.
+
+    The 2026-11-10 ruling (built in 8ecbb33a) owes a session only from its close plus the settle margin, so a caller
+    comparing against the default margin passes `owed_now = now - SETTLE`. The deadline is judged at the real `now`
+    either way, which is the half of the ruling that did not move.
+    """
+    owed_now = now if owed_now is None else owed_now
+    owed = [
+        s for s in calendar.sessions_overlapping(start, min(end, owed_now)) if calendar.session_close(s) <= owed_now
+    ]
     if not owed:
         return DatasetHealth(DatasetHealthStatus.FRESH)
     expected = owed[-1]
@@ -1054,10 +1101,15 @@ def test_session_granularities_give_exactly_the_pre_change_results(granularity):
                     ):
                         differ.append(('buckets', start, end, now, covered, buckets))
             for last_bar in GRID_LAST_BARS:
+                # 2026-11-10 ruling: under the default margin a session is owed from its close plus SETTLE, the
+                # deadline unchanged; with a margin of zero the result is the pre-change code's, verbatim.
                 got = subscription(start, now, last_bar, granularity, end)
                 statuses.add(got.status)
-                if got != _old_daily(start, end, last_bar, XNYS, now):
+                if got != _old_daily(start, end, last_bar, XNYS, now, owed_now=now - SETTLE):
                     differ.append(('daily', start, end, now, last_bar, got))
+                zero = subscription(start, now, last_bar, granularity, end, HealthConfig(settle_margin=timedelta(0)))
+                if zero != _old_daily(start, end, last_bar, XNYS, now):
+                    differ.append(('daily, zero margin', start, end, now, last_bar, zero))
     assert not differ, differ[:5]
     # Guard the guard: the grid reaches every status the two rules can give.
     assert statuses == {

@@ -244,10 +244,22 @@ MONDAY_CLOSE = z(2026, 11, 9, 21)
         (z(2026, 11, 8, 12), DatasetHealthStatus.FRESH),  # Sunday
         (z(2026, 11, 9, 15), DatasetHealthStatus.FRESH),  # Monday mid-session
         (MONDAY_CLOSE - timedelta(seconds=1), DatasetHealthStatus.FRESH),
-        (MONDAY_CLOSE, DatasetHealthStatus.LATE),  # Monday's bar is owed from its close
+        # Monday's bar is owed from its close plus the settle margin (CONFIG, 30 min; the 2026-11-10 ruling on
+        # decision tj-grna9p.8): not at the bare close, as this row asserted before.
+        (MONDAY_CLOSE, DatasetHealthStatus.FRESH),
+        (MONDAY_CLOSE + timedelta(minutes=30) - timedelta(seconds=1), DatasetHealthStatus.FRESH),
+        (MONDAY_CLOSE + timedelta(minutes=30), DatasetHealthStatus.LATE),
         (z(2026, 11, 10, 14, 30), DatasetHealthStatus.OVERDUE),  # Tuesday's open
     ],
-    ids=['sunday', 'monday-session', 'just-before-monday-close', 'monday-close', 'tuesday-open'],
+    ids=[
+        'sunday',
+        'monday-session',
+        'just-before-monday-close',
+        'monday-close',
+        'just-before-monday-close-plus-settle',
+        'monday-close-plus-settle',
+        'tuesday-open',
+    ],
 )
 def test_a_saturday_start_owes_nothing_until_monday_closes(xnys, now, status):
     """P3: the first fetch stores no bar (no session); nothing is owed before the first session after the start."""
@@ -274,7 +286,10 @@ def test_an_evening_snapshot_s_first_bar_is_final_and_the_dataset_reads_fresh_un
     assert row.start == monday_bar, "the snapshot day's bar is inside [start, end)"
     assert judge(row, xnys, z(2026, 11, 10, 3)) is DatasetHealthStatus.FRESH
     assert judge(row, xnys, z(2026, 11, 10, 20, 59)) is DatasetHealthStatus.FRESH
-    assert judge(row, xnys, z(2026, 11, 10, 21)) is DatasetHealthStatus.LATE, "then Tuesday's bar is owed"
+    # Tuesday's bar is owed from its close plus the 30-minute margin (2026-11-10 ruling), not the bare close.
+    assert judge(row, xnys, z(2026, 11, 10, 21)) is DatasetHealthStatus.FRESH
+    assert judge(row, xnys, z(2026, 11, 10, 21, 29)) is DatasetHealthStatus.FRESH
+    assert judge(row, xnys, z(2026, 11, 10, 21, 30)) is DatasetHealthStatus.LATE, "then Tuesday's bar is owed"
 
 
 def test_a_mid_session_snapshot_s_first_bar_is_provisional_late_then_fresh_after_the_rewrite(xnys):
@@ -291,11 +306,16 @@ def test_a_mid_session_snapshot_s_first_bar_is_provisional_late_then_fresh_after
 
 
 def test_a_thanksgiving_start_owes_nothing_until_friday_s_early_close(xnys):
-    """P3 on a holiday: Wednesday's session is before the start, so nothing is owed until Friday closes (18:00Z)."""
+    """P3 on a holiday: Wednesday's session is before the start, so nothing is owed until Friday closes (18:00Z).
+
+    ...plus the 30-minute settle margin (2026-11-10 ruling): owed from 18:30Z.
+    """
     row = panel_row(panel_dataset_start(SOURCE, z(2026, 11, 26, 20)))
     assert judge(row, xnys, z(2026, 11, 26, 22)) is DatasetHealthStatus.FRESH
     assert judge(row, xnys, z(2026, 11, 27, 17, 59)) is DatasetHealthStatus.FRESH
-    assert judge(row, xnys, z(2026, 11, 27, 18)) is DatasetHealthStatus.LATE
+    assert judge(row, xnys, z(2026, 11, 27, 18)) is DatasetHealthStatus.FRESH
+    assert judge(row, xnys, z(2026, 11, 27, 18, 29)) is DatasetHealthStatus.FRESH
+    assert judge(row, xnys, z(2026, 11, 27, 18, 30)) is DatasetHealthStatus.LATE
 
 
 @pytest.mark.asyncio
