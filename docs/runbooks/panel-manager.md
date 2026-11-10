@@ -39,7 +39,11 @@ minutes: `CREATED` rows against `ramp_datasets_per_hour`, and every request the 
 the bars request. Ingest makes a third vendor call for each creation, the asset lookup by symbol on the trading API,
 which counts against neither the request cap nor the market-data budget. The ramp is checked first, and once a window is full the rest of the members in that pass share its
 cause. A rate that is empty (no limit) skips its check. This limits creation only: the daily bars of members are the DAILY refresh's, bounded by
-`DAILY_REFRESH_MAX_PER_PASS`, so a large panel needs that cap raised to about the number of assets its filters select.
+`DAILY_REFRESH_MAX_PER_PASS`. That variable is the most **existing** collecting `DAILY` datasets on a source, the panel's members and every other owner's together, that one pass requests the missing tail for; new datasets are not counted, since the panel manager creates them under the source's hourly limits. The default of 15000 covers a source with up to that many; above it, raise the cap. With the default, one pass submits the tail of every owed dataset, one after another, without waiting for any. The vendor works through them at its rate limit: at the ceiling of 200 a minute, 15,000 one-page requests (a 1day tail fits in one page) take at least about 75 minutes, and longer when other requests share the limit or `ALPACA_RATE_LIMIT_PER_MINUTE` lowers it.
+
+Requests that carry a deadline (`ready_by`) go ahead of undated ones, and the refresh's requests carry one (the next market open) while a panel's creations do not, so creations wait behind a large refresh.
+
+**A refresh request still queued at the next market open expires unrun.** It is recorded as failed, cause expired, and the dataset is requested again at the next pass, a session late; no bar is lost. A pass that starts shortly before the open, such as the catch-up after a restart, can expire most of a large backlog this way.
 
 **Warning: a first pass with no rates and no filter is very long.** With both rates empty and no filter, a panel
 selects every row of the newest ACTIVE asset list (14,399 rows on the dev stack's STOCK list) and creates every member in one pass. There is no big transaction: each member gets its own small commits, so
@@ -200,7 +204,7 @@ repository.
    saved**.
 3. Create the panel with the `MONTHLY` cadence and, if the source has none, its source settings version 1, each with
    an actor (a reason is optional).
-4. Raise `DAILY_REFRESH_MAX_PER_PASS` to about the number of assets the panel's filters select.
+4. Check `DAILY_REFRESH_MAX_PER_PASS` (default 15000) against the number of collecting `DAILY` datasets on the source, this panel's selection included; raise it only if there are more.
 5. Confirm: an active and an inactive asset-list snapshot written within minutes; the first `panel_pass` row, naming
    settings version 1; and the first close-time pass showing in dataset Health.
 

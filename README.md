@@ -301,7 +301,7 @@ pass: nothing is queued, so after a restart the next pass is the catch-up.
 | Job | What it does | Settings (defaults) |
 |---|---|---|
 | Expiry reaper | Deletes datasets whose expiry has passed, whether or not they are still collecting, and records each deletion | `REAPER_INTERVAL_SECONDS` (3600), `REAPER_DELETES_ENABLED` (off) |
-| Daily refresh | Keeps `DAILY` datasets that are collecting current: after a trading session closes, plus a settle delay, it requests each stale dataset's missing tail | `DAILY_REFRESH_ENABLED`, `DAILY_REFRESH_SETTLE_MINUTES` (30), `DAILY_REFRESH_MAX_PER_PASS` (10), `DAILY_REFRESH_BACKOFF_SECONDS` (30) |
+| Daily refresh | Keeps `DAILY` datasets that are collecting current: after a trading session closes, plus a settle delay, it requests each stale dataset's missing tail | `DAILY_REFRESH_ENABLED`, `DAILY_REFRESH_SETTLE_MINUTES` (30), `DAILY_REFRESH_MAX_PER_PASS` (15000), `DAILY_REFRESH_BACKOFF_SECONDS` (30) |
 | Panel manager | Keeps a dataset for every asset a panel selects (below). Off for a panel until a settings version enables it | `PANEL_MANAGER_ENABLED` (on), `PANEL_MANAGER_DRY_RUN` (off) |
 | Usage recorder | Buffers bar reads and writes them in batches | `USAGE_FLUSH_INTERVAL_SECONDS` (5), `USAGE_FLUSH_BATCH_SIZE` (500), `USAGE_BUFFER_MAX` (10000) |
 | Usage rollup | Folds per-read rows older than the window into daily summaries | `USAGE_ROLLUP_AFTER_DAYS` (90), `USAGE_ROLLUP_INTERVAL_SECONDS` (3600) |
@@ -361,7 +361,7 @@ after the last *finished* pass (a pass that crashed holds the next off for an ho
 for a new member within two hourly limits that are set per source: new datasets per hour (1 or more) and requests
 per hour (2 or more, since a creation costs two). Both are optional: empty means no limit, and zero is refused. Pausing
 a panel is turning its Enabled off, which stops its passes. A member that exits has its dataset stopped, never deleted. The members' daily bars are
-the daily refresh's, so raise `DAILY_REFRESH_MAX_PER_PASS` for a large panel. With `PANEL_MANAGER_DRY_RUN=true`
+the daily refresh's, so a source with more collecting `DAILY` datasets than `DAILY_REFRESH_MAX_PER_PASS` (default 15000), counting every panel's and owner's, needs that cap raised. With `PANEL_MANAGER_DRY_RUN=true`
 it records what it would do and applies nothing. The mechanics are in
 [`server/data/store/CLAUDE.md`](server/data/store/CLAUDE.md#panels-and-the-panel-manager), and the
 operator's view, with the switches, the ledger and the sitting checks, in
