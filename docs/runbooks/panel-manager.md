@@ -10,7 +10,9 @@ UI-only: they are made and edited in the web UI's Panels tab (`/data/panels`) th
 ## What it does
 
 A panel is a named selection of one source's assets, owned by the reserved owner `panel`, which `POST /store` refuses.
-The manager keeps one dataset for each selected asset: DAILY, `1day`, `ROLLING`, open-ended, collecting.
+The manager keeps one dataset for each selected asset: DAILY (the update type), at the panel's Bar Interval, `ROLLING`, open-ended, collecting.
+
+**Bar Interval.** A panel has one Bar Interval (1 Minute, 1 Hour or 1 Day), chosen at creation and fixed for the panel's life, like its source: no write changes it and the settings forms have no interval control. Another interval is another panel, so one listing can be held by a 1 Minute and a 1 Day panel at once, each with its own datasets. The held set (the symbols other enabled panels still select), the check for an existing dataset and the check for a request still in flight all look only at panels and datasets of the same interval; a corporate-actions request has no interval and counts for every panel. Intraday bars arrive after the close: the daily refresh keeps a 1 Minute or 1 Hour dataset current once a session close, so the panel collects once a day and is not a live feed, and a minute panel holds data up to the most recent completed session once its post-close refresh has landed, and up to the session before until then.
 
 **One loop, nothing stored.** The loop ticks every 5 minutes (`TICK_INTERVAL`, a constant, not a setting) and the
 first tick runs at start. Each tick works out from the stored rows what is due, so a crash or restart resets nothing.
@@ -38,22 +40,23 @@ minutes: `CREATED` rows against `ramp_datasets_per_hour`, and every request the 
 `request_cap_per_hour`. A creation costs **two** requests against these limits (`REQUESTS_PER_CREATION`): the name-change clamp query and
 the bars request. Ingest makes a third vendor call for each creation, the asset lookup by symbol on the trading API,
 which counts against neither the request cap nor the market-data budget. The ramp is checked first, and once a window is full the rest of the members in that pass share its
-cause. A rate that is empty (no limit) skips its check. This limits creation only: the daily bars of members are the DAILY refresh's, bounded by
-`DAILY_REFRESH_MAX_PER_PASS`. That variable is the most **existing** collecting `DAILY` datasets on a source, the panel's members and every other owner's together, that one pass requests the missing tail for; new datasets are not counted, since the panel manager creates them under the source's hourly limits. The default of 15000 covers a source with up to that many; above it, raise the cap. With the default, one pass submits the tail of every owed dataset, one after another, without waiting for any. The vendor works through them at its rate limit: at the ceiling of 200 a minute, 15,000 one-page requests (a 1day tail fits in one page) take at least about 75 minutes, and longer when other requests share the limit or `ALPACA_RATE_LIMIT_PER_MINUTE` lowers it.
+cause. A rate that is empty (no limit) skips its check. This limits creation only: the members' bars, at whatever interval, are the DAILY refresh's, bounded by
+`DAILY_REFRESH_MAX_PER_PASS`. That variable is the most **existing** collecting `DAILY` datasets on a source, the panel's members and every other owner's together, that one pass requests the missing tail for; new datasets are not counted, since the panel manager creates them under the source's hourly limits. The default of 15000 covers a source with up to that many; above it, raise the cap. With the default, one pass submits the tail of every owed dataset, one after another, without waiting for any. The vendor works through them at its rate limit: at the ceiling of 200 a minute, 15,000 one-page requests (a one-session tail fits one page at any of the three intervals) take at least about 75 minutes, and longer when minute tails after an outage take several pages, when other requests share the limit or `ALPACA_RATE_LIMIT_PER_MINUTE` lowers it.
 
 Requests that carry a deadline (`ready_by`) go ahead of undated ones, and the refresh's requests carry one (the next market open) while a panel's creations do not, so creations wait behind a large refresh.
 
 **A refresh request still queued at the next market open expires unrun.** It is recorded as failed, cause expired, and the dataset is requested again at the next pass, a session late; no bar is lost. A pass that starts shortly before the open, such as the catch-up after a restart, can expire most of a large backlog this way.
+
+**Sizing the caps for mixed intervals.** A refresh and a creation make the same number of vendor requests per dataset whatever the interval, and a one-session tail is one vendor page (one market-data token) at every interval; a 1 Minute tail longer than about ten sessions (after an outage, a resume or a long deferral) takes several pages. The source's ramp and request cap and the refresh's per-pass cap (`DAILY_REFRESH_MAX_PER_PASS`) are shared by every panel on the source. A 1 Minute panel beside a 1 Day panel on one listing therefore doubles the datasets to create and to refresh: size the ramp, the request cap and `DAILY_REFRESH_MAX_PER_PASS` for the sum of every panel's datasets, not for one listing.
 
 **Warning: a first pass with no rates and no filter is very long.** With both rates empty and no filter, a panel
 selects every row of the newest ACTIVE asset list (14,399 rows on the dev stack's STOCK list) and creates every member in one pass. There is no big transaction: each member gets its own small commits, so
 the database is safe at that size. Time is what bounds it. Ingest allows at most 200 market-data requests a minute
 (`ALPACA_RATE_LIMIT_PER_MINUTE`, which configuration can only lower), and the clamp and the bars request of each
 creation both draw from that one bucket. The asset lookup draws from the trading scope. A clamp query whose answer
-spans several pages costs one token per page. A panel's 1day bars request starts at the member's entry date (below), so it covers days, not decades, and fits one
-page. Each creation still makes the same three vendor calls (the clamp, the bars request and the asset lookup), so
+spans several pages costs one token per page. A panel's bars request starts at the member's entry date (below), so it covers days, not decades: at 1 Day or 1 Hour it fits one page, and at 1 Minute it fits one page while the entry date is within about ten sessions (a first pass's always is). A member deferred longer costs one token per further page. Each creation still makes the same three vendor calls (the clamp, the bars request and the asset lookup), so
 its two market-data tokens set a floor: at 200 a minute, at most 100 creations a minute, which is at least about 2.4
-hours for 14,399 members. As an observation from a dev run against the real vendor with bars requests about 9,200
+hours for 14,399 members, a floor that holds for every interval. As an observation from a dev run against the real vendor with bars requests about 9,200
 sessions long, not a guarantee: the pass made about 77 creations a minute (80.8 a minute over its first 48 seconds),
 about 3 hours for 14,399 members, with the market-data side near 155 of its 200 requests a minute and no 429 answers.
 The pace with entry-date requests is not measured. A larger asset list or a slower vendor takes longer. Manager runs never overlap, so for those hours no other panel on any source gets a pass. Ingest keeps one queue per broker, shared by both of its quota scopes (market data and trading): requests with a
@@ -72,7 +75,7 @@ date is requested and nothing is backfilled.
 - A member that enters later starts at its own entry date. A member whose creation is deferred (a full rate window)
   and created in a later pass still starts at its entry date.
 - A member that exits and re-enters keeps its dataset and its start. Panels on a source share the owner `panel`, and when
-  a panel-owned dataset already exists for the symbol (made for this or another panel) nothing is created, so the
+  a panel-owned dataset already exists for the symbol (made for this or another panel of the same Bar Interval) nothing is created, so the
   start stays that of the dataset created first.
 - A weekend or holiday start is fine: nothing is owed until the first session after it closes.
 - The name-change check still runs on every creation; it is what collects the member's corporate actions, and it
@@ -112,7 +115,7 @@ as `actor`, and an optional `reason`: a blank one means none, is stored as NULL 
 Rules that decide a create (all refusals are `INVALID_REQUEST`, 422, with the store's message, and write nothing):
 
 - `enabled` is required (an absent value is never read as `false`); `cadence` unnamed takes
-  `MONTHLY`; `name` is required, trimmed and unique; `source` is required and fixed for the panel's life; `reason` is
+  `MONTHLY`; `name` is required, trimmed and unique; `source` is required and fixed for the panel's life; `granularity` (the Bar Interval) is required, one of `GRANULARITY_ONE_MINUTE`, `GRANULARITY_ONE_HOUR` or `GRANULARITY_ONE_DAY` (the full enum member name in a body), and fixed for the panel's life (a missing, UNSPECIFIED or other value is a 422); `reason` is
   optional. A body that carries `size` is refused with a 422: the field was removed and an unknown field is refused.
 - **The two hourly rates are optional; empty means no limit.** A set ramp is a whole number from 1 to 2147483647 and a
   set cap from 2 to 2147483647 (each new panel dataset costs two requests, so a cap of 1 could never create one); zero
@@ -137,8 +140,8 @@ Rules that decide a create (all refusals are `INVALID_REQUEST`, 422, with the st
 - **The forms** carry the checkbox "Include OTC Securities" with the hint "Off by default. The current market-data
   feed has no bars for OTC securities."
 - **The web create form** validates on click: nothing is marked until Create Panel has been pressed once, then every
-  empty or invalid field is marked at once and the marks follow the fields. A name and a source are the only required
-  fields. Ramp and cap are shown only while the source has no settings version and are both optional, with the
+  empty or invalid field is marked at once and the marks follow the fields. A name, a source and a Bar Interval are the required
+  fields. The Bar Interval is a select that starts on 1 Day, with the hint "Intraday bars arrive after the market close: the panel collects once a day, it is not a live feed. The interval cannot be changed later; another interval is another panel." Ramp and cap are shown only while the source has no settings version and are both optional, with the
   hints "Leave empty for no limit." and, for the cap, "Minimum 2: each new panel dataset costs 2 requests." (the window
   days are optional too and default to 90); the reason is optional.
 - Creates are serialised by name (a transaction-scoped advisory lock), so the loser of two concurrent creates of one
@@ -191,7 +194,7 @@ beside it.
 
 | Table | Read it as |
 |---|---|
-| `panel` | One row per panel: `name` (unique), `source`, `created_at` |
+| `panel` | One row per panel: `name` (unique), `source`, `created_at`, `granularity` (the Bar Interval) |
 | `panel_settings_version` | A panel's versions, `version_no` ascending, with `enabled`, `cadence`, the filters (`include_otc` among them), `actor`, `reason` (NULL when none), `saved_at` |
 | `panel_source_settings_version` | A source's rates and window days by `version_no`, shared by its panels |
 | `panel_pass` | One row per pass: `kind` (`MEMBERSHIP` or `RELEASE`), the settings versions and the snapshots it ran under, `dry_run`, `started_at`, `finished_at` (null until it finishes) and `counts` |

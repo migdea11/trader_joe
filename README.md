@@ -353,7 +353,7 @@ budget and the missing-tail-only request.
 **The panel manager** decides which assets a *panel* holds and creates their datasets. A panel is a named
 selection of one source's assets (filters on the daily asset-list snapshot, including Include OTC Securities, which is off by default because the
 current feed has no bars for OTC securities, and a cadence of daily, weekly or monthly; monthly unless told
-otherwise), owned by the reserved owner `panel`, which `POST /store` refuses. A member's dataset starts at the local
+otherwise) and one Bar Interval (1 Minute, 1 Hour or 1 Day, chosen at creation and fixed, like the source; another interval is another panel; intraday bars arrive after the close, since the daily refresh keeps the dataset current), owned by the reserved owner `panel`, which `POST /store` refuses. A member's dataset starts at the local
 date the panel first knew the member from, with no earlier history. Panels are UI-only: they are created and edited
 in the web UI's Panels tab (`/data/panels`) through the `/ui/v1` panel routes (`docs/API.md`, *The panel routes*), and there is no SDK panel API. Every 5 minutes it works out from the stored rows what is due, so a
 restart resets nothing. A membership pass runs at the panel's creation, on the newest snapshot, then an interval
@@ -361,8 +361,8 @@ after the last *finished* pass (a pass that crashed holds the next off for an ho
 (entered, created, deferred, refused, exited, draining, drained) in an append-only ledger, and creates a dataset
 for a new member within two hourly limits that are set per source: new datasets per hour (1 or more) and requests
 per hour (2 or more, since a creation costs two). Both are optional: empty means no limit, and zero is refused. Pausing
-a panel is turning its Enabled off, which stops its passes. A member that exits has its dataset stopped, never deleted. The members' daily bars are
-the daily refresh's, so a source with more collecting `DAILY` datasets than `DAILY_REFRESH_MAX_PER_PASS` (default 15000), counting every panel's and owner's, needs that cap raised. With `PANEL_MANAGER_DRY_RUN=true`
+a panel is turning its Enabled off, which stops its passes. A member that exits has its dataset stopped, never deleted. The members' bars, at whatever interval, are
+the daily refresh's, so a source with more collecting `DAILY` datasets than `DAILY_REFRESH_MAX_PER_PASS` (default 15000), counting every panel's and owner's, needs that cap raised, and a 1 Minute panel beside a 1 Day panel on one listing doubles the datasets to refresh. With `PANEL_MANAGER_DRY_RUN=true`
 it records what it would do and applies nothing. The mechanics are in
 [`server/data/store/CLAUDE.md`](server/data/store/CLAUDE.md#panels-and-the-panel-manager), and the
 operator's view, with the switches, the ledger and the sitting checks, in
@@ -436,7 +436,7 @@ revisions before it were deleted, and the repository supports no schema from bef
   dev stack before the baseline (`output/dev_seed/<old revision>/`) cannot be loaded into it: request them again
   after the reset.
 - **The baseline was edited in place on 2026-11-07 and kept its id** (the panel source rates became optional) and again on 2026-11-10 (the panel settings gained the Include OTC
-  Securities flag). A
+  Securities flag) and a third and fourth time the same day (`stock_market_activity.id` became BIGINT, and a panel gained its Bar Interval, `panel.granularity`). A
   database already at it is not upgraded by `make migrate`: drop it and migrate again, on every stack, dev included.
 - **There is no downgrade.** The baseline's `downgrade()` raises. Recovery is a restore of the pre-migrate dump that
   `make migrate` takes (below).

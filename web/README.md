@@ -4,7 +4,7 @@ The UI: a static single-page app. Vue 3, TypeScript and Vite, with PrimeVue 5 fo
 Vue Router, AG Grid Community for tables, Lightweight Charts and Apache ECharts for charts, and Lucide
 for icons. It shows the Data section: the dataset catalog (**Datasets**), a per-dataset **Dataset
 detail** (overview, coverage and gaps, run history, retention and usage), a **Viewer** with a candle chart, paged in
-1,000-bar pages, a paged bar table and a CSV export, a **Panels** tab and a **Usage** tab. Requests and Health are
+1,000-bar pages, a paged bar table and a CSV export, a **Panels** tab (a panel has one Bar Interval, 1 Minute, 1 Hour or 1 Day, chosen on the New Panel form, which starts on 1 Day, and shown in the panel picker and the panel's header; it cannot be changed later, so another interval is another panel, and the settings form has no interval control) and a **Usage** tab. Requests and Health are
 placeholders: their tabs render disabled ("Not built yet") until their routes exist.
 
 ## Why the UI lives in this public repo
