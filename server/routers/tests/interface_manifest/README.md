@@ -39,7 +39,7 @@ kind | address | file | symbol | request | response | touches
 `request` and `touches` are split on "is it a Pydantic model", because in this repository every
 cross-boundary schema is one and everything else is injected plumbing. That makes `touches` the
 "what it touches" field: `AsyncSession` says the route reaches Postgres,
-an `IngestFetchClient` says it reaches data_ingest — and it is what decides the tier of the test
+an `IngestSubmitClient` says it reaches data_ingest. It is what decides the tier of the test
 each interface eventually gets. An untyped body lands in `touches` as `dict`, which is the honest
 answer: there is no schema to name.
 
@@ -79,9 +79,7 @@ committed code; they are simply not enumerable at import. That is the case this 
 
 A line leaves this kind in one of two ways, and neither is quiet: implement the path and its
 `unbound-path` line has to become an `http` line in the same diff, or delete the declaration and the
-line goes with it in the same diff. Declarations removed that way, each one an enum member no code ever served and not a
-route anyone could call, are listed under "Declarations deleted by ruling" in `docs/API.md`; they
-are not restated here.
+line goes with it in the same diff.
 
 Matching is by path, not by method, because an enum member carries no method: `DELETE /store/{id}`
 is therefore enough to count `GET_STORE_ASSET_DATASET_BY_ID` as bound. That coarseness is the
