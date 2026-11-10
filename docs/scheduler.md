@@ -9,10 +9,8 @@ image. The wire contract it serves is in [`API.md`](API.md) section I1; the oper
 
 **What is built, and what is not.** One module serves every broker handle; each handle builds its own instance with
 `SchedulerBuilder`. Built: a FIFO queue, the ready-by check at dequeue, pacing and counting, the acknowledged retry
-and the bounded outgoing buffer with its stall alarm. Not built: a planner or admission control (decision `tj-pd41mt`
-is still proposed), a cumulative quota cap that survives a restart (gate `tj-a4kni8`), and more than one credential
-(the provider seam exists; `StaticCredentialProvider` serves the one configured key). Its sources are ADR `tj-26jt9w`
-and its addenda, `tj-pd41mt` addendum 1 and `tj-7zjov1.2`.
+and the bounded outgoing buffer with its stall alarm. Not built: a planner or admission control, a cumulative quota cap that survives a restart, and more than one credential
+(the provider seam exists; `StaticCredentialProvider` serves the one configured key).
 
 ## A handle, end to end
 
@@ -32,7 +30,7 @@ request, which it holds and answers at once; nothing in `Submit` calls the vendo
 ## The queue
 
 Two arrival-ordered tiers: requests that carry a `ready_by` first, in arrival order, then requests with no `ready_by`
-in arrival order (decision `tj-26jt9w` addendum 2). The queue is unbounded and admits everything; there is no priority
+in arrival order. The queue is unbounded and admits everything; there is no priority
 beyond that order. A retry re-enters at the tail of its tier through the same `submit`.
 
 ## The ready-by check at dequeue
@@ -45,7 +43,7 @@ already being attempted is not cut short.
 The sink is `AckGatedExecutor.report_expired`: the request goes out on the same outgoing buffer as an `EXPIRED`
 report. No vendor call was made, so it carries no stats, no payload and no served range, and an empty quota key. Its
 header still follows the request kind's feed rule: a bars request that expired **names the resolved tape**
-(`ScheduledRequest.feed`, `tj-7zjov1.66`); an asset list or corporate-actions request carries `FEED_UNSPECIFIED`. The
+(`ScheduledRequest.feed`); an asset list or corporate-actions request carries `FEED_UNSPECIFIED`. The
 store writes the request `FAILED` with cause expired and no attempt row, and answers `FINAL`.
 
 **`EXPIRED` versus `EXHAUSTED`.** Two reports share a shape and mean different things:
@@ -90,7 +88,7 @@ reason (so the run history shows an empty `reason`) and logs the exception; a wo
 Every Alpaca market-data HTTP request, a bars page, a retry inside an attempt or a corporate-actions page, takes one
 scheduler token first (`Scheduler.acquire`, called at each request in `brokers/alpaca/broker_api.py`), and every
 request that reaches the vendor is counted on the attempt: `pages`, `retries`, `throttled_429` and `calls` (a 429
-included) are the attempt's `vendor_stats` (`CallTally`, `tj-7zjov1.56`). A call collapsed onto another caller's in
+included) are the attempt's `vendor_stats` (`CallTally`). A call collapsed onto another caller's in
 flight, or refused before the vendor, spends and counts nothing.
 
 - **Scopes.** The Alpaca handle declares two, each with its own ceiling of 200 calls a minute (Alpaca's documented
@@ -126,7 +124,7 @@ The buffer holds the reports the store has not yet acknowledged. It is bounded: 
 The executor looks at the oldest unacknowledged report every `stall_check_interval_s` (5 s). When it has waited longer
 than `ALPACA_STALL_TIMEOUT_S` (default 300 s) the handle is **stalled**: one ERROR line, and the state is reported on a
 named gRPC health service for the handle, `trader_joe.ingest.delivery.ALPACA_DATA` (the fixed prefix plus the quota
-scope, never an account or a credential; `tj-7zjov1.55`): `SERVING` while not stalled, `NOT_SERVING` while stalled.
+scope, never an account or a credential): `SERVING` while not stalled, `NOT_SERVING` while stalled.
 The ERROR line repeats once per timeout while the stall lasts, and its text is (`executor.py`):
 
 ```
@@ -159,4 +157,4 @@ Recovered request <id> (<kind>) charged its estimate of <n> calls to quota scope
 ```
 
 The lost attempt is not counted, is not a broker failure and is not shown as failed (`NOT_DELIVERED`). Calls the old
-process made before a restart and that are not re-requested are not modelled (`tj-90z4dq`).
+process made before a restart and that are not re-requested are not modelled.
