@@ -121,7 +121,9 @@ ENABLED_ENV: Final = 'DAILY_REFRESH_ENABLED'
 MAX_PER_PASS_ENV: Final = 'DAILY_REFRESH_MAX_PER_PASS'
 BACKOFF_ENV: Final = 'DAILY_REFRESH_BACKOFF_SECONDS'
 
-DEFAULT_MAX_PER_PASS: Final = 10
+# Owner ruling 2026-11-10: sized for a panel's whole universe (about 14,400 DAILY datasets), so one pass requests the
+# new bar of every existing dataset that is behind rather than the first few.
+DEFAULT_MAX_PER_PASS: Final = 15000
 DEFAULT_BACKOFF_SECONDS: Final = 30
 
 BACKOFF_CAP_SECONDS: Final = 600

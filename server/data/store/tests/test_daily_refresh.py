@@ -1578,7 +1578,12 @@ async def test_datasets_always_empty_hold_at_most_half_the_cap_and_healthy_ones_
 
 @pytest.mark.asyncio
 async def test_the_due_again_take_whatever_the_others_leave(world: World, monkeypatch):
-    """With fewer productive datasets than half the cap, the due-again ones fill the rest of it."""
+    """With fewer productive datasets than half the cap, the due-again ones fill the rest of it.
+
+    The premise needs a cap SMALLER than the twelve behind (four productive, eight due again), so it is set: at the
+    default (15000) all twelve would be requested and the cap would decide nothing.
+    """
+    monkeypatch.setenv(refresh_module.MAX_PER_PASS_ENV, '10')
     dead = {f'dead{i}': entry(f'{SYMBOL_PREFIX}Y{i}', update_type=UpdateType.DAILY) for i in range(8)}
     world.rows.update(dead)
     await _add(world, *dead.values())
@@ -1599,8 +1604,107 @@ async def test_the_due_again_take_whatever_the_others_leave(world: World, monkey
 
     result = await world.refresher(client).run_pass(DataSource.ALPACA_API)
 
-    assert result.refreshed == DEFAULT_MAX_PER_PASS
-    assert world.requested(client)[:4] == list(BEHIND_ORDER)
+    # Half the cap (5) is reserved for the eight due again, but only four productive ones exist, so the due-again
+    # ones take the six left: ten requested, two deferred.
+    assert result.refreshed == 10
+    assert result.deferred == 2
+    requested = world.requested(client)
+    assert requested[:4] == list(BEHIND_ORDER)
+    assert len([name for name in requested if name.startswith('dead')]) == 6
+
+
+# ------------------------------------------------------------------------------------------------- the default cap
+# Owner ruling 2026-11-10 (tj-1553x8): DAILY_REFRESH_MAX_PER_PASS defaults to 15000, sized for a panel's whole
+# universe (about 14,400 DAILY datasets), so one pass requests the new bar of every existing dataset that is behind.
+# The env override stays, and a non-positive or malformed value falls back to the default.
+
+
+def test_the_default_cap_is_sized_for_a_whole_panel(monkeypatch):
+    """Written out, not read back from the constant: a test comparing the reader with the constant pins nothing."""
+    monkeypatch.delenv(refresh_module.MAX_PER_PASS_ENV, raising=False)
+
+    assert DEFAULT_MAX_PER_PASS == 15000
+    assert refresh_module.max_per_pass() == 15000
+
+
+@pytest.mark.parametrize('value', ['', '   ', '0', '-1', '-15000', '1.5', 'many', '15e3'])
+def test_a_blank_non_positive_or_malformed_cap_is_the_default(monkeypatch, value):
+    monkeypatch.setenv(refresh_module.MAX_PER_PASS_ENV, value)
+
+    assert refresh_module.max_per_pass() == 15000
+
+
+@pytest.mark.parametrize(('value', 'expected'), [('1', 1), ('7', 7), (' 25 ', 25), ('20000', 20000)])
+def test_a_positive_cap_in_the_environment_overrides_the_default(monkeypatch, value, expected):
+    monkeypatch.setenv(refresh_module.MAX_PER_PASS_ENV, value)
+
+    assert refresh_module.max_per_pass() == expected
+
+
+async def _sixteen_more_behind(world: World) -> list[str]:
+    """Sixteen more DAILY datasets, last bar Fri 2 Oct (behind), never attempted: twenty owed with the seed's four."""
+    extra = {f'more{i:02d}': entry(f'{SYMBOL_PREFIX}M{i:02d}', update_type=UpdateType.DAILY) for i in range(16)}
+    world.rows.update(extra)
+    await _add(world, *extra.values())
+    await _add(world, *(bar(world.rows[name], ny_midnight(2)) for name in extra))
+    return [*BEHIND_ORDER, *extra]
+
+
+@pytest.mark.asyncio
+async def test_with_the_default_cap_a_pass_requests_every_owed_dataset(world: World):
+    """Twenty owed, no cap set: all twenty are requested in one pass, none deferred (with 10 only ten were)."""
+    owed = await _sixteen_more_behind(world)
+    client = ScriptedClient()
+
+    result = await world.refresher(client).run_pass(DataSource.ALPACA_API)
+
+    assert sorted(world.requested(client)) == sorted(owed)
+    assert result == PassResult(behind=20, refreshed=20, failed=0, deferred=0)
+
+
+@pytest.mark.asyncio
+async def test_an_explicit_cap_still_bounds_a_pass_over_more_owed_datasets(world: World, monkeypatch):
+    """The bound still works when set: twenty owed and a cap of 7 request exactly 7, oldest first, and defer 13."""
+    await _sixteen_more_behind(world)
+    monkeypatch.setenv(refresh_module.MAX_PER_PASS_ENV, '7')
+    client = ScriptedClient()
+
+    result = await world.refresher(client).run_pass(DataSource.ALPACA_API)
+
+    requested = world.requested(client)
+    assert len(requested) == 7
+    assert requested[:2] == ['older', 'empty']
+    assert result == PassResult(behind=20, refreshed=7, failed=0, deferred=13)
+
+
+@pytest.mark.parametrize(
+    ('productive', 'again', 'taken_productive', 'taken_again'),
+    [
+        # Both classes crowd the cap: the due-again ones hold exactly half of it (7500), the productive the rest.
+        (20000, 10000, 7500, 7500),
+        # Few due again: the reserve is only what they need, the productive take the rest of the cap.
+        (20000, 3, 14997, 3),
+        # Few productive: the due-again ones take whatever the others leave.
+        (5, 20000, 5, 14995),
+        # Under the cap altogether: everything is taken.
+        (14000, 400, 14000, 400),
+    ],
+)
+def test_the_due_again_reserve_is_half_the_default_cap(monkeypatch, productive, again, taken_productive, taken_again):
+    """`_take` at the default cap, read through max_per_pass() as the pass reads it.
+
+    The two classes are stand-ins (`_take` only slices), so the half-the-cap rule is pinned at 15000 without 15000
+    database rows.
+    """
+    monkeypatch.delenv(refresh_module.MAX_PER_PASS_ENV, raising=False)
+    due = ([('p', i) for i in range(productive)], [('a', i) for i in range(again)])
+
+    taken = DailyRefresher._take(due, refresh_module.max_per_pass())  # type: ignore[arg-type]
+
+    assert len([item for item in taken if item[0] == 'p']) == taken_productive
+    assert len([item for item in taken if item[0] == 'a']) == taken_again
+    # Productive first, in order, then the due-again ones, in order.
+    assert taken == due[0][:taken_productive] + due[1][:taken_again]
 
 
 # ------------------------------------------------------------------------------------------------- round 2: retire race
