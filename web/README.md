@@ -136,7 +136,7 @@ reconnects the same way.
   row (`running_dataset_ids` in `server/data/store/app/database/crud/ingest_run.py`). The Status cell's badge reads only the
   latest run's state (`isRunning` in `src/catalog/rows.ts`), and the push path writes no `RUNNING` row, so the cell
   shows Running only for a row an earlier release left. So a row inside the Running filter can show another status, such
-  as Healthy or Late. This is a regression filed as bug `tj-7zjov1.357`.
+  as Healthy or Late. This is a known regression.
 - **Not built:** Requests and Health (disabled tabs; their routes show a not-built page); Request the Gap
   and All Runs; a Quota Key column, since the server does not record one.
 

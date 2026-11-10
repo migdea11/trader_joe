@@ -20,7 +20,7 @@ resolution: monthly bars begin 2020-07 and daily bars 2020-07-27, and the depth 
 run returned a first monthly bar of 2018-11-01 for the same series). Every healthy row therefore starts after
 2020-07-27 (r6 on 2020-08-01).
 
-See `tj-7zjov1.359`: the plan names no feed, so dev runs are now served on SIP, and the depth above needs re-measuring (and r14's intentional leading GAPS re-checking).
+The plan names no feed, so dev runs are now served on SIP, and the depth above needs re-measuring (and r14's intentional leading GAPS re-checking).
 
 | id | symbol | granularity | start .. end | update | expiry type | expiry | owner | reads | exercises |
 |---|---|---|---|---|---|---|---|---|---|
@@ -222,8 +222,8 @@ the newest **complete** stamp (one with a `manifest.json`) is used; a symbolic l
   `refused: the seed is at revision A, the database at B and the checkout head is C; ...`. To recover: migrate the dev
   database to the head, then run a dev `reset`, which exports a seed of the current revision and reloads it. (An older
   seed cannot be upgraded here; that would need a database at its revision.)
-- **After the alpha reset.** The first alpha replaced every earlier store migration with one baseline revision
-  (ADR tj-kg521d), and the bar and panel tables changed shape. An export under `output/dev_seed/<old revision>/` names a
+- **After the alpha reset.** The first alpha replaced every earlier store migration with one baseline revision,
+  and the bar and panel tables changed shape. An export under `output/dev_seed/<old revision>/` names a
   revision that no longer exists, so it cannot be loaded; drop the dev database, `make migrate`, and re-request the
   datasets (the `request-datasets` skill). Exports taken after the reset load as before.
 - **The stack rule.** The manifest records the stack the seed was exported from (`dev` or `test`). A load refuses, exits
