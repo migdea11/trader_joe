@@ -125,8 +125,7 @@ leaves no override-log row and publishes no event: the version row is the audit.
 **The seven edge rules.** The web edge (Caddy in production, the Vite dev server in development) forwards exactly seven
 rules to `data_store` and answers 404 to anything else: GET and HEAD under `/api/store/ui/v1/`; PATCH on a dataset's
 `expiry`; PATCH on a dataset's `collecting`; DELETE on a dataset; and POST on the three panel paths in the table above.
-Six of them are writes and carry the secret. The panel rules had never been parsed by Caddy before the production
-sitting (`tj-mx97hu`): before saving any panel setting, validate the Caddyfile, probe each of the seven rules, and
+Six of them are writes and carry the secret. Before saving any panel setting, validate the Caddyfile, probe each of the seven rules, and
 send one off-list POST that must answer 404.
 
 ## Exits and re-entry

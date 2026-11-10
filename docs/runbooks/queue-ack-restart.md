@@ -1,9 +1,8 @@
 # Runbook: the queue, the acknowledgement and the restarts
 
 How a request moves from `data_store` through `data_ingest`'s queue and back, what each log and table shows while it
-does, and what the system does when either service restarts or the store goes down. This is what the P26 system
-session observed on the fake stack (bead `tj-7zjov1.38`, closed at `59ea5a2`), restated against the code. The module
-itself is described in [`../scheduler.md`](../scheduler.md); the wire contract is [`../API.md`](../API.md) section I1.
+does, and what the system does when either service restarts or the store goes down. It was observed on the fake stack and
+restated against the code. The module itself is described in [`../scheduler.md`](../scheduler.md); the wire contract is [`../API.md`](../API.md) section I1.
 
 Log lines are quoted from the format strings in the code. Ids, counts and ages in your logs will differ. A service's
 container log is dominated by `GET /ping` health lines, so filter them out before you read for anything else.
@@ -134,7 +133,7 @@ pass for an enabled panel (S7, `tests/system/test_panel_loop_smoke.py`) are in
 
 ## The scenario names
 
-The S-numbers are the P26 plan's (bead `tj-7zjov1.38`). Each maps to a test, and the restart cases run in two phases
+Each S-number maps to a test, and the restart cases run in two phases
 with the stack disturbed between them.
 
 | Scenario | Test |
