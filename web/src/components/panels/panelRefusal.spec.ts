@@ -490,7 +490,26 @@ describe('the sent body: an empty rate is absent, a typed one a number', () => {
 
   it('create, all four empty: none of the four keys is in the body', async () => {
     const sent = await createWith({})
-    expect(sent).toEqual({ name: 'Gamma', source: 'DATA_SOURCE_ALPACA_API', enabled: true })
+    expect(sent).toEqual({ name: 'Gamma', source: 'DATA_SOURCE_ALPACA_API', granularity: 'GRANULARITY_ONE_DAY', enabled: true })
+  })
+
+  // ADR tj-rwoasb D3, on the wire: the create body carries the chosen Bar Interval as the market.v1 Granularity
+  // enum name, 1 Day when untouched; there is no schema default, so the key is always present.
+  it.each([
+    [0, 'GRANULARITY_ONE_MINUTE'],
+    [1, 'GRANULARITY_ONE_HOUR'],
+    [2, 'GRANULARITY_ONE_DAY'],
+  ])('create, the bar interval option at %i: the body carries granularity %s', async (index, wire) => {
+    fake.sourceHasSettings = true
+    const form = mount(PanelCreateForm, { attachTo: document.body })
+    await byId(form, 'create-name').setValue('Gamma')
+    await byId(form, 'create-source').findAll('option')[1]!.setValue()
+    await byId(form, 'create-granularity').findAll('option')[index]!.setValue()
+    await flushPromises()
+    await form.find('form').trigger('submit')
+    await flushPromises()
+    expect(posts()).toHaveLength(1)
+    expect(body()).toMatchObject({ name: 'Gamma', source: 'DATA_SOURCE_ALPACA_API', granularity: wire })
   })
 
   it('create, a window-only body: only the window keys', async () => {
@@ -498,6 +517,7 @@ describe('the sent body: an empty rate is absent, a typed one a number', () => {
     expect(sent).toEqual({
       name: 'Gamma',
       source: 'DATA_SOURCE_ALPACA_API',
+      granularity: 'GRANULARITY_ONE_DAY',
       enabled: true,
       corporateActionWindowPreDays: 0,
       corporateActionWindowPostDays: 30,
@@ -509,6 +529,7 @@ describe('the sent body: an empty rate is absent, a typed one a number', () => {
     expect(sent).toEqual({
       name: 'Gamma',
       source: 'DATA_SOURCE_ALPACA_API',
+      granularity: 'GRANULARITY_ONE_DAY',
       enabled: true,
       rampDatasetsPerHour: 1,
       requestCapPerHour: 2_147_483_647,

@@ -515,6 +515,7 @@ CASES: dict[str, Case] = {
             'json': {
                 'name': 'smoke',
                 'source': 'DATA_SOURCE_ALPACA_API',
+                'granularity': 'GRANULARITY_ONE_DAY',
                 'enabled': False,
                 'reason': 'smoke',
                 'rampDatasetsPerHour': 1,

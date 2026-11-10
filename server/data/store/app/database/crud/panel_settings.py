@@ -8,7 +8,8 @@ A VERSION ROW IS A MARKER: saved_at (database time), actor and reason. The reaso
 or missing one is stored as NULL (ADR tj-46jkey, owner ruling 2026-11-06). The actor is still required. EFFECTIVE-FROM IS DERIVED and has no column, and has ONE definition, the boundary read's (crud/panel_ledger.py
 boundary_read): the started_at of the first non-dry-run pass OF THIS PANEL that names the version.
 
-A PANEL'S SOURCE NEVER CHANGES: no function takes a source for an existing panel (another source is another panel).
+A PANEL'S SOURCE AND GRANULARITY NEVER CHANGE: no function takes either for an existing panel (another source or bar
+interval is another panel; ADR tj-rwoasb D1).
 
 NO FALLBACK NUMBERS. The two hourly rates are optional and None means NO LIMIT (ADR tj-2ayia2, owner ruling
 2026-11-07): there is no default value for either. A set ramp is 1 to INT32_MAX and a set cap 2 to INT32_MAX; zero is
@@ -33,7 +34,7 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from common.enums.data_select import AssetType
-from common.enums.data_stock import DataSource
+from common.enums.data_stock import DataSource, Granularity
 from common.errors.vocabulary import InvalidRequestError, Reason
 from data.store.app.database.models.panel import (
     DEFAULT_CORPORATE_ACTION_WINDOW_DAYS,
@@ -111,6 +112,7 @@ class PanelRecord:
     name: str
     source: DataSource
     created_at: datetime
+    granularity: Granularity
 
 
 @dataclass(frozen=True)
@@ -224,7 +226,9 @@ def _source_settings_values(
 
 
 def _panel_record(row) -> PanelRecord:
-    return PanelRecord(id=row.id, name=row.name, source=row.source, created_at=row.created_at)
+    return PanelRecord(
+        id=row.id, name=row.name, source=row.source, created_at=row.created_at, granularity=row.granularity
+    )
 
 
 def _settings_record(row) -> PanelSettingsRecord:
@@ -316,6 +320,7 @@ async def create_panel(
     *,
     name: str,
     source: DataSource,
+    granularity: Granularity,
     settings: PanelSettings,
     actor: str,
     reason: str | None,
@@ -335,6 +340,8 @@ async def create_panel(
         db: The session.
         name: The panel's name, unique; stored trimmed.
         source: The panel's source, fixed for the panel's life.
+        granularity: The panel's bar interval, fixed for the panel's life like source, required. Stored as given: the
+            allowed set (PANEL_GRANULARITIES) is checked by the caller, the router.
         settings: The first settings version.
         actor: The operator principal.
         reason: Why the panel was created, optional; stored trimmed, NULL when None or blank.
@@ -379,7 +386,9 @@ async def create_panel(
             first = source_settings if source_settings is not None else SourceSettings(None, None)
             await _insert_source_settings(db, source, first, trimmed_actor, trimmed_reason)
         panel_row = (
-            await db.execute(_PANEL.insert().values(name=trimmed_name, source=source).returning(*_PANEL.c))
+            await db.execute(
+                _PANEL.insert().values(name=trimmed_name, source=source, granularity=granularity).returning(*_PANEL.c)
+            )
         ).one()
         version_row = (
             await db.execute(
@@ -488,14 +497,27 @@ async def enabled_panels_on_source(db: AsyncSession, source: DataSource) -> list
         .scalar_subquery()
     )
     result = await db.execute(
-        select(_PANEL.c.id.label('panel_row_id'), _PANEL.c.name, _PANEL.c.source, _PANEL.c.created_at, *_SETTINGS.c)
+        select(
+            _PANEL.c.id.label('panel_row_id'),
+            _PANEL.c.name,
+            _PANEL.c.source,
+            _PANEL.c.created_at,
+            _PANEL.c.granularity,
+            *_SETTINGS.c,
+        )
         .join(_SETTINGS, _SETTINGS.c.panel_id == _PANEL.c.id)
         .where(_PANEL.c.source == source, _SETTINGS.c.version_no == newest, _SETTINGS.c.enabled.is_(True))
         .order_by(_PANEL.c.created_at, _PANEL.c.id)
     )
     return [
         EnabledPanel(
-            panel=PanelRecord(id=row.panel_row_id, name=row.name, source=row.source, created_at=row.created_at),
+            panel=PanelRecord(
+                id=row.panel_row_id,
+                name=row.name,
+                source=row.source,
+                created_at=row.created_at,
+                granularity=row.granularity,
+            ),
             current=_settings_record(row),
         )
         for row in result.all()

@@ -102,6 +102,8 @@ message PanelListItem {
   trader_joe.proto.market.v1.DataSource source = 3;
   // From the panel's latest settings version.
   bool enabled = 4;
+  // The panel's Bar Interval: immutable like source (another granularity is another panel).
+  trader_joe.proto.market.v1.Granularity granularity = 5;
 }
 
 message PanelList {
@@ -204,6 +206,8 @@ message PanelDetail {
   // The latest settings version of the panel's source.
   PanelSourceSettingsVersion current_source_version = 6;
   PanelMembershipCounts counts = 7;
+  // The panel's Bar Interval: immutable like source (another granularity is another panel).
+  trader_joe.proto.market.v1.Granularity granularity = 8;
 }
 
 // One page of a panel's own settings versions, newest first. Keyset paging; the cursor is opaque.
@@ -410,4 +414,8 @@ message CreatePanelRequest {
   // carries no bars for OTC securities. A false value with exchange OTC is refused (422): it would select
   // nothing. It is a panel setting, so it is numbered after 13-16 but is not one of the source settings.
   bool include_otc = 17;
+  // Required: the panel's Bar Interval, fixed for the panel's life (another granularity is another panel).
+  // The store accepts only ONE_MINUTE, ONE_HOUR and ONE_DAY; UNSPECIFIED and every other member is refused
+  // (422) and nothing is written. There is no default.
+  trader_joe.proto.market.v1.Granularity granularity = 18;
 }

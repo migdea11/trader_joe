@@ -1,4 +1,5 @@
 from enum import StrEnum
+from typing import Final
 
 from sqlalchemy import (
     ARRAY,
@@ -21,7 +22,7 @@ from sqlalchemy.dialects.postgresql import JSONB
 
 from common.database.sql_alchemy_table import AppBase, CustomTypeTable
 from common.enums.data_select import AssetType
-from common.enums.data_stock import DataSource
+from common.enums.data_stock import DataSource, Granularity
 
 
 # Safe defaults, named here and applied where a row is CREATED (never by the schema). Only the ruled one is named: the
@@ -29,6 +30,11 @@ from common.enums.data_stock import DataSource
 # value: an unset rate is NULL and means NO LIMIT (ADR tj-2ayia2, owner ruling 2026-11-07). The cadence has no ruled
 # default either, so it has no constant and no server default.
 DEFAULT_CORPORATE_ACTION_WINDOW_DAYS = 90
+
+# The bar intervals a panel may be created with (ADR tj-rwoasb D1), defined once: the router refuses any other value
+# (422), and the panel manager mints datasets at the panel's own granularity. The column itself accepts every
+# Granularity, since the native type is shared with the dataset tables.
+PANEL_GRANULARITIES: Final = (Granularity.ONE_MINUTE, Granularity.ONE_HOUR, Granularity.ONE_DAY)
 
 
 class PanelCadence(StrEnum):
@@ -80,7 +86,9 @@ def _values(enum_cls: type[StrEnum]) -> list[str]:
 class Panel(AppBase.DATA_STORE_BASE, CustomTypeTable):
     """A panel: a named, operator-defined selection of one source's assets that the panel manager keeps datasets for.
 
-    APPEND-ONLY: no update or delete path. The source is immutable (another source is another panel). The market is
+    APPEND-ONLY: no update or delete path. The source and the granularity are immutable, fixed at creation (another
+    source or another bar interval is another panel); the granularity is not part of the settings versions and has NO
+    schema default (a required column; ADR tj-rwoasb D1, D2). The market is
     NOT a column: one DataSource per vendor and market, so the source implies it. No panel is seeded by any revision;
     names and filters are operator data.
     """
@@ -94,11 +102,13 @@ class Panel(AppBase.DATA_STORE_BASE, CustomTypeTable):
     name = Column(String, nullable=False)
     source = Column(Enum(DataSource), nullable=False)
     created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    # Immutable like source; reuses the native granularity type. No default: the caller states it (last ordinal).
+    granularity = Column(Enum(Granularity), nullable=False)
 
     __table_args__ = (Index(NAME_INDEX, 'name', unique=True),)
 
     def __repr__(self):
-        return f"<Panel(id='{self.id}', name='{self.name}', source='{self.source}')>"
+        return f"<Panel(id='{self.id}', name='{self.name}', source='{self.source}', granularity='{self.granularity}')>"
 
 
 class PanelSettingsVersion(AppBase.DATA_STORE_BASE, CustomTypeTable):

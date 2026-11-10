@@ -14,7 +14,7 @@ import { create } from '@bufbuild/protobuf'
 import { timestampFromMs } from '@bufbuild/protobuf/wkt'
 import { createPinia, setActivePinia } from 'pinia'
 
-import { DataSource } from '@generated/trader_joe/proto/market/v1/enums_pb'
+import { DataSource, Granularity } from '@generated/trader_joe/proto/market/v1/enums_pb'
 import { DatasetHealthStatus } from '@generated/trader_joe/proto/ui/v1/data_pb'
 import {
   AssetListDayState,
@@ -70,11 +70,12 @@ const T0 = Date.UTC(2026, 7, 3)
 
 const pass = create(EffectivePassSchema, { kind: PanelPassKind.MEMBERSHIP, startedAt: timestampFromMs(T0 + DAY) })
 
-function detailOf(id: string, effective = true) {
+function detailOf(id: string, effective = true, granularity = id === A ? Granularity.ONE_DAY : Granularity.ONE_HOUR) {
   return create(PanelDetailSchema, {
     id,
     name: id === A ? 'Large caps' : 'Small caps',
     source: DataSource.ALPACA_API,
+    granularity,
     currentVersion: create(PanelSettingsVersionSchema, {
       versionNo: 2,
       settings: create(PanelSettingsSchema, { enabled: true, cadence: PanelCadence.MONTHLY }),
@@ -106,8 +107,8 @@ function answerEveryRead(): void {
   api.listPanels.mockResolvedValue(
     create(PanelListSchema, {
       items: [
-        create(PanelListItemSchema, { id: A, name: 'Large caps', source: DataSource.ALPACA_API, enabled: true }),
-        create(PanelListItemSchema, { id: B, name: 'Small caps', source: DataSource.ALPACA_API, enabled: false }),
+        create(PanelListItemSchema, { id: A, name: 'Large caps', source: DataSource.ALPACA_API, granularity: Granularity.ONE_DAY, enabled: true }),
+        create(PanelListItemSchema, { id: B, name: 'Small caps', source: DataSource.ALPACA_API, granularity: Granularity.ONE_HOUR, enabled: false }),
       ],
     }),
   )
@@ -146,12 +147,53 @@ describe('PanelListView', () => {
     expect((await page()).find('h1').text()).toBe('Panels')
   })
 
-  it('the selector lists every panel with its source and a disabled one marked; the first is selected and shown', async () => {
+  it('the selector lists every panel with its source and bar interval and a disabled one marked; the first is selected and shown', async () => {
     const view = await page()
     const options = byId(view, 'panel-select').findAll('option')
-    expect(options.map((o) => o.text())).toEqual(['Large caps · Alpaca', 'Small caps · Alpaca (disabled)'])
+    expect(options.map((o) => o.text())).toEqual(['Large caps · Alpaca · 1 Day', 'Small caps · Alpaca · 1 Hour (disabled)'])
     expect((byId(view, 'panel-select').element as HTMLSelectElement).value).toBe(A)
     expect(view.find('.panels__name').text()).toContain('Large caps')
+  })
+
+  // ADR tj-rwoasb D2 and D3: the Bar Interval is fixed at creation and shown read-only beside the source, on the
+  // list item and in the detail; a wire value the form does not offer reads Unknown and nothing crashes.
+  it.each([
+    [Granularity.ONE_MINUTE, '1 Minute'],
+    [Granularity.ONE_HOUR, '1 Hour'],
+    [Granularity.ONE_DAY, '1 Day'],
+  ])('the detail shows granularity %i as Bar Interval: %s, beside the source, with no control', async (granularity, label) => {
+    api.getPanel.mockImplementation(async (id: string) => detailOf(id, true, granularity))
+    const view = await page()
+    const shown = byId(view, 'panel-interval')
+    expect(shown.text()).toBe(`Bar Interval: ${label}`)
+    expect(shown.element.tagName).toBe('SPAN')
+    expect(shown.element.parentElement).toBe(view.find('.panels__name').element)
+    expect(view.find('.panels__name').text()).toContain('Alpaca')
+    expect(view.find('select[data-testid*="granularity"], select[id*="granularity"]').exists()).toBe(false)
+  })
+
+  it('a moved selection shows the other panel\'s interval', async () => {
+    const view = await page()
+    expect(byId(view, 'panel-interval').text()).toBe('Bar Interval: 1 Day')
+    await byId(view, 'panel-select').findAll('option')[1]!.setValue()
+    await flushPromises()
+    expect(byId(view, 'panel-interval').text()).toBe('Bar Interval: 1 Hour')
+  })
+
+  it.each([
+    ['UNSPECIFIED', Granularity.UNSPECIFIED],
+    ['ONE_WEEK', Granularity.ONE_WEEK],
+    ['a value no enum member names', 42 as Granularity],
+  ])('a wire granularity of %s reads Unknown on the list item and in the detail, and the page still renders', async (_name, granularity) => {
+    api.listPanels.mockResolvedValue(
+      create(PanelListSchema, { items: [create(PanelListItemSchema, { id: A, name: 'Large caps', source: DataSource.ALPACA_API, granularity, enabled: true })] }),
+    )
+    api.getPanel.mockImplementation(async (id: string) => detailOf(id, true, granularity))
+    const view = await page()
+    expect(byId(view, 'panel-select').findAll('option').map((o) => o.text())).toEqual(['Large caps · Alpaca · Unknown'])
+    expect(byId(view, 'panel-interval').text()).toBe('Bar Interval: Unknown')
+    expect(byId(view, 'panel-tiles').exists()).toBe(true)
+    expect(byId(view, 'panel-settings').exists()).toBe(true)
   })
 
   it('the counts tiles show the server counts', async () => {

@@ -250,11 +250,24 @@ class World:
         } | kw
         return (await self.put(SETTINGS.insert().values(**values).returning(SETTINGS.c.id))).scalar_one()
 
-    async def panel(self, created_at: datetime, *, name: str | None = None, **settings: Any) -> Seeded:
+    async def panel(
+        self,
+        created_at: datetime,
+        *,
+        name: str | None = None,
+        granularity: Granularity = Granularity.ONE_DAY,
+        **settings: Any,
+    ) -> Seeded:
+        # panel.granularity is NOT NULL with no schema default (ADR tj-rwoasb D2): a row written behind the crud states it.
         panel_id = (
             await self.put(
                 PANELS.insert()
-                .values(name=name or f'panel-{uuid.uuid4().hex[:8]}', source=SOURCE, created_at=created_at)
+                .values(
+                    name=name or f'panel-{uuid.uuid4().hex[:8]}',
+                    source=SOURCE,
+                    created_at=created_at,
+                    granularity=granularity,
+                )
                 .returning(PANELS.c.id)
             )
         ).scalar_one()
@@ -339,6 +352,10 @@ class World:
             'client_label': client_label,
             'state': state,
         } | values
+        # A BARS request always names its granularity (the panel manager writes the panel's own); the in-flight check
+        # matches on it (ADR tj-rwoasb). A corporate-actions request has none.
+        if kind is IngestRequestKind.BARS:
+            row.setdefault('granularity', Granularity.ONE_DAY)
         return (await self.put(REQUESTS.insert().values(**row).returning(REQUESTS.c.id))).scalar_one()
 
     async def bars_attempt(

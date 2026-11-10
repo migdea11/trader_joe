@@ -79,7 +79,7 @@ import sqlalchemy as sa
 from sqlalchemy.engine import Engine
 
 from common.enums.data_select import AssetType, DataType
-from common.enums.data_stock import DataSource, ExpiryType, UpdateType
+from common.enums.data_stock import DataSource, ExpiryType, Granularity, UpdateType
 from data.store.app.database.models.dataset_deletion import DatasetDeletion
 from data.store.app.database.models.dataset_override_log import DatasetOverrideLog
 from data.store.app.database.models.panel import (
@@ -316,7 +316,9 @@ def seeded_panel(pg_engine: Engine, run_identity) -> Iterator[SeededPanel]:
                 )
             )
             panel_id = conn.execute(
-                sa.insert(PANEL_TABLE).values(name=f'{prefix}-seeded', source=PANEL_SOURCE).returning(PANEL_TABLE.c.id)
+                sa.insert(PANEL_TABLE)
+                .values(name=f'{prefix}-seeded', source=PANEL_SOURCE, granularity=Granularity.ONE_DAY)
+                .returning(PANEL_TABLE.c.id)
             ).scalar_one()
             conn.execute(
                 sa.insert(PANEL_SETTINGS_TABLE).values(
@@ -385,6 +387,7 @@ def send_write(
                     **PANEL_SETTINGS_BODY,
                     'name': seeded_panel.created_name,
                     'source': PANEL_SOURCE_NAME,
+                    'granularity': 'GRANULARITY_ONE_DAY',
                     'reason': seeded_panel.reason,
                 }
                 return data_store.post(UiPanelWritesInterface.POST_UI_PANELS, json=body, auth=auth)

@@ -239,15 +239,19 @@ async def requests_in_window(db: AsyncSession, source: DataSource, client_label:
     ).scalar_one()
 
 
-async def symbols_with_open_requests(db: AsyncSession, source: DataSource, client_label: str) -> set[str]:
+async def symbols_with_open_requests(
+    db: AsyncSession, source: DataSource, granularity: Granularity, client_label: str
+) -> set[str]:
     """The symbols a client label has an open request for: a BARS request with no dataset yet, or corporate actions.
 
     The panel manager's in-flight check: a symbol whose creation (its clamp or its first bars request) is still on its
-    way must not be asked for again. A BARS request that already names a dataset is a refresh and is not counted.
+    way must not be asked for again. A BARS request that already names a dataset is a refresh and is not counted. A BARS request counts only at the
+    panel's granularity; a corporate-actions request has none and counts for every panel.
 
     Args:
         db: A session.
         source: The data source.
+        granularity: The panel's Bar Interval; a BARS request at another one is not in flight for this panel.
         client_label: The label the requests carry (the panel owner).
 
     Returns:
@@ -263,7 +267,9 @@ async def symbols_with_open_requests(db: AsyncSession, source: DataSource, clien
             table.c.asset_symbol.is_not(None),
             or_(
                 table.c.kind == IngestRequestKind.CORPORATE_ACTIONS,
-                (table.c.kind == IngestRequestKind.BARS) & table.c.dataset_id.is_(None),
+                (table.c.kind == IngestRequestKind.BARS)
+                & table.c.dataset_id.is_(None)
+                & (table.c.granularity == granularity),
             ),
         )
         .distinct()

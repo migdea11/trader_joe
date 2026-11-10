@@ -52,7 +52,7 @@ from common.database.sql_alchemy_nullable_datetime import NullableDateTime
 from common.enums.data_stock import DataSource, ExpiryType, Feed, Granularity, UpdateType
 from common.errors.vocabulary import ERROR_DOMAIN, Reason
 from data.store.app import daily_refresh as refresh_module
-from data.store.app.client_label import OPERATOR_PRINCIPAL
+from data.store.app.client_label import OPERATOR_PRINCIPAL, PANEL_OWNER
 from data.store.app.daily_refresh import SCHEDULER_ACTOR, DailyRefresher, PassResult
 from data.store.app.database.crud.stock.dataset_catalog import get_catalog_row
 from data.store.app.database.models.dataset_override_log import DatasetOverrideLog
@@ -651,3 +651,66 @@ async def test_a_provisional_newest_bar_is_re_requested_and_rewritten_final_on_p
 
     assert second == PassResult()
     assert ingest.submitted == []
+
+
+# ADR tj-rwoasb (panel Bar Interval), architect's gate addition (6): a 1 Minute panel's dataset is DAILY at 1min, and
+# the refresh, which reads the work from the database, owes it ONE request per pass AT 1min: the granularity is the
+# entry's own, never the 1day every panel dataset had before the column existed. A second pass while that request is
+# open owes nothing more (an open request is not owed again).
+MINUTE_BARS = [datetime(2026, 10, 2, 19, 57, tzinfo=UTC) + timedelta(minutes=k) for k in range(3)]
+
+
+@pytest.mark.asyncio
+async def test_a_1min_panel_dataset_gets_one_daily_refresh_request_at_1min_on_postgres(
+    scratch_db, point_refresh, entry_values, bar_values, run_identity
+):
+    scratch_db.must('upgrade', _head())
+    with scratch_db.engine.begin() as conn:
+        row = conn.execute(
+            sa.insert(ENTRY_TABLE)
+            .values(
+                entry_values(
+                    asset_symbol=run_identity.alt_symbol('dr1m'),
+                    owner=PANEL_OWNER,
+                    update_type=UpdateType.DAILY.value,
+                    expiry_type=ExpiryType.ROLLING.value,
+                    granularity=Granularity.ONE_MINUTE,
+                    feed=SERVED_FEED,
+                    start=START,
+                    end=NullableDateTime.EPOCH,
+                )
+            )
+            .returning(ENTRY_TABLE)
+        ).one()
+        for timestamp in MINUTE_BARS:
+            conn.execute(sa.insert(BAR_TABLE).values(bar_values(row, timestamp=timestamp)))
+    clock = Clock(NOW)
+    ingest = _ingest(clock)
+
+    result = await DailyRefresher(ingest, clock=clock).run_pass(DataSource.ALPACA_API)
+
+    assert result == PassResult(behind=1, refreshed=1)
+    (sent,) = ingest.submitted
+    assert (sent.bars.granularity, sent.bars.update_type, sent.bars.asset_symbol) == (
+        Granularity.ONE_MINUTE,
+        UpdateType.DAILY,
+        row.asset_symbol,
+    )
+    assert sent.bars.start > MINUTE_BARS[-1], 'the tail did not start after the newest stored 1min bar'
+    (request,) = _requests(scratch_db.engine).values()
+    assert (request.dataset_id, request.granularity, request.update_type) == (
+        row.id,
+        Granularity.ONE_MINUTE,
+        UpdateType.DAILY.value,
+    )
+    assert (request.trigger, request.client_label, request.requested_start) == (
+        IngestRunTrigger.SCHEDULE,
+        SCHEDULER_ACTOR,
+        sent.bars.start,
+    )
+    assert request.state == IngestRequestState.QUEUED
+
+    second = await DailyRefresher(ingest, clock=clock).run_pass(DataSource.ALPACA_API)
+
+    assert second.refreshed == 0, second
+    assert len(ingest.submitted) == 1, 'an open 1min refresh request was owed again'

@@ -4,7 +4,7 @@
 //
 // Copy follows theme/copy.ts: Title Case for labels and buttons, sentence case for sentences. The word is
 // panel; nothing here names a market, a world or a universe.
-import { AssetType, DataSource } from '@generated/trader_joe/proto/market/v1/enums_pb'
+import { AssetType, DataSource, Granularity } from '@generated/trader_joe/proto/market/v1/enums_pb'
 import { DatasetHealthStatusSchema } from '@generated/trader_joe/proto/ui/v1/data_pb'
 import type { DatasetHealthStatus } from '@generated/trader_joe/proto/ui/v1/data_pb'
 import {
@@ -232,8 +232,27 @@ export function draftProblem(draft: PanelDraft, options: { cadenceRequired: bool
   return draftFieldErrors(draft, options).cadence ?? ''
 }
 
+/**
+ * The Bar Intervals a panel can be created with, in the order the form offers them (ADR tj-rwoasb D3): the one
+ * list on this side, so offering another interval is one line here (the store has its own allowed set).
+ */
+export const PANEL_INTERVALS: readonly { value: Granularity; label: string }[] = [
+  { value: Granularity.ONE_MINUTE, label: '1 Minute' },
+  { value: Granularity.ONE_HOUR, label: '1 Hour' },
+  { value: Granularity.ONE_DAY, label: '1 Day' },
+]
+
+/** The interval a new panel form starts on: a form default, not a schema default. */
+export const DEFAULT_PANEL_INTERVAL = Granularity.ONE_DAY
+
+/** A panel's Bar Interval in words; a wire value the list does not offer reads Unknown. */
+export function panelIntervalLabel(granularity: Granularity): string {
+  return PANEL_INTERVALS.find((interval) => interval.value === granularity)?.label ?? 'Unknown'
+}
+
 /** What the create form knows when it decides whether Create Panel can be pressed. */
 export interface CreateInput {
+  granularity: Granularity
   name: string
   nameTaken: boolean
   source: DataSource
@@ -248,7 +267,7 @@ export interface CreateInput {
 }
 
 /** A create form field that can carry an error. */
-export type CreateField = 'name' | 'source' | 'ramp' | 'cap' | 'pre' | 'post'
+export type CreateField = 'name' | 'source' | 'granularity' | 'ramp' | 'cap' | 'pre' | 'post'
 
 const COUNT_ERROR = `Give a whole number, 0 to ${MAX_INT32}.`
 const RAMP_ERROR = `Give a whole number, ${MIN_RAMP_PER_HOUR} to ${MAX_INT32}, or leave it empty for no limit.`
@@ -275,6 +294,7 @@ export function createFieldErrors(input: CreateInput): Partial<Record<CreateFiel
   if (input.source === DataSource.UNSPECIFIED) errors.source = 'Choose a source.'
   else if (input.sourceProblem) errors.source = 'The source settings could not be read. Choose the source again.'
   else if (input.sourceNeedsSettings === null) errors.source = 'Reading the source settings.'
+  if (!PANEL_INTERVALS.some((interval) => interval.value === input.granularity)) errors.granularity = 'Choose a bar interval.'
   if (input.sourceNeedsSettings) {
     const ramp = rateFieldError(input.ramp, 'ramp')
     if (ramp !== '') errors.ramp = ramp

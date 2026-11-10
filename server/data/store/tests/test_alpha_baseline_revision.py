@@ -173,6 +173,22 @@ def test_the_bar_counts_are_bigint(recorded):
         assert isinstance(bar.c[name].type, sa.BigInteger) and not bar.c[name].nullable, name
 
 
+def test_the_bar_id_is_bigint_in_the_baseline(recorded):
+    """ADR tj-rwoasb D4, edited in place: the surrogate bar id is 64-bit, so its implicit sequence is bigint too."""
+    bar = recorded.metadata.tables[StockMarketActivity.TABLE_NAME]
+    assert isinstance(bar.c.id.type, sa.BigInteger) and bar.c.id.primary_key and not bar.c.id.nullable
+
+
+def test_the_panel_granularity_is_the_last_panel_column_the_shared_enum_not_null_no_default(recorded):
+    """ADR tj-rwoasb D1/D2, edited in place: the native type 'granularity' is referenced, not re-created."""
+    panel = recorded.metadata.tables['panel']
+    column = panel.c.granularity
+    assert list(panel.c.keys())[-1] == 'granularity', list(panel.c.keys())
+    assert isinstance(column.type, postgresql.ENUM) and column.type.name == 'granularity'
+    assert column.type.create_type is False
+    assert not column.nullable and column.server_default is None and column.default is None
+
+
 def test_the_panel_version_has_no_size_and_no_size_check(recorded):
     version = recorded.metadata.tables[PanelSettingsVersion.__tablename__]
     assert 'size' not in version.c

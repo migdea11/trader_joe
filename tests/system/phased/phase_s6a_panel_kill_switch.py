@@ -39,6 +39,7 @@ import pytest
 import sqlalchemy as sa
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from common.enums.data_stock import Granularity
 from data.store.app.client_label import OPERATOR_PRINCIPAL, PANEL_OWNER
 from data.store.app.database.crud.panel_settings import append_source_settings_version, create_panel
 from data.store.app.database.models.ingest_request import IngestRequest
@@ -95,6 +96,7 @@ async def test_s6a_the_kill_switch_holds_an_enabled_panel_off_for_a_whole_tick(
                 db,
                 name=f'{NAME_PREFIX}{run_identity.run_id}',
                 source=SOURCE,
+                granularity=Granularity.ONE_DAY,
                 settings=SETTINGS_V1,
                 actor=OPERATOR_PRINCIPAL,
                 reason='P26 S6 kill switch and dry run',

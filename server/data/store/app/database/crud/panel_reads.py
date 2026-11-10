@@ -131,7 +131,9 @@ def _chunks(items: Sequence) -> list[Sequence]:
 
 
 def _panel_record(row) -> PanelRecord:
-    return PanelRecord(id=row.id, name=row.name, source=row.source, created_at=row.created_at)
+    return PanelRecord(
+        id=row.id, name=row.name, source=row.source, created_at=row.created_at, granularity=row.granularity
+    )
 
 
 def _settings_record(row) -> PanelSettingsRecord:
@@ -189,7 +191,7 @@ async def list_panels(db: AsyncSession) -> list[PanelListRow]:
         .scalar_subquery()
     )
     result = await db.execute(
-        select(_PANEL.c.id, _PANEL.c.name, _PANEL.c.source, _PANEL.c.created_at, _SETTINGS.c.enabled)
+        select(*_PANEL.c, _SETTINGS.c.enabled)
         .join(_SETTINGS, and_(_SETTINGS.c.panel_id == _PANEL.c.id, _SETTINGS.c.version_no == newest))
         .order_by(_PANEL.c.name, _PANEL.c.id)
     )
@@ -198,11 +200,7 @@ async def list_panels(db: AsyncSession) -> list[PanelListRow]:
 
 async def get_panel(db: AsyncSession, panel_id: uuid.UUID) -> PanelRecord | None:
     """One panel, or None when no such panel exists."""
-    row = (
-        await db.execute(
-            select(_PANEL.c.id, _PANEL.c.name, _PANEL.c.source, _PANEL.c.created_at).where(_PANEL.c.id == panel_id)
-        )
-    ).first()
+    row = (await db.execute(select(*_PANEL.c).where(_PANEL.c.id == panel_id))).first()
     return None if row is None else _panel_record(row)
 
 

@@ -99,7 +99,13 @@ def _override_rows(pg_engine: Engine) -> int:
 def _create(data_store, pg_engine: Engine, written: Written, name: str, source: str = MANUAL) -> httpx.Response:
     """W1 for a DISABLED panel, giving the source's first settings only when the source has none yet."""
     has_version = data_store.get(f'/ui/v1/panel-sources/{source}/settings-versions').json().get('items')
-    body = {'name': name, 'source': source, 'enabled': False, 'reason': 'system test panel'}
+    body = {
+        'name': name,
+        'source': source,
+        'granularity': 'GRANULARITY_ONE_DAY',
+        'enabled': False,
+        'reason': 'system test panel',
+    }
     response = data_store.post('/ui/v1/panels', json=body | ({} if has_version else RATES), auth='right')
     if response.status_code == 201:
         written.panels.append(uuid.UUID(response.json()['id']))
@@ -183,7 +189,7 @@ async def test_concurrent_creates_of_one_name_leave_one_panel_and_answer_422_oth
     # Make sure MANUAL_ENTRY has a version first, so no create carries source settings (that race is PS8's).
     first = _create(data_store, pg_engine, written, f'{name}-seed')
     assert first.status_code == 201, data_store.describe(first)
-    body = {'name': name, 'source': MANUAL, 'enabled': False, 'reason': 'race'}
+    body = {'name': name, 'source': MANUAL, 'granularity': 'GRANULARITY_ONE_DAY', 'enabled': False, 'reason': 'race'}
     headers = data_store._headers('right')
 
     async with httpx.AsyncClient(base_url=data_store_url, timeout=30.0) as client:

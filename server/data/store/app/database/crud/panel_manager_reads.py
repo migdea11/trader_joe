@@ -29,7 +29,7 @@ ID_CHUNK = 5000
 
 @dataclass(frozen=True)
 class PanelEntry:
-    """A panel-owned DAILY 1day dataset entry, as the existing check and the exit rule see it."""
+    """A panel-owned DAILY dataset entry at the panel's granularity, as the existing check and the exit rule see it."""
 
     id: uuid.UUID
     symbol: str
@@ -53,12 +53,12 @@ class PassRecord:
 
 
 async def panel_entries(
-    db: AsyncSession, source: DataSource, owner: str, symbols: Collection[str]
+    db: AsyncSession, source: DataSource, granularity: Granularity, owner: str, symbols: Collection[str]
 ) -> dict[str, PanelEntry]:
-    """The owner's DAILY 1day entries of a source for these symbols, by symbol, whatever their declared start.
+    """The owner's DAILY entries of a source at one granularity (the panel's Bar Interval) for these symbols, by symbol, whatever their declared start.
 
     The existing check must not key on the declared start (the name_change clamp can move it), so this reads by
-    (source, owner, symbol, DAILY, 1day) alone. When a symbol has several entries the oldest wins.
+    (source, owner, symbol, DAILY, granularity) alone. When a symbol has several entries the oldest wins.
     """
     found: dict[str, PanelEntry] = {}
     names = sorted(set(symbols))
@@ -69,7 +69,7 @@ async def panel_entries(
                 _ENTRY.c.source == source,
                 _ENTRY.c.owner == owner,
                 _ENTRY.c.update_type == UpdateType.DAILY,
-                _ENTRY.c.granularity == Granularity.ONE_DAY,
+                _ENTRY.c.granularity == granularity,
                 _ENTRY.c.asset_symbol.in_(names[start : start + ID_CHUNK]),
             )
             .order_by(_ENTRY.c.created_at.desc(), _ENTRY.c.id.desc())

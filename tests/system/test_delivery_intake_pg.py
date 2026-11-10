@@ -82,6 +82,7 @@ from data.store.app.database.models.stock_market_activity import StockMarketActi
 from data.store.app.events import DatasetChange, DatasetChanged
 from data.store.app.ingest import delivery_intake
 from data.store.app.ingest.delivery_intake import DeliveryIntake
+from routers.data_store.app_endpoints import AssetDataInterface, UiDatasetsInterface
 from schemas.data_ingest.delivery import (
     AttemptDelivery,
     CorporateActionRecord,
@@ -1086,3 +1087,103 @@ async def test_pg13_a_bar_count_above_int32_round_trips_through_deliver_and_the_
         ).one()
     assert types == {'volume': 'int8', 'trade_count': 'int8'}, types
     assert tuple(stored) == (ABOVE_INT32, ABOVE_INT32)
+
+
+# --------------------------------------------------------------------------------------------- PG14
+
+# ADR tj-rwoasb D2: stock_market_activity.id is BIGINT and its sequence is a bigint sequence, both created so from
+# empty by the alpha baseline. PG14 moves the stack's sequence past 2**31 (never down: setval to the greater of the
+# floor and where it already is, so no id this run or another already used can be handed out again) and writes bars
+# through the real delivery intake and the single-bar POST, then reads them over every route that returns bars. The
+# internal read and the POST serialise the id itself; the /ui/v1 bar page and bar-page index carry no id but read the
+# same rows, so a codec or serialiser that refused an int8 id would fail them too. A setval is not rolled back and the
+# sequence stays above 2**31 for the rest of the run, which is the point: every later bar of the run has a wide id.
+ID_FLOOR = 2**31
+INT8_MAX = 2**63 - 1
+BAR_READ_PATH = AssetDataInterface.GET_ASSET_DATA.format(
+    asset_type=AssetType.STOCK.value, data_type=DataType.MARKET_ACTIVITY.value
+)
+BAR_POST_PATH = AssetDataInterface.POST_ASSET_DATA.format(
+    asset_type=AssetType.STOCK.value, data_type=DataType.MARKET_ACTIVITY.value
+)
+
+
+def _zulu(at: datetime) -> str:
+    return at.strftime('%Y-%m-%dT%H:%M:%SZ')
+
+
+def _bar_sequence(conn: sa.Connection) -> str:
+    return conn.execute(sa.text("SELECT pg_get_serial_sequence('stock_market_activity', 'id')")).scalar_one()
+
+
+async def test_pg14_the_bar_id_column_and_its_sequence_are_bigint_with_the_int8_maximum(pg_engine: Engine):
+    """The column, and the sequence's OWN type and maximum: a bigint column fed by an integer sequence still stops."""
+    with pg_engine.connect() as conn:
+        column = conn.execute(
+            sa.text(
+                'SELECT udt_name FROM information_schema.columns WHERE table_schema = current_schema() '
+                "AND table_name = 'stock_market_activity' AND column_name = 'id'"
+            )
+        ).scalar_one()
+        name = _bar_sequence(conn)
+        data_type, max_value = conn.execute(
+            sa.text(
+                'SELECT data_type::text, max_value FROM pg_sequences '
+                "WHERE schemaname = current_schema() AND sequencename = 'stock_market_activity_id_seq'"
+            )
+        ).one()
+    assert name == 'public.stock_market_activity_id_seq', name
+    assert column == 'int8', column
+    assert (data_type, max_value) == ('bigint', INT8_MAX), (data_type, max_value)
+
+
+async def test_pg14_a_bar_id_above_int32_round_trips_through_the_intake_the_post_and_every_bar_route(
+    intake, created, run_identity, insert_entry, own_symbol, instance_id, pg_engine, data_store, bar_create_body
+):
+    entry = insert_entry(
+        asset_symbol=own_symbol,
+        granularity=Granularity.ONE_DAY,
+        feed=Feed.IEX,
+        start=BAR_START,
+        end=BAR_START + timedelta(days=10),
+    )
+    with pg_engine.begin() as conn:
+        name = _bar_sequence(conn)
+        last = conn.execute(sa.text(f'SELECT last_value FROM {name}')).scalar_one()  # nosec B608
+        conn.execute(sa.text('SELECT setval(:name, :value)'), {'name': name, 'value': max(ID_FLOOR, last)})
+
+    # The real write path: a delivered SUCCEEDED attempt, bars upserted by the intake on asyncpg.
+    holder = instance_id('pg14')
+    await intake.register(holder)
+    request_id = await _request(intake.engine, created, run_identity, own_symbol, holder=holder, dataset_id=entry.id)
+    answer = await intake.deliver(report(request_id, parts=[bar_page(0, 1, 2)], instance_id=holder))
+    assert answer == DeliverAttemptResponse(verdict=FINAL, attempt_count=1), answer
+
+    # The single-bar POST, the other write route: it answers with the stored row, id included.
+    posted = data_store.post(BAR_POST_PATH, json=bar_create_body(entry, BAR_START + timedelta(days=3)), auth='right')
+    assert posted.status_code == 200, data_store.describe(posted)
+    posted_id = posted.json()['id']
+    assert type(posted_id) is int and posted_id > ID_FLOOR, data_store.describe(posted)
+
+    stored = {row.timestamp: row.id for row in await _bars(intake.engine, entry.id)}
+    assert len(stored) == 4, stored
+    assert all(type(i) is int and ID_FLOOR < i <= INT8_MAX for i in stored.values()), stored
+    assert stored[BAR_START + timedelta(days=3)] == posted_id
+
+    # The internal read serialises the id: every one comes back whole, not truncated or wrapped.
+    read = data_store.get(BAR_READ_PATH, params={'dataset_id': str(entry.id)})
+    assert read.status_code == 200, data_store.describe(read)
+    served = {datetime.fromisoformat(bar['timestamp']): bar['id'] for bar in read.json()}
+    assert served == stored, data_store.describe(read)
+    assert all(type(i) is int for i in served.values())
+
+    # The /ui/v1 bar page and the bar-page index read the same rows.
+    window = {'start': _zulu(BAR_START), 'end': _zulu(BAR_START + timedelta(days=10))}
+    page = data_store.get(UiDatasetsInterface.GET_UI_DATASET_BARS.format(dataset_id=entry.id), params=window)
+    assert page.status_code == 200, data_store.describe(page)
+    assert [bar['barStart'] for bar in page.json()['bars']] == [
+        _zulu(BAR_START + timedelta(days=d)) for d in range(4)
+    ], data_store.describe(page)
+    index = data_store.get(UiDatasetsInterface.GET_UI_DATASET_BAR_PAGES.format(dataset_id=entry.id), params=window)
+    assert index.status_code == 200, data_store.describe(index)
+    assert int(index.json().get('barCount', '0')) == 4, data_store.describe(index)

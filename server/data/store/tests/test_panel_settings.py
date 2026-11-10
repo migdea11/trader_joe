@@ -66,9 +66,10 @@ from sqlalchemy.pool import StaticPool
 from sqlalchemy.sql import Insert, Select
 
 from common.enums.data_select import AssetType
-from common.enums.data_stock import DataSource
+from common.enums.data_stock import DataSource, Granularity
 from common.errors.vocabulary import REASONS, InvalidRequestError, Reason
 from data.store.app.database.crud import panel_settings
+from data.store.app.database.crud.panel_reads import get_panel, list_panels
 from data.store.app.database.crud.panel_settings import (
     DEFAULT_PANEL_CADENCE,
     EnabledPanel,
@@ -86,6 +87,7 @@ from data.store.app.database.crud.panel_settings import (
 )
 from data.store.app.database.models.panel import (
     DEFAULT_CORPORATE_ACTION_WINDOW_DAYS,
+    PANEL_GRANULARITIES,
     Panel,
     PanelCadence,
     PanelPass,
@@ -213,6 +215,7 @@ async def _panel(world: World, name: str = 'alpha', source: DataSource = SOURCE,
             db,
             name=name,
             source=source,
+            granularity=kw.get('granularity', Granularity.ONE_DAY),
             settings=settings,
             actor=kw.get('actor', ACTOR),
             reason=kw.get('reason', 'first panel'),
@@ -263,7 +266,40 @@ async def test_create_panel_writes_the_panel_and_version_1_in_one_commit(world):
         actor='operator',
         reason='split per country',
     )
-    assert panel == PanelRecord(id=panel_row.id, name='alpha', source=SOURCE, created_at=panel_row.created_at)
+    assert panel == PanelRecord(
+        id=panel_row.id, name='alpha', source=SOURCE, created_at=panel_row.created_at, granularity=Granularity.ONE_DAY
+    )
+
+
+@pytest.mark.parametrize('granularity', list(PANEL_GRANULARITIES), ids=lambda g: g.name)
+async def test_create_panel_stores_the_given_granularity_and_every_read_returns_it(world, granularity):
+    """ADR tj-rwoasb D1/D2: the row stores the Bar Interval as given.
+
+    get_panel, list_panels and enabled_panels_on_source carry it.
+    """
+    await _source(world)
+
+    panel, _ = await _panel(world, granularity=granularity)
+
+    (panel_row,) = await world.rows(PANELS)
+    assert panel_row.granularity is granularity and panel.granularity is granularity
+    async with world.session() as db:
+        assert (await get_panel(db, panel.id)).granularity is granularity
+        (listed,) = await list_panels(db)
+        assert listed.panel.granularity is granularity
+        (enabled,) = await enabled_panels_on_source(db, SOURCE)
+        assert enabled.panel.granularity is granularity
+
+
+async def test_create_panel_without_a_granularity_is_a_type_error_and_writes_nothing(world):
+    """ADR tj-rwoasb D2: a required keyword with no default; the column has no server default either."""
+    await _source(world)
+    before = len(await world.rows(PANELS))
+    async with world.session() as db:
+        with pytest.raises(TypeError, match='granularity'):
+            await create_panel(db, name='alpha', source=SOURCE, settings=SETTINGS_V1, actor=ACTOR, reason='x')  # type: ignore[call-arg]
+    assert len(await world.rows(PANELS)) == before
+    assert inspect.signature(create_panel).parameters['granularity'].default is inspect.Parameter.empty
 
 
 async def test_default_panel_cadence_is_monthly():
@@ -1158,9 +1194,25 @@ async def test_the_name_lock_is_transaction_scoped_and_ends_with_the_transaction
     async with world.session() as db:
         if refused:
             with pytest.raises(InvalidRequestError):
-                await create_panel(db, name='alpha', source=SOURCE, settings=SETTINGS_V1, actor=ACTOR, reason='again')
+                await create_panel(
+                    db,
+                    name='alpha',
+                    source=SOURCE,
+                    granularity=Granularity.ONE_DAY,
+                    settings=SETTINGS_V1,
+                    actor=ACTOR,
+                    reason='again',
+                )
         else:
-            await create_panel(db, name='alpha', source=SOURCE, settings=SETTINGS_V1, actor=ACTOR, reason='first')
+            await create_panel(
+                db,
+                name='alpha',
+                source=SOURCE,
+                granularity=Granularity.ONE_DAY,
+                settings=SETTINGS_V1,
+                actor=ACTOR,
+                reason='first',
+            )
         assert not db.in_transaction(), 'create_panel left its transaction, and so the name lock, open'
 
     lock_sql = [_sql(statement) for statement in world.statements if _lock_key(statement) is not None]
@@ -1191,7 +1243,9 @@ async def test_an_id_that_reads_as_a_number_round_trips(world, hex_id):
     """The tier's own guard: ids are stored as text, so a random id never fails a read now and then."""
     await _source(world)
     panel_id = uuid.UUID(hex_id)
-    await world.put(sa.insert(PANELS).values(id=panel_id, name='numeric', source=SOURCE))
+    await world.put(
+        sa.insert(PANELS).values(id=panel_id, name='numeric', source=SOURCE, granularity=Granularity.ONE_DAY)
+    )
 
     version = await _append(world, panel_id)
 

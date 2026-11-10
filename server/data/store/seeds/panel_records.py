@@ -90,7 +90,7 @@ async def seed_panel_records(url: URL, dataset_id: uuid.UUID) -> None:
     from sqlalchemy import select
     from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 
-    from common.enums.data_stock import DataSource
+    from common.enums.data_stock import DataSource, Granularity
     from data.store.app.database.crud import panel_ledger, panel_settings
     from data.store.app.database.models.asset_list import AssetListSnapshot
     from data.store.app.database.models.panel import PanelCadence, PanelPassKind, PanelTransition
@@ -158,6 +158,7 @@ async def seed_panel_records(url: URL, dataset_id: uuid.UUID) -> None:
                 db,
                 name=PANEL_NAME,
                 source=DataSource.ALPACA_API,
+                granularity=Granularity.ONE_DAY,
                 settings=panel_settings.PanelSettings(enabled=True, allow_symbols=('ZZSEEDXA', 'ZZSEEDXB')),
                 actor=PANEL_ACTOR,
                 reason='seed: create the panel',

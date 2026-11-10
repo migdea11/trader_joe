@@ -22,7 +22,7 @@ from dataclasses import dataclass
 import pytest
 import sqlalchemy.ext.asyncio as sqlalchemy_asyncio
 
-from common.enums.data_stock import DataSource
+from common.enums.data_stock import DataSource, Granularity
 from data.store.app.database.crud import panel_ledger, panel_settings
 from data.store.app.database.models.panel import PanelCadence, PanelPassKind, PanelTransition
 from data.store.seeds import ingest_records, panel_records
@@ -258,6 +258,8 @@ def test_one_panel_is_created_with_version_1_and_the_source_settings(recorder):
     _run(recorder)
     (created,) = recorder.named('create_panel')
     assert created['name'] == PANEL_NAME and created['source'] is DataSource.ALPACA_API
+    # ADR tj-rwoasb D2: the cast states the required Bar Interval; 1 Day is today's behaviour, and the dump carries it.
+    assert created['granularity'] is Granularity.ONE_DAY
     assert created['actor'] == PANEL_ACTOR and created['reason'].strip()
     settings = created['settings']
     assert settings.enabled is True and settings.cadence is None, 'version 1 names no cadence: the default applies'

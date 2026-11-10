@@ -31,6 +31,13 @@ default, the last column of the table (the panel setting 'include OTC', off by d
 new revision is needed. A database already at this id is NOT upgraded by `make migrate` (a no-op) and lacks the column:
 drop it and migrate again.
 
+EDITED IN PLACE (2026-11-10, ADR tj-rwoasb D4): stock_market_activity.id is BIGINT (its implicit sequence is bigint too): a
+1 Minute panel passes 2^31 bars. The id is unchanged on purpose, for the reason above: drop the database and migrate again.
+
+EDITED IN PLACE (2026-11-10, ADR tj-rwoasb D1, D2): panel gained granularity, the native granularity enum (not re-created),
+NOT NULL with NO default, the last column of the table: the bar interval a panel's datasets are minted at, fixed at
+creation like source. The id is unchanged on purpose, for the reason above: drop the database and migrate again.
+
 NO DOWNGRADE. downgrade() raises: recovery is a restore of make migrate's pre-migrate dump (ADR tj-x3ig38), and this
 revision has no parent to return to.
 
@@ -320,6 +327,7 @@ def upgrade() -> None:
     sa.Column('name', sa.String(), nullable=False),
     sa.Column('source', _enum('datasource'), nullable=False),
     sa.Column('created_at', sa.DateTime(timezone=True), server_default=sa.text('now()'), nullable=False),
+    sa.Column('granularity', _enum('granularity'), nullable=False),
     sa.PrimaryKeyConstraint('id')
     )
     op.create_index('uq_panel_name', 'panel', ['name'], unique=True)
@@ -400,7 +408,7 @@ def upgrade() -> None:
     sa.Column('close', sa.Float(), nullable=False),
     sa.Column('volume', sa.BigInteger(), nullable=False),
     sa.Column('trade_count', sa.BigInteger(), nullable=False),
-    sa.Column('id', sa.Integer(), nullable=False),
+    sa.Column('id', sa.BigInteger(), nullable=False),
     sa.Column('dataset_id', sa.UUID(), nullable=False),
     sa.Column('source', _enum('datasource'), nullable=False),
     sa.Column('asset_symbol', sa.String(), nullable=False),

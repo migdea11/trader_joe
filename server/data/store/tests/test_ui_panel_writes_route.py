@@ -42,10 +42,12 @@ import pytest
 import pytest_asyncio
 from google.protobuf import json_format
 
+from common.enums.data_stock import Granularity
+from common.errors.vocabulary import InvalidRequestError
 from data.store.app.client_label import OPERATOR_PRINCIPAL, PANEL_OWNER
 from data.store.app.database.crud.panel_settings import PanelSettings
 from data.store.app.database.database import async_db
-from data.store.app.database.models.panel import PanelCadence
+from data.store.app.database.models.panel import PANEL_GRANULARITIES, PanelCadence
 from data.store.app.events import EventHub
 from data.store.app.main import app
 from data.store.tests.panel_ui_harness import (
@@ -73,7 +75,13 @@ HEADERS = {INSTANCE_SECRET_HEADER: SECRET}
 CREATE = '/ui/v1/panels'
 SOURCE_PATH = '/ui/v1/panel-sources/DATA_SOURCE_ALPACA_API/settings-versions'
 RATES = {'rampDatasetsPerHour': 2, 'requestCapPerHour': 10}
-PANEL_BODY = {'name': 'etfs', 'source': 'DATA_SOURCE_ALPACA_API', 'enabled': True, 'reason': '  first  '}
+PANEL_BODY = {
+    'name': 'etfs',
+    'source': 'DATA_SOURCE_ALPACA_API',
+    'granularity': 'GRANULARITY_ONE_DAY',
+    'enabled': True,
+    'reason': '  first  ',
+}
 SETTINGS_BODY = {'enabled': False, 'cadence': 'PANEL_CADENCE_WEEKLY', 'reason': ' paused for review '}
 SOURCE_BODY = RATES | {'corporateActionWindowPreDays': 30, 'corporateActionWindowPostDays': 7, 'reason': ' slower '}
 
@@ -228,6 +236,79 @@ async def test_w1_creates_the_panel_its_version_1_and_its_sources_first_settings
     assert (counts['panel'], counts['panel_settings_version'], counts['panel_source_settings_version']) == (1, 1, 1)
     assert counts['panel_pass'] == 0 and counts['dataset_override_log'] == 0
     assert world.published.events == []
+
+
+ALLOWED_GRANULARITIES = {
+    'GRANULARITY_ONE_MINUTE': Granularity.ONE_MINUTE,
+    'GRANULARITY_ONE_HOUR': Granularity.ONE_HOUR,
+    'GRANULARITY_ONE_DAY': Granularity.ONE_DAY,
+}
+
+
+@pytest.mark.parametrize('wire', list(ALLOWED_GRANULARITIES))
+async def test_w1_creates_a_panel_at_each_allowed_granularity_and_r1_r2_return_it(world, client, wire):
+    """ADR tj-rwoasb D2/D3: 1 Minute, 1 Hour and 1 Day are accepted; the row stores it, list and detail serve it."""
+    body = await created(await post(client, CREATE, PANEL_BODY | RATES | {'granularity': wire}))
+
+    assert body['granularity'] == wire
+    (panel,) = await world.rows(PANELS)
+    assert panel.granularity is ALLOWED_GRANULARITIES[wire]
+    (listed,) = (await client.get(CREATE)).json()['items']
+    assert listed['id'] == body['id'] and listed['granularity'] == wire
+    assert (await client.get(f'{CREATE}/{body["id"]}')).json()['granularity'] == wire
+
+
+REFUSED_GRANULARITIES = [
+    pytest.param({'granularity': 'GRANULARITY_UNSPECIFIED'}, id='unspecified'),
+    pytest.param(None, id='absent'),
+    pytest.param({'granularity': 'GRANULARITY_FIVE_MINUTES'}, id='five-minutes'),
+    pytest.param({'granularity': 'GRANULARITY_THIRTY_MINUTES'}, id='thirty-minutes'),
+    pytest.param({'granularity': 'GRANULARITY_ONE_WEEK'}, id='one-week'),
+    pytest.param({'granularity': 'GRANULARITY_ONE_MONTH'}, id='one-month'),
+]
+
+
+@pytest.mark.parametrize('change', REFUSED_GRANULARITIES)
+async def test_w1_refuses_any_granularity_outside_the_allowed_set_with_422_and_writes_nothing(world, client, change):
+    """ADR tj-rwoasb D3: UNSPECIFIED, absent and every other proto member are INVALID_REQUEST, nothing written.
+
+    No panel, version or source settings row (the request carries rates, so a write would add a source version too).
+    """
+    body = {key: value for key, value in (PANEL_BODY | RATES).items() if key != 'granularity'} | (change or {})
+    before = await world.counts()
+
+    answer = problem(await post(client, CREATE, body), status=422, reason='INVALID_REQUEST')
+
+    assert 'granularity' in answer['detail']
+    await nothing_written(world, before)
+    assert before['panel'] == before['panel_settings_version'] == before['panel_source_settings_version'] == 0
+
+
+def test_the_mapping_refuses_exactly_the_members_outside_panel_granularities():
+    """The allowed set is the store's one constant: every wire member is accepted iff it maps into PANEL_GRANULARITIES.
+
+    The enum is walked from the field's descriptor (the generated modules stay private to the edge, TID251), so a member
+    added to market.v1.Granularity later is judged here too.
+    """
+    members = ui_mapping.panels_pb2.CreatePanelRequest.DESCRIPTOR.fields_by_name['granularity'].enum_type.values
+    assert len(members) == 8, [member.name for member in members]
+    accepted, refused = set(), set()
+    for member in members:
+        body = {'name': 'n', 'source': 'DATA_SOURCE_ALPACA_API', 'enabled': True, 'granularity': member.name}
+        request = json_format.Parse(json.dumps(body), ui_mapping.panels_pb2.CreatePanelRequest())
+        try:
+            accepted.add((member.name, ui_mapping.create_panel_values(request).granularity))
+        except InvalidRequestError:
+            refused.add(member.name)
+    assert {domain for _, domain in accepted} == set(PANEL_GRANULARITIES)
+    assert {wire for wire, _ in accepted} == set(ALLOWED_GRANULARITIES)
+    assert refused == {
+        'GRANULARITY_UNSPECIFIED',
+        'GRANULARITY_FIVE_MINUTES',
+        'GRANULARITY_THIRTY_MINUTES',
+        'GRANULARITY_ONE_WEEK',
+        'GRANULARITY_ONE_MONTH',
+    }
 
 
 async def test_w1_keeps_a_named_cadence_and_a_given_window_day_count_and_an_absent_ramp_is_no_limit(world, client):
@@ -635,7 +716,7 @@ async def test_the_mapping_reads_include_otc_from_both_bodies(extra, expected):
     """
     base = {'enabled': True, 'cadence': 'PANEL_CADENCE_DAILY'} | extra
     save = json_format.Parse(json.dumps(base), ui_mapping.panels_pb2.SavePanelSettingsRequest())
-    create_body = base | {'name': 'n', 'source': 'DATA_SOURCE_ALPACA_API'}
+    create_body = base | {'name': 'n', 'source': 'DATA_SOURCE_ALPACA_API', 'granularity': 'GRANULARITY_ONE_DAY'}
     create = json_format.Parse(json.dumps(create_body), ui_mapping.panels_pb2.CreatePanelRequest())
     settings, _ = ui_mapping.save_panel_settings_values(save)
     assert settings.include_otc is expected

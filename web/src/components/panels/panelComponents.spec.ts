@@ -5,7 +5,8 @@
 // - PanelCreateForm: cadence Monthly (default) sent UNSPECIFIED unless picked; the four source settings
 //   fields only while the chosen source's versions page is empty, all four optional (ADR tj-2ayia2 D6: an
 //   empty ramp or cap is no limit and left out; a typed one is ramp 1 or more, cap 2 or more, at most the
-//   int32 maximum); only name and source are required; an optional reason, no size. Validated on click
+//   int32 maximum); name, source and the Bar Interval (1 Minute, 1 Hour, 1 Day, starting on 1 Day, ADR tj-rwoasb)
+//   are required; an optional reason, no size. Validated on click
 //   (tj-7zjov1.362.2): nothing marked on open, a press with gaps marks every one, focuses the first and
 //   sends nothing; the marks then follow the fields.
 // - PanelSourceSettingsForm: ramp and cap optional by the same rule, validated live (Save off on a bad one);
@@ -26,7 +27,7 @@ import { create } from '@bufbuild/protobuf'
 import { timestampFromMs } from '@bufbuild/protobuf/wkt'
 import { createPinia, setActivePinia } from 'pinia'
 
-import { AssetType, DataSource } from '@generated/trader_joe/proto/market/v1/enums_pb'
+import { AssetType, DataSource, Granularity } from '@generated/trader_joe/proto/market/v1/enums_pb'
 import { DatasetHealthStatus } from '@generated/trader_joe/proto/ui/v1/data_pb'
 import {
   AssetListDayState,
@@ -533,14 +534,18 @@ describe('the Include OTC Securities checkbox', () => {
     }
   })
 
-  it('the create form: the required set and the press marks stay name and source, whatever the box', async () => {
+  it('the create form: the required set stays name, source and bar interval, the press marks name and source, whatever the box', async () => {
     stubWrites()
     const form = mountCreate()
     await box(form, 'create').setValue(true)
     await press(form)
-    expect(form.findAll('[aria-required="true"]').map((el) => el.attributes('id'))).toEqual(['create-name', 'create-source'])
+    expect(form.findAll('[aria-required="true"]').map((el) => el.attributes('id'))).toEqual([
+      'create-name',
+      'create-source',
+      'create-granularity',
+    ])
     expect(form.findAll('[aria-invalid="true"]').map((el) => el.attributes('id'))).toEqual(['create-name', 'create-source'])
-    expect(form.findAll('label .pn-required')).toHaveLength(2)
+    expect(form.findAll('label .pn-required')).toHaveLength(3)
   })
 
   it('the create form opens with the box unticked, and an untouched create sends includeOtc false', async () => {
@@ -729,6 +734,7 @@ describe('PanelCreateForm', () => {
       includeOtc: false,
       name: 'Large caps',
       source: DataSource.ALPACA_API,
+      granularity: Granularity.ONE_DAY,
       reason: 'first panel',
     })
     expect(form.emitted('close')).toHaveLength(1)
@@ -962,6 +968,120 @@ describe('PanelCreateForm', () => {
   })
 })
 
+// ADR tj-rwoasb D1-D3 (owner ruling 2026-11-10): one Bar Interval per panel, chosen at creation from 1 Minute,
+// 1 Hour and 1 Day, the form starting on 1 Day (a form default, not a schema default), with a hint that intraday
+// bars arrive after the close and that the interval cannot change later. The settings form has no interval.
+describe('PanelCreateForm: the Bar Interval', () => {
+  const HELD_PAGE = create(PanelSourceSettingsVersionPageSchema, { items: [create(PanelSourceSettingsVersionSchema, { versionNo: 1 })] })
+  const HINT =
+    'Intraday bars arrive after the market close: the panel collects once a day, it is not a live feed. ' +
+    'The interval cannot be changed later; another interval is another panel.'
+
+  async function ready(form: VueWrapper): Promise<void> {
+    await byId(form, 'create-name').setValue('Large caps')
+    await byId(form, 'create-source').findAll('option')[1]!.setValue()
+    await flushPromises()
+  }
+
+  // A select can hold no offered value only by a value outside its options; jsdom then selects nothing and the
+  // v-model reads no value, which is what a stale or tampered form would send.
+  async function chooseNothing(form: VueWrapper): Promise<void> {
+    const select = byId(form, 'create-granularity')
+    ;(select.element as HTMLSelectElement).value = 'not-offered'
+    await select.trigger('change')
+  }
+
+  it('offers 1 Minute, 1 Hour and 1 Day in that order, 1 Day selected, as a required field labelled Bar Interval', () => {
+    stubWrites()
+    const form = mountCreate()
+    const select = byId(form, 'create-granularity')
+    expect(select.element.tagName).toBe('SELECT')
+    const options = select.findAll('option')
+    expect(options.map((o) => o.text())).toEqual(['1 Minute', '1 Hour', '1 Day'])
+    expect(options.map((o) => (o.element as HTMLOptionElement).selected)).toEqual([false, false, true])
+    const label = form.find('label[for="create-granularity"]')
+    expect(label.text()).toBe('Bar Interval *')
+    expect(label.find('.pn-required').classes()).toEqual(['pn-required'])
+    expect(select.attributes('aria-required')).toBe('true')
+    expect(select.attributes('aria-invalid')).toBeUndefined()
+  })
+
+  it('the hint is visible on open and linked to the field', () => {
+    stubWrites()
+    const form = mountCreate()
+    const hint = byId(form, 'create-granularity-hint')
+    expect(hint.exists()).toBe(true)
+    expect(hint.isVisible()).toBe(true)
+    expect(hint.text().replace(/\s+/g, ' ')).toBe(HINT)
+    expect(hint.attributes('id')).toBe('create-granularity-hint')
+    expect(byId(form, 'create-granularity').attributes('aria-describedby')).toBe('create-granularity-hint')
+  })
+
+  it('an untouched create sends granularity ONE_DAY', async () => {
+    api.getSourceSettingsVersions.mockResolvedValue(HELD_PAGE)
+    const { create: createPanel } = stubWrites({ kind: 'created', detail: detail() })
+    const form = mountCreate()
+    await ready(form)
+    await press(form)
+    expect(createPanel).toHaveBeenCalledTimes(1)
+    expect(createPanel.mock.calls[0]![0].granularity).toBe(Granularity.ONE_DAY)
+  })
+
+  it.each([
+    [0, Granularity.ONE_MINUTE],
+    [1, Granularity.ONE_HOUR],
+    [2, Granularity.ONE_DAY],
+  ])('the option at %i is sent as granularity %i', async (index, granularity) => {
+    api.getSourceSettingsVersions.mockResolvedValue(HELD_PAGE)
+    const { create: createPanel } = stubWrites({ kind: 'created', detail: detail() })
+    const form = mountCreate()
+    await ready(form)
+    await byId(form, 'create-granularity').findAll('option')[index]!.setValue()
+    await press(form)
+    expect(createPanel).toHaveBeenCalledTimes(1)
+    expect(createPanel.mock.calls[0]![0]).toMatchObject({ name: 'Large caps', source: DataSource.ALPACA_API, granularity })
+  })
+
+  it('no offered value: the press sends nothing, marks the field red with its words and focuses it; choosing one clears it and sends', async () => {
+    api.getSourceSettingsVersions.mockResolvedValue(HELD_PAGE)
+    const { create: createPanel } = stubWrites({ kind: 'created', detail: detail() })
+    const form = mountCreate()
+    await ready(form)
+    await chooseNothing(form)
+    expect(byId(form, 'create-granularity-error').exists()).toBe(false)
+    await press(form)
+    expect(createPanel).not.toHaveBeenCalled()
+    const select = byId(form, 'create-granularity')
+    expect(select.attributes('aria-invalid')).toBe('true')
+    expect(select.attributes('aria-describedby')).toBe('create-granularity-error create-granularity-hint')
+    expect(byId(form, 'create-granularity-error').text()).toBe('Choose a bar interval.')
+    expect(byId(form, 'create-granularity-error').classes()).toContain('pn-field-error')
+    expect(form.find('label[for="create-granularity"] .pn-required').classes()).toContain('pn-required--marked')
+    expect(form.findAll('[aria-invalid="true"]').map((el) => el.attributes('id'))).toEqual(['create-granularity'])
+    expect(byId(form, 'create-problem').text()).toBe('1 marked field needs a value before the panel can be created.')
+    focused(form, 'create-granularity')
+
+    await select.findAll('option')[1]!.setValue()
+    expect(byId(form, 'create-granularity-error').exists()).toBe(false)
+    expect(select.attributes('aria-invalid')).toBeUndefined()
+    expect(form.find('label[for="create-granularity"] .pn-required').classes()).not.toContain('pn-required--marked')
+    await press(form)
+    expect(createPanel).toHaveBeenCalledTimes(1)
+    expect(createPanel.mock.calls[0]![0].granularity).toBe(Granularity.ONE_HOUR)
+  })
+
+  it('the settings form offers no interval control', () => {
+    stubWrites()
+    const form = mount(PanelSettingsForm, { props: { detail: detail() } })
+    expect(form.find('[data-testid*="granularity"]').exists()).toBe(false)
+    expect(form.find('[id*="granularity"]').exists()).toBe(false)
+    expect(form.text()).not.toContain('Bar Interval')
+    expect(form.text()).not.toContain('Interval')
+    const offered = form.findAll('option').map((o) => o.text())
+    for (const label of ['1 Minute', '1 Hour', '1 Day']) expect(offered).not.toContain(label)
+  })
+})
+
 // tj-crl7pm, re-sequenced by tj-7zjov1.362.2 (owner ruling 2026-11-06: validate on click): every mandatory
 // field carries a required marker, neutral on open. Nothing is marked until Create Panel is pressed; a press
 // with gaps marks every empty or invalid field at once (aria-invalid, its own message linked by
@@ -974,7 +1094,9 @@ describe('PanelCreateForm: validated on click, every missing field marked at onc
   // tj-7zjov1.362.4, then ADR tj-2ayia2 D6 (owner ruling 2026-11-07): name and source are the only mandatory
   // fields in every source state. Ramp and cap show only while the source has no settings, optional (no
   // asterisk, no aria-required, empty never marked); a typed value out of range is marked like any other.
-  // Size is gone and the reason is optional, so neither is mandatory nor ever marked.
+  // Size is gone and the reason is optional, so neither is mandatory nor ever marked. The Bar Interval (ADR
+  // tj-rwoasb D3) also carries an asterisk but starts on 1 Day, so a press never finds it empty; its own mark is
+  // pinned in the Bar Interval block above.
   const MANDATORY = ['name', 'source'] as const
   const OPENED = {
     name: 'Give the panel a name.',
@@ -1072,7 +1194,8 @@ describe('PanelCreateForm: validated on click, every missing field marked at onc
     await byId(form, 'create-pre').setValue('x')
     for (const field of ['ramp', 'cap', 'pre']) expectUnmarked(form, field)
     expectSummary(form, 0)
-    expect(form.findAll('label .pn-required')).toHaveLength(2)
+    // Name, source and the Bar Interval (ADR tj-rwoasb D3: a required select that starts on 1 Day).
+    expect(form.findAll('label .pn-required')).toHaveLength(3)
     expect(createPanel).not.toHaveBeenCalled()
   })
 
@@ -1109,18 +1232,19 @@ describe('PanelCreateForm: validated on click, every missing field marked at onc
     focused(form, 'create-name')
   })
 
-  it('the asterisks and aria-required are exactly name and source, on a source with settings and on one without', async () => {
+  it('the asterisks and aria-required are exactly name, source and bar interval, on a source with settings and on one without', async () => {
+    const REQUIRED = ['create-name', 'create-source', 'create-granularity']
     const starred = (form: VueWrapper) =>
       form.findAll('label .pn-required').map((star) => star.element.closest('label')!.getAttribute('for'))
     const ariaRequired = (form: VueWrapper) => form.findAll('[aria-required="true"]').map((el) => el.attributes('id'))
     api.getSourceSettingsVersions.mockResolvedValue(HELD_PAGE)
     stubWrites()
     const held = mountCreate()
-    expect(starred(held)).toEqual(['create-name', 'create-source'])
-    expect(ariaRequired(held)).toEqual(['create-name', 'create-source'])
+    expect(starred(held)).toEqual(REQUIRED)
+    expect(ariaRequired(held)).toEqual(REQUIRED)
     await byId(held, 'create-source').findAll('option')[1]!.setValue()
     await flushPromises()
-    expect(starred(held)).toEqual(['create-name', 'create-source'])
+    expect(starred(held)).toEqual(REQUIRED)
     held.unmount()
 
     api.getSourceSettingsVersions.mockResolvedValue(EMPTY_PAGE)
@@ -1128,14 +1252,14 @@ describe('PanelCreateForm: validated on click, every missing field marked at onc
     await byId(empty, 'create-source').findAll('option')[1]!.setValue()
     await flushPromises()
     expect(byId(empty, 'create-ramp').exists()).toBe(true)
-    expect(starred(empty)).toEqual(['create-name', 'create-source'])
-    expect(ariaRequired(empty)).toEqual(['create-name', 'create-source'])
+    expect(starred(empty)).toEqual(REQUIRED)
+    expect(ariaRequired(empty)).toEqual(REQUIRED)
     // Pressed with every rate field empty or bad: the set does not grow.
     await press(empty)
-    expect(starred(empty)).toEqual(['create-name', 'create-source'])
+    expect(starred(empty)).toEqual(REQUIRED)
     await byId(empty, 'create-ramp').setValue('0')
-    expect(starred(empty)).toEqual(['create-name', 'create-source'])
-    expect(ariaRequired(empty)).toEqual(['create-name', 'create-source'])
+    expect(starred(empty)).toEqual(REQUIRED)
+    expect(ariaRequired(empty)).toEqual(REQUIRED)
   })
 
   it('a source without settings: a click with only a source chosen marks the name alone, focus on the name', async () => {

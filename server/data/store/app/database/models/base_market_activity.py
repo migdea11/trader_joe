@@ -1,6 +1,6 @@
 from abc import abstractmethod
 
-from sqlalchemy import UUID, Column, DateTime, Enum, ForeignKey, Integer, String, func
+from sqlalchemy import UUID, BigInteger, Column, DateTime, Enum, ForeignKey, Integer, String, func
 
 from common.database.sql_alchemy_table import AppBase
 from common.enums.data_select import AssetType
@@ -22,8 +22,10 @@ class BaseMarketActivity(AppBase.DATA_STORE_BASE):
     NATURAL_KEY = ('dataset_id', 'asset_symbol', 'source', 'feed', 'granularity', 'timestamp')
 
     # Surrogate key, kept deliberately: it is exposed as StockDataMarketActivity.id and is a
-    # cheaper join and delete target than the six-column natural key above.
-    id = Column(Integer, primary_key=True)
+    # cheaper join and delete target than the six-column natural key above. 64-bit: a 1 Minute panel
+    # passes 2^31 bars, which a 32-bit serial could not number. The SQLite variant is INTEGER because only an
+    # INTEGER PRIMARY KEY autoincrements there (the offline tests run on SQLite); Postgres gets BIGINT.
+    id = Column(BigInteger().with_variant(Integer, 'sqlite'), primary_key=True)
     # No index=True: dataset_id now LEADS the unique constraint over NATURAL_KEY, so a
     # dataset-scoped range read already gets a five-column equality prefix and an ordered
     # timestamp from that constraint. A standalone index here would be redundant (tj-vhboky.1).

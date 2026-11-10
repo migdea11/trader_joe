@@ -755,7 +755,9 @@ class World:
         self.written.source_versions.append(record.id)
         return record.id
 
-    async def panel(self, name: str, members: list[Asset], **filters: Any) -> PanelUnderTest:
+    async def panel(
+        self, name: str, members: list[Asset], granularity: Granularity = Granularity.ONE_DAY, **filters: Any
+    ) -> PanelUnderTest:
         settings = PanelSettings(
             enabled=True,
             cadence=PanelCadence.MONTHLY,
@@ -767,6 +769,7 @@ class World:
                 db,
                 name=f'system-test-{self.run_id}-pm-{name}-{uuid.uuid4().hex[:8]}',
                 source=SOURCE,
+                granularity=granularity,
                 settings=settings,
                 actor='operator',
                 reason='panel manager system test panel',
@@ -983,7 +986,7 @@ async def test_pm1_a_membership_pass_on_asyncpg_commits_entered_created_and_its_
     assert world.entries(a, b) == {}, 'the manager minted an entry; only the delivery intake may'
 
     async with AsyncSession(world.engine) as db:
-        assert {a.symbol, b.symbol} <= await symbols_with_open_requests(db, SOURCE, PANEL_OWNER)
+        assert {a.symbol, b.symbol} <= await symbols_with_open_requests(db, SOURCE, Granularity.ONE_DAY, PANEL_OWNER)
         assert await requests_in_window(db, SOURCE, PANEL_OWNER, min(q.created_at for q in queries.values())) == 4
         assert await created_in_window(db, SOURCE, min(row.recorded_at for row in created)) == 2
 
@@ -1008,7 +1011,7 @@ async def test_pm2_the_intake_mints_each_entry_and_the_next_pass_sees_them_as_ex
         (after,) = world.rows(sa.select(REQUESTS).where(REQUESTS.c.id == request.id))
         assert after.dataset_id == entries[symbol].id and not after.state.is_open, 'the intake did not set dataset_id'
     async with AsyncSession(world.engine) as db:
-        found = await panel_entries(db, SOURCE, PANEL_OWNER, {a.symbol, b.symbol})
+        found = await panel_entries(db, SOURCE, Granularity.ONE_DAY, PANEL_OWNER, {a.symbol, b.symbol})
     assert {symbol: entry.id for symbol, entry in found.items()} == {s: e.id for s, e in entries.items()}
 
     world.calls.clear()
@@ -1506,3 +1509,74 @@ async def test_pm10_include_otc_off_exits_and_stops_the_otc_member_and_on_restar
         DatasetChanged(ids[o.symbol], DatasetChange.RESUMED),
     ]
     assert len(world.requests(a, o, kind=IngestRequestKind.BARS)) == 2
+
+
+# --------------------------------------------------------------------------------------------- PM11
+
+
+def _entries_by_granularity(world: World, asset: Asset) -> dict[Granularity, sa.Row]:
+    rows = world.rows(sa.select(ENTRIES).where(ENTRIES.c.source == SOURCE, ENTRIES.c.asset_symbol == asset.symbol))
+    by_granularity = {row.granularity: row for row in rows}
+    assert len(by_granularity) == len(rows), f'two entries at one granularity: {rows}'
+    return by_granularity
+
+
+async def test_pm11_a_1min_and_a_1day_panel_on_one_symbol_each_mint_their_own_and_an_exit_stops_only_its_own(world):
+    """ADR tj-rwoasb D3/D4 on asyncpg (validator tj-7zjov1.365.10).
+
+    The panel's granularity is the dataset's: a 1 Minute and a 1 Day panel selecting the same symbol each create
+    their own bars request at their own granularity (the in-flight check and panel_entries key on it), the intake mints
+    one entry per granularity, and a filter exit of the 1 Minute panel stops only the 1min entry: the 1 Day panel
+    still selects the symbol but holds only a 1day entry, so it does not hold the 1min one.
+    """
+    a = world.asset('A')
+    await world.source_settings(ramp=10, cap=100)
+    minute = await world.panel('pm11-1min', [a], granularity=Granularity.ONE_MINUTE)
+    day = await world.panel('pm11-1day', [a], granularity=Granularity.ONE_DAY)
+    await world.snapshot([a])
+
+    await world.tick()
+
+    for panel in (minute, day):
+        assert _kinds(world.transitions(panel)) == [
+            (a.symbol, PanelTransition.ENTERED),
+            (a.symbol, PanelTransition.CREATED),
+        ]
+    bars = world.requests(a, kind=IngestRequestKind.BARS)
+    assert sorted(row.granularity for row in bars) == sorted([Granularity.ONE_MINUTE, Granularity.ONE_DAY]), bars
+    created = {
+        row.panel_id: row.request_id
+        for row in world.rows(
+            sa.select(TRANSITIONS).where(
+                TRANSITIONS.c.panel_id.in_([minute.id, day.id]), TRANSITIONS.c.transition == PanelTransition.CREATED
+            )
+        )
+    }
+    by_request = {row.id: row.granularity for row in bars}
+    assert (by_request[created[minute.id]], by_request[created[day.id]]) == (
+        Granularity.ONE_MINUTE,
+        Granularity.ONE_DAY,
+    )
+
+    await world.deliver_bars()
+
+    entries = _entries_by_granularity(world, a)
+    assert set(entries) == {Granularity.ONE_MINUTE, Granularity.ONE_DAY}
+    for entry in entries.values():
+        assert (entry.owner, entry.collect, entry.update_type) == (PANEL_OWNER, True, UpdateType.DAILY.value)
+    async with AsyncSession(world.engine) as db:
+        for granularity, entry in entries.items():
+            found = await panel_entries(db, SOURCE, granularity, PANEL_OWNER, {a.symbol})
+            assert {symbol: row.id for symbol, row in found.items()} == {a.symbol: entry.id}, granularity
+
+    # The 1 Minute panel denies the symbol; the 1 Day panel still selects it.
+    await world.new_version(minute, [a], deny_symbols=(a.symbol,))
+    await world.next_membership_pass([minute, day], [a])
+    await world.tick()
+
+    assert _kinds(world.transitions(minute))[-1] == (a.symbol, PanelTransition.EXITED)
+    after = _entries_by_granularity(world, a)
+    assert (after[Granularity.ONE_MINUTE].collect, after[Granularity.ONE_MINUTE].stopped_cause) == (False, LEFT)
+    assert (after[Granularity.ONE_DAY].collect, after[Granularity.ONE_DAY].stopped_cause) == (True, None)
+    assert world.published == [DatasetChanged(entries[Granularity.ONE_MINUTE].id, DatasetChange.RETIRED)]
+    assert len(world.requests(a, kind=IngestRequestKind.BARS)) == 2, 'the exit wrote a bars request'

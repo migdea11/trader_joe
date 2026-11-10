@@ -604,6 +604,7 @@ class PanelManager:
         held = {
             row.symbol
             for other in on_source
+            if other.panel.granularity == panel.granularity
             for row in select_members(rows, other.current.settings, newest.asset_type, AssetListStatus.ACTIVE)
         }
         states = await latest_state(db, panel.id)
@@ -626,7 +627,7 @@ class PanelManager:
 
         exiting = [s for s in states.values() if is_member_state(s) and s.vendor_asset_id not in selected_ids]
         symbols = {s.symbol for s in states.values()} | {row.symbol for row in selected}
-        entries = await panel_entries(db, source, PANEL_OWNER, symbols)
+        entries = await panel_entries(db, source, panel.granularity, PANEL_OWNER, symbols)
         evidence = await self._evidence(db, source, current.id, previous, newest, exiting, selected)
 
         def as_of_of(vendor_asset_id: str, selected_now: bool) -> datetime:
@@ -696,7 +697,7 @@ class PanelManager:
         request_rows = await requests_by_ids(
             db, [s.request_id for s in states.values() if s.transition is PanelTransition.CREATED and s.request_id]
         )
-        in_flight = await symbols_with_open_requests(db, source, PANEL_OWNER)
+        in_flight = await symbols_with_open_requests(db, source, panel.granularity, PANEL_OWNER)
         to_create: list[_Member] = []
         entered_only: list[NewTransition] = []
         resumed: list[uuid.UUID] = []
@@ -754,6 +755,7 @@ class PanelManager:
             await self._create(
                 run,
                 source,
+                panel.granularity,
                 newest,
                 source_settings,
                 member,
@@ -876,8 +878,8 @@ class PanelManager:
         snapshot = await snapshot_by_id(db, last.active_snapshot_id)
         if snapshot is None:
             return
-        entries = await panel_entries(db, source, PANEL_OWNER, {s.symbol for s in deferred})
-        in_flight = await symbols_with_open_requests(db, source, PANEL_OWNER)
+        entries = await panel_entries(db, source, panel.granularity, PANEL_OWNER, {s.symbol for s in deferred})
+        in_flight = await symbols_with_open_requests(db, source, panel.granularity, PANEL_OWNER)
         run = _PassRun(
             db,
             panel.id,
@@ -895,6 +897,7 @@ class PanelManager:
             await self._create(
                 run,
                 source,
+                panel.granularity,
                 snapshot,
                 source_settings,
                 _Member(state.vendor_asset_id, state.symbol, False, state),
@@ -925,6 +928,7 @@ class PanelManager:
         self,
         run: _PassRun,
         source: DataSource,
+        granularity: Granularity,
         snapshot: SnapshotRecord,
         source_settings: SourceSettingsRecord,
         member: _Member,
@@ -934,6 +938,8 @@ class PanelManager:
         entered_dates: Mapping[str, datetime] | None = None,
     ) -> None:
         """Create one member's dataset request, in the order of the creation ruling. See the module docstring.
+
+        The dataset is minted at the panel's own Bar Interval, granularity.
 
         as_of dates CREATED, DEFERRED and REFUSED (the pass's snapshot); entered_as_of dates ENTERED (evidence-backdated),
         and defaults to as_of. The dataset starts at the local date of the member's ENTERED as_of: the one this call
@@ -995,7 +1001,7 @@ class PanelManager:
             asset_type=snapshot.asset_type, data_type=DataType.MARKET_ACTIVITY, asset_symbol=member.symbol
         )
         declared_start = panel_dataset_start(source, entered_when)
-        body = self._body(source, declared_start)
+        body = self._body(source, granularity, declared_start)
         # (4) the clamp, on its OWN session, never P.
         try:
             async with own_session() as clamp_db:
@@ -1019,7 +1025,7 @@ class PanelManager:
             )
             return
         start = clamp.clamped_start if clamp is not None else declared_start
-        clamped = self._body(source, start)
+        clamped = self._body(source, granularity, start)
         # (5) own overlap on P with the clamped start (not _check_overlap: it commits P).
         key = OverlapKey(
             owner=PANEL_OWNER,
@@ -1027,7 +1033,7 @@ class PanelManager:
             asset_symbol=path.asset_symbol,
             data_type=path.data_type,
             source=source,
-            granularity=Granularity.ONE_DAY,
+            granularity=granularity,
             expiry_type=ExpiryType.ROLLING,
             update_type=UpdateType.DAILY,
             start=start,
@@ -1083,11 +1089,11 @@ class PanelManager:
             log.info(f'Panel creation request {record.id} not accepted yet: {type(error).__name__} {error.reason}')
 
     @staticmethod
-    def _body(source: DataSource, start: datetime) -> StoreAssetDatasetBody:
+    def _body(source: DataSource, granularity: Granularity, start: datetime) -> StoreAssetDatasetBody:
         return StoreAssetDatasetBody(
             owner=PANEL_OWNER,
             source=source,
-            granularity=Granularity.ONE_DAY,
+            granularity=granularity,
             start=start,
             end=None,
             expiry=None,

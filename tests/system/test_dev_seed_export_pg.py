@@ -223,7 +223,14 @@ def _seed_ledger(
         actor='operator',
         reason=f'dev seed export system test {run_id}',
     )
-    panel = _insert(conn, written, PANELS, name=f'system-test-{run_id}-dev-seed', source=PANEL_SOURCE)
+    panel = _insert(
+        conn,
+        written,
+        PANELS,
+        name=f'system-test-{run_id}-dev-seed',
+        source=PANEL_SOURCE,
+        granularity=Granularity.ONE_DAY,
+    )
     settings = _insert(
         conn,
         written,

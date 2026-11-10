@@ -70,7 +70,7 @@ from alembic.script import ScriptDirectory
 
 import data.store.app as store_app
 from common.enums.data_select import AssetType
-from common.enums.data_stock import DataSource
+from common.enums.data_stock import DataSource, Granularity
 from data.store.app.database.models.asset_list import (
     AssetListEvent,
     AssetListEventKind,
@@ -479,7 +479,12 @@ def _seed(db: ScratchDb, entry_values: Callable[..., dict[str, Any]], bar_values
                 reason='dev seed reset system test',
             ),
         )
-        panel = keep(PANELS, _insert(conn, PANELS, name=f'system-test-{run_id}-dsreset', source=PANEL_SOURCE))
+        panel = keep(
+            PANELS,
+            _insert(
+                conn, PANELS, name=f'system-test-{run_id}-dsreset', source=PANEL_SOURCE, granularity=Granularity.ONE_DAY
+            ),
+        )
         settings = keep(
             SETTINGS,
             _insert(

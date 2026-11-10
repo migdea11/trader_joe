@@ -53,7 +53,7 @@ import sqlalchemy as sa
 from sqlalchemy.engine import Engine
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 
-from common.enums.data_stock import DataSource
+from common.enums.data_stock import DataSource, Granularity
 from data.store.app.database.crud import panel_ledger
 from data.store.app.database.crud.panel_ledger import (
     COUNT_KEYS,
@@ -151,6 +151,7 @@ async def panel(pg_async_engine: AsyncEngine, written: Written, run_identity):
             db,
             name=f'system-test-{run_identity.run_id}-ledger-{uuid.uuid4().hex[:8]}',
             source=SOURCE,
+            granularity=Granularity.ONE_DAY,
             settings=PanelSettings(enabled=True, cadence=PanelCadence.DAILY),
             actor='operator',
             reason='ledger system test panel',
@@ -459,6 +460,7 @@ async def _other_panel(engine: AsyncEngine, panel, written: Written, run_id: str
             db,
             name=f'system-test-{run_id}-ledger-other-{uuid.uuid4().hex[:8]}',
             source=SOURCE,
+            granularity=Granularity.ONE_DAY,
             settings=PanelSettings(enabled=True, cadence=PanelCadence.DAILY),
             actor='operator',
             reason='ledger system test other panel',

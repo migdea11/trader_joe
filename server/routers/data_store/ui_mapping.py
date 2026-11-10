@@ -51,7 +51,7 @@ from data.store.app.database.crud.panel_settings import (
 from data.store.app.database.crud.stock.dataset_catalog import BarExtent
 from data.store.app.database.models.dataset_read import ReadClientKind
 from data.store.app.database.models.ingest_run import IngestRunState
-from data.store.app.database.models.panel import PanelCadence, PanelPassKind, PanelTransition
+from data.store.app.database.models.panel import PANEL_GRANULARITIES, PanelCadence, PanelPassKind, PanelTransition
 from data.store.app.dataset_catalog import (
     BarPageIndexResult,
     BarPageResult,
@@ -767,6 +767,7 @@ def panel_list_message(rows: list[PanelListRow]) -> panels_pb2.PanelList:
             name=row.panel.name,
             source=DATA_SOURCE.to_proto(row.panel.source),
             enabled=row.enabled,
+            granularity=GRANULARITY.to_proto(row.panel.granularity),
         )
         for row in rows
     )
@@ -782,7 +783,10 @@ def _counts_message(counts: MemberCounts) -> panels_pb2.PanelMembershipCounts:
 def panel_detail_message(view: PanelDetailView) -> panels_pb2.PanelDetail:
     """A panel as a PanelDetail: current versions with their effective passes, and the counts."""
     message = panels_pb2.PanelDetail(
-        id=str(view.panel.id), name=view.panel.name, source=DATA_SOURCE.to_proto(view.panel.source)
+        id=str(view.panel.id),
+        name=view.panel.name,
+        source=DATA_SOURCE.to_proto(view.panel.source),
+        granularity=GRANULARITY.to_proto(view.panel.granularity),
     )
     message.created_at.CopyFrom(to_timestamp(view.panel.created_at))
     message.current_version.CopyFrom(panel_settings_version_message(view.current_version))
@@ -983,6 +987,7 @@ class CreatePanelValues:
 
     name: str
     source: DataSource
+    granularity: Granularity
     settings: PanelSettings
     source_settings: SourceSettings | None
     reason: str
@@ -991,7 +996,8 @@ class CreatePanelValues:
 def create_panel_values(request: panels_pb2.CreatePanelRequest) -> CreatePanelValues:
     """A CreatePanelRequest as plain values.
 
-    The cadence UNSPECIFIED is None, so the store applies its default. The source settings are GIVEN when any of fields
+    The granularity is required and fixed for the panel's life: UNSPECIFIED, or any value outside PANEL_GRANULARITIES
+    (1 Minute, 1 Hour, 1 Day), is refused. The cadence UNSPECIFIED is None, so the store applies its default. The source settings are GIVEN when any of fields
     13 to 16 is present; an absent rate is None (no limit) and an absent window day count takes the store's 90. None
     given is None, and the store then writes the source's first version (no limits, 90 days) when the source has none.
 
@@ -999,17 +1005,23 @@ def create_panel_values(request: panels_pb2.CreatePanelRequest) -> CreatePanelVa
         request: The parsed body.
 
     Returns:
-        CreatePanelValues: The name, source, settings, optional source settings and reason.
+        CreatePanelValues: The name, source, granularity, settings, optional source settings and reason.
 
     Raises:
-        InvalidRequestError: INVALID_REQUEST (422) for an absent enabled, an UNSPECIFIED or unknown source, or a
-            value this release does not know.
+        InvalidRequestError: INVALID_REQUEST (422) for an absent enabled, an UNSPECIFIED or unknown source, an
+            UNSPECIFIED granularity or one outside PANEL_GRANULARITIES, or a value this release does not know.
     """
     settings = _panel_settings_of(request)
     try:
         source = DATA_SOURCE.to_domain(request.source)
     except ProtoMappingError:
         raise _refuse('source is required and must name a source this release knows.') from None
+    try:
+        granularity = GRANULARITY.to_domain(request.granularity)
+    except ProtoMappingError:
+        raise _refuse('granularity is required and must be one of 1 Minute, 1 Hour or 1 Day.') from None
+    if granularity not in PANEL_GRANULARITIES:
+        raise _refuse('granularity is required and must be one of 1 Minute, 1 Hour or 1 Day.')
     given = any(
         request.HasField(name)
         for name in (
@@ -1022,6 +1034,7 @@ def create_panel_values(request: panels_pb2.CreatePanelRequest) -> CreatePanelVa
     return CreatePanelValues(
         name=request.name,
         source=source,
+        granularity=granularity,
         settings=settings,
         source_settings=_source_numbers(request, window_default=True) if given else None,
         reason=request.reason,

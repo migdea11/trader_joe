@@ -6,7 +6,7 @@ import { create, fromJson, toJson } from '@bufbuild/protobuf'
 import { timestampFromMs } from '@bufbuild/protobuf/wkt'
 import { describe, expect, it } from 'vitest'
 
-import { AssetType, DataSource } from '@generated/trader_joe/proto/market/v1/enums_pb'
+import { AssetType, DataSource, Granularity } from '@generated/trader_joe/proto/market/v1/enums_pb'
 import { DatasetHealthStatus } from '@generated/trader_joe/proto/ui/v1/data_pb'
 import {
   AssetListDayState,
@@ -29,6 +29,8 @@ import { HEALTH_BADGES } from '@/theme/semantics'
 import {
   CADENCE_CHOICES,
   DEFAULT_CADENCE_LABEL,
+  DEFAULT_PANEL_INTERVAL,
+  PANEL_INTERVALS,
   cadenceLabel,
   dayStateLabel,
   createFieldErrors,
@@ -44,6 +46,7 @@ import {
   memberHealthBadge,
   MIN_RAMP_PER_HOUR,
   MIN_REQUEST_CAP_PER_HOUR,
+  panelIntervalLabel,
   panelWriteNotice,
   parseCount,
   parseSymbols,
@@ -101,6 +104,31 @@ describe('the label helpers', () => {
     [PanelMarkerKind.UNSPECIFIED, 'Marker'],
   ])('marker kind %i reads %s', (kind, label) => {
     expect(markerLabel(kind)).toBe(label)
+  })
+
+  // ADR tj-rwoasb D3: the Bar Intervals offered are exactly 1 Minute, 1 Hour and 1 Day, in that order, mapped to
+  // the market.v1 Granularity members; the form starts on 1 Day, a form default and not a schema default.
+  it('the bar intervals: exactly 1 Minute, 1 Hour, 1 Day mapped to ONE_MINUTE, ONE_HOUR, ONE_DAY; the default is 1 Day', () => {
+    expect(PANEL_INTERVALS.map((i) => [i.value, i.label])).toEqual([
+      [Granularity.ONE_MINUTE, '1 Minute'],
+      [Granularity.ONE_HOUR, '1 Hour'],
+      [Granularity.ONE_DAY, '1 Day'],
+    ])
+    expect(DEFAULT_PANEL_INTERVAL).toBe(Granularity.ONE_DAY)
+  })
+
+  it.each([
+    [Granularity.ONE_MINUTE, '1 Minute'],
+    [Granularity.ONE_HOUR, '1 Hour'],
+    [Granularity.ONE_DAY, '1 Day'],
+    [Granularity.UNSPECIFIED, 'Unknown'],
+    [Granularity.FIVE_MINUTES, 'Unknown'],
+    [Granularity.THIRTY_MINUTES, 'Unknown'],
+    [Granularity.ONE_WEEK, 'Unknown'],
+    [Granularity.ONE_MONTH, 'Unknown'],
+    [99 as Granularity, 'Unknown'],
+  ])('bar interval %i reads %s', (granularity, label) => {
+    expect(panelIntervalLabel(granularity)).toBe(label)
   })
 
   it('effectivePassText names the pass kind and, when known, its start', () => {
@@ -394,6 +422,7 @@ describe('createFieldErrors: every empty or invalid create field at once', () =>
   const RAMP = 'Give a whole number, 1 to 2147483647, or leave it empty for no limit.'
   const CAP = 'Give a whole number, 2 to 2147483647, or leave it empty for no limit.'
   const READY: CreateInput = {
+    granularity: Granularity.ONE_DAY,
     name: 'Large caps',
     nameTaken: false,
     source: DataSource.ALPACA_API,
@@ -414,7 +443,8 @@ describe('createFieldErrors: every empty or invalid create field at once', () =>
   // tj-7zjov1.362.4 (ADR tj-46jkey sections 1 and 2), then ADR tj-2ayia2 D6 (owner ruling 2026-11-07): the
   // required create fields are name and source only, in every source state. Ramp and cap show only while the
   // source has no settings and are optional there (empty is no limit); a typed value out of range is marked.
-  // Size is gone; reason is optional and is no input to the rules at all.
+  // Size is gone; reason is optional and is no input to the rules at all. The Bar Interval (ADR tj-rwoasb D3) is
+  // required too, but the form starts on 1 Day, so it is never what an opened or blank form is missing.
   it('the form as opened: name and source only, in that order, with their words', () => {
     const opened: CreateInput = {
       ...READY,
@@ -441,11 +471,12 @@ describe('createFieldErrors: every empty or invalid create field at once', () =>
     expect(createFieldErrors({ ...NEEDS, ramp: '', cap: '', pre: '', post: '' })).toEqual({})
   })
 
-  it('every field at once on a source with no settings: all six, in form order, each with its words', () => {
+  it('every field at once on a source with no settings: all seven, in form order, each with its words', () => {
     const all: CreateInput = {
       ...NEEDS,
       name: ' ',
       sourceProblem: true,
+      granularity: Granularity.UNSPECIFIED,
       ramp: '0',
       cap: '1',
       pre: 'x',
@@ -454,11 +485,31 @@ describe('createFieldErrors: every empty or invalid create field at once', () =>
     expect(Object.entries(createFieldErrors(all))).toEqual([
       ['name', 'Give the panel a name.'],
       ['source', 'The source settings could not be read. Choose the source again.'],
+      ['granularity', 'Choose a bar interval.'],
       ['ramp', RAMP],
       ['cap', CAP],
       ['pre', COUNT],
       ['post', COUNT],
     ])
+  })
+
+  // ADR tj-rwoasb D3: the Bar Interval is refused unless it is one of the offered values; the store refuses the
+  // rest of the proto enum with a 422, so the form never lets one through.
+  it('the bar interval: each offered value is valid', () => {
+    for (const { value } of PANEL_INTERVALS) expect(createFieldErrors({ ...READY, granularity: value })).toEqual({})
+  })
+
+  it.each([
+    ['UNSPECIFIED', Granularity.UNSPECIFIED],
+    ['FIVE_MINUTES', Granularity.FIVE_MINUTES],
+    ['THIRTY_MINUTES', Granularity.THIRTY_MINUTES],
+    ['ONE_WEEK', Granularity.ONE_WEEK],
+    ['ONE_MONTH', Granularity.ONE_MONTH],
+    ['an unknown wire value', 99 as Granularity],
+    ['no value at all', undefined as unknown as Granularity],
+  ])('the bar interval: %s is marked on the granularity field alone', (_name, granularity) => {
+    expect(createFieldErrors({ ...READY, granularity })).toStrictEqual({ granularity: 'Choose a bar interval.' })
+    expect(createFieldErrors({ ...NEEDS, granularity })).toStrictEqual({ granularity: 'Choose a bar interval.' })
   })
 
   it.each(['', '   '])('a blank name (%j) is asked for, taken or not', (name) => {

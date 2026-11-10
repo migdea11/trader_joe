@@ -125,6 +125,7 @@ def test_the_running_panel_loop_writes_one_finished_membership_pass_for_a_new_en
     body = {
         'name': f'system-test-{run_identity.run_id}-loop-smoke',
         'source': SOURCE,
+        'granularity': 'GRANULARITY_ONE_DAY',
         'enabled': True,
         # A symbol of this run: no asset list holds it, so the pass selects nothing.
         'allowSymbols': [own_symbol],

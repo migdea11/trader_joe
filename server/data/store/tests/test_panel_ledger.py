@@ -53,7 +53,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, create_async_engin
 from sqlalchemy.pool import StaticPool
 from sqlalchemy.sql import Insert, Select, Update
 
-from common.enums.data_stock import DataSource
+from common.enums.data_stock import DataSource, Granularity
 from data.store.app.database.crud import panel_ledger
 from data.store.app.database.crud.panel_ledger import (
     COUNT_KEYS,
@@ -219,8 +219,11 @@ class World:
         return (await self.put(REQUESTS.insert().values(**values).returning(REQUESTS.c.id))).scalar_one()
 
     async def panel(self, source: DataSource = SOURCE, name: str | None = None) -> Seeded:
+        # panel.granularity is NOT NULL with no schema default (ADR tj-rwoasb D2): a row written behind the crud states it.
         result = await self.put(
-            PANELS.insert().values(name=name or f'panel-{uuid.uuid4().hex[:8]}', source=source).returning(PANELS.c.id)
+            PANELS.insert()
+            .values(name=name or f'panel-{uuid.uuid4().hex[:8]}', source=source, granularity=Granularity.ONE_DAY)
+            .returning(PANELS.c.id)
         )
         panel_id = result.scalar_one()
         settings_id = await self.settings_version(panel_id)

@@ -327,7 +327,9 @@ async def post_panel(
 ) -> ProtoJSONResponse:
     """W1. Create a panel: its version 1 and, when given, its source's first settings, in one transaction.
 
-    Does not start a pass; the detail has effective_pass unset and zero counts. The reason is optional.
+    Does not start a pass; the detail has effective_pass unset and zero counts. The reason is optional. The granularity
+    is required and fixed for the panel's life: UNSPECIFIED or any value outside PANEL_GRANULARITIES (1 Minute, 1 Hour,
+    1 Day) is a 422 and nothing is written.
 
     Args:
         db: The request's session.
@@ -339,7 +341,7 @@ async def post_panel(
 
     Raises:
         InvalidRequestError: INVALID_REQUEST (422) for a bad body or any store refusal (a blank name, a name
-            already used, a negative number, a source with no settings and none given, settings given for a source that
+            already used, a negative number, a missing or unsupported granularity, a source with no settings and none given, settings given for a source that
             has some). Nothing is written.
     """
     values = create_panel_values(body)
@@ -347,6 +349,7 @@ async def post_panel(
         db,
         name=values.name,
         source=values.source,
+        granularity=values.granularity,
         settings=values.settings,
         actor=OPERATOR_PRINCIPAL,
         reason=values.reason,

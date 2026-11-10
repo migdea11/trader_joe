@@ -757,3 +757,25 @@ def test_the_panel_block_has_no_subquery_inside_an_update():
     assert len(updates) == 15
     for statement in updates:
         assert '(SELECT' not in statement, statement[:80]
+
+
+def test_the_panel_granularity_round_trips_through_the_normalisation_and_the_rendered_line():
+    """ADR tj-rwoasb D2 (bead tj-7zjov1.365.3 (d)): the panel row's granularity is copied whole and never rewritten.
+
+    The temp copy and the reinsert are SELECT *, no UPDATE of the panel block names the column, and the line the dump
+    renders from the model's columns carries it. The Postgres run of the same text is the stack's (bead .10).
+    """
+    assert 'granularity' in Panel.__table__.c
+    (copy,) = [
+        s for s in _statements() if s.endswith('CREATE TEMP TABLE seed_panel ON COMMIT DROP AS SELECT * FROM panel')
+    ]
+    assert copy
+    assert _statement('INSERT INTO panel SELECT') == 'INSERT INTO panel SELECT * FROM seed_panel ORDER BY id'
+    assert not [s for s in _statements() if s.startswith('UPDATE seed_panel ') and 'granularity' in s]
+    columns = [column.name for column in Panel.__table__.columns]
+    row = {'id': 'p1', 'name': 'seed', 'source': 'ALPACA_API', 'created_at': 't0', 'granularity': 'ONE_MINUTE'}
+    line = render_line(render_table_sql(PANEL_TABLE, columns), PANEL_TABLE, row)
+    assert line == (
+        'INSERT INTO public.panel (created_at, granularity, id, name, source) '
+        "VALUES ('t0', 'ONE_MINUTE', 'p1', 'seed', 'ALPACA_API');"
+    )

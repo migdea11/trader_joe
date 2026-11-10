@@ -15,6 +15,7 @@ import { Plus, RefreshCw } from '@lucide/vue'
 
 import { int64ToNumber } from '@/api'
 import { sourceLabel } from '@/catalog/labels'
+import { panelIntervalLabel } from '@/components/panels/panelModel'
 import PanelCreateForm from '@/components/panels/PanelCreateForm.vue'
 import PanelHistoryStrip from '@/components/panels/PanelHistoryStrip.vue'
 import PanelMemberList from '@/components/panels/PanelMemberList.vue'
@@ -122,7 +123,7 @@ onBeforeUnmount(() => {
             :key="item.id"
             :value="item.id"
           >
-            {{ item.name }} · {{ sourceLabel(item.source) }}{{ item.enabled ? '' : ' (disabled)' }}
+            {{ item.name }} · {{ sourceLabel(item.source) }} · {{ panelIntervalLabel(item.granularity) }}{{ item.enabled ? '' : ' (disabled)' }}
           </option>
         </select>
       </div>
@@ -191,6 +192,10 @@ onBeforeUnmount(() => {
       <h2 class="panels__name">
         {{ detail.name }}
         <span class="panels__source">{{ sourceLabel(detail.source) }}</span>
+        <span
+          class="panels__source"
+          data-testid="panel-interval"
+        >{{ titleCase('Bar Interval') }}: {{ panelIntervalLabel(detail.granularity) }}</span>
       </h2>
 
       <p

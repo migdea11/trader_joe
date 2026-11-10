@@ -31,7 +31,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy.schema import CreateColumn, CreateIndex, CreateTable
 
 from common.database.sql_alchemy_sensitive_string import SensitiveString
-from common.enums.data_stock import DataSource, ExpiryType, UpdateType
+from common.enums.data_stock import DataSource, ExpiryType, Granularity, UpdateType
 from common.tests.roots import SERVER_ROOT
 from data.store.app.database.crud import asset_list as asset_list_crud
 from data.store.app.database.crud import corporate_action as corporate_action_crud
@@ -51,6 +51,7 @@ from data.store.app.database.models.ingest_instance import IngestInstance
 from data.store.app.database.models.ingest_request import IngestRequest
 from data.store.app.database.models.ingest_run import IngestRun, IngestRunTrigger
 from data.store.app.database.models.panel import (
+    PANEL_GRANULARITIES,
     Panel,
     PanelMemberTransition,
     PanelPass,
@@ -767,7 +768,8 @@ PANEL_TABLES = {model.TABLE_NAME: model.__table__ for model in PANEL_MODELS}
 
 # The columns per table as addendum 20 and the rate design name them, WITHOUT size (ADR tj-46jkey: a panel has none).
 PANEL_DESIGN_COLUMNS = {
-    'panel': {'id', 'name', 'source', 'created_at'},
+    # granularity: ADR tj-rwoasb D1/D2, the panel's Bar Interval, fixed at creation like source, NOT NULL, no default.
+    'panel': {'id', 'name', 'source', 'created_at', 'granularity'},
     'panel_settings_version': {
         'id', 'panel_id', 'version_no', 'enabled', 'cadence', 'allow_symbols', 'deny_symbols',
         'asset_class', 'exchange', 'active', 'tradable', 'saved_at', 'actor', 'reason',
@@ -798,6 +800,8 @@ PANEL_DESIGN_NULLABLE = {
 }
 # NO POLICY DEFAULT (owner ruling 2026-10-27): none of these may carry a default of any kind.
 PANEL_POLICY_COLUMNS = {
+    # granularity: ADR tj-rwoasb D2, no server default (tj-26jt9w addendum 20); the create form's 1 Day is a form default.
+    'panel': {'granularity'},
     # include_otc: ADR tj-ed4t8m D1, the default (off) is applied by the crud where a row is created, never the schema.
     'panel_settings_version': {'enabled', 'cadence', 'include_otc'},
     'panel_source_settings_version': {
@@ -886,6 +890,48 @@ def test_include_otc_is_the_last_settings_column_a_not_null_boolean_with_no_defa
     assert column.server_default is None and column.default is None
     checks = [c for c in table.constraints if isinstance(c, sa.CheckConstraint)]
     assert not any('include_otc' in str(c.sqltext) for c in checks), [str(c.sqltext) for c in checks]
+
+
+def test_panel_granularity_is_the_last_panel_column_the_native_granularity_enum_not_null_with_no_default():
+    """ADR tj-rwoasb D1/D2: panel.granularity is declared LAST and reuses the shared native type 'granularity'.
+
+    No new enum; NOT NULL with no default of any kind, so a panel row must state its Bar Interval.
+    """
+    table = PANEL_TABLES['panel']
+    column = table.c.granularity
+    assert list(table.c.keys())[-1] == 'granularity', list(table.c.keys())
+    assert isinstance(column.type, sa.Enum) and column.type.enum_class is Granularity, column.type
+    assert column.type.name == StoreDatasetEntry.__table__.c.granularity.type.name == 'granularity', column.type.name
+    assert not column.nullable
+    assert column.server_default is None and column.default is None
+
+
+def test_the_allowed_panel_granularities_are_one_minute_one_hour_and_one_day_only():
+    """ADR tj-rwoasb D3: ONE constant names the allowed set; every other Granularity member is outside it."""
+    assert PANEL_GRANULARITIES == (Granularity.ONE_MINUTE, Granularity.ONE_HOUR, Granularity.ONE_DAY)
+    assert set(Granularity) - set(PANEL_GRANULARITIES) == {
+        Granularity.FIVE_MINUTES,
+        Granularity.THIRTY_MINUTES,
+        Granularity.ONE_WEEK,
+        Granularity.ONE_MONTH,
+    }
+
+
+def test_the_bar_id_is_bigint_on_postgres_and_an_autoincrementing_integer_on_sqlite():
+    """ADR tj-rwoasb D4: stock_market_activity.id is 64-bit.
+
+    The model declares BigInteger with an INTEGER variant on SQLite only (where only an INTEGER PRIMARY KEY autoincrements), so the Postgres DDL is BIGINT and the offline DDL
+    INTEGER. The live Postgres column and its sequence are proven in the Postgres window (bead .10).
+    """
+    from sqlalchemy.dialects import sqlite
+
+    column = StockMarketActivity.__table__.c.id
+    assert column.primary_key
+    assert column.type.compile(dialect=postgresql.dialect()) == 'BIGINT'
+    assert column.type.compile(dialect=sqlite.dialect()) == 'INTEGER'
+    pg_ddl = str(CreateTable(StockMarketActivity.__table__).compile(dialect=postgresql.dialect()))
+    assert re.search(r'\bid BIGSERIAL NOT NULL', pg_ddl) or re.search(r'\bid BIGINT\b', pg_ddl), pg_ddl
+    assert not re.search(r'\bid (SERIAL|INTEGER)\b', pg_ddl), pg_ddl
 
 
 @pytest.mark.parametrize('table_name', list(PANEL_DESIGN_COLUMNS))

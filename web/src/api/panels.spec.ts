@@ -7,7 +7,7 @@
 // stubbed per test.
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
-import { DataSource, DataSourceSchema } from '@generated/trader_joe/proto/market/v1/enums_pb'
+import { DataSource, DataSourceSchema, Granularity } from '@generated/trader_joe/proto/market/v1/enums_pb'
 import { AssetType } from '@generated/trader_joe/proto/market/v1/enums_pb'
 import { PanelCadence, PanelPassKind } from '@generated/trader_joe/proto/ui/v1/panels_pb'
 
@@ -273,6 +273,29 @@ describe('the three writes: POST on their ruled path with a canonical JSON body'
       corporateActionWindowPostDays: undefined,
     })
     expect(sentBody()).toEqual({ name: 'n', source: 'DATA_SOURCE_ALPACA_API', reason: 'r', corporateActionWindowPreDays: 0 })
+  })
+
+  // ADR tj-rwoasb D3: the Bar Interval is sent as the market.v1 Granularity enum NAME, and read back the same way
+  // on the detail and the list item.
+  it.each([
+    [Granularity.ONE_MINUTE, 'GRANULARITY_ONE_MINUTE'],
+    [Granularity.ONE_HOUR, 'GRANULARITY_ONE_HOUR'],
+    [Granularity.ONE_DAY, 'GRANULARITY_ONE_DAY'],
+  ])('W1 createPanel: granularity %i is sent as %s', async (granularity, wire) => {
+    fetchMock.mockResolvedValue(jsonResponse(DETAIL_JSON, 201))
+    await createPanel({ name: 'n', source: DataSource.ALPACA_API, granularity, reason: 'r' })
+    expect(sentBody()).toEqual({ name: 'n', source: 'DATA_SOURCE_ALPACA_API', granularity: wire, reason: 'r' })
+  })
+
+  it('R1 and R2 decode the granularity name on the list item and the detail, a member the form does not offer included', async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse({ ...DETAIL_JSON, granularity: 'GRANULARITY_ONE_HOUR' }))
+    expect((await getPanel(PANEL_ID)).granularity).toBe(Granularity.ONE_HOUR)
+    fetchMock.mockResolvedValueOnce(
+      jsonResponse({ items: [{ id: PANEL_ID, name: 'n', source: 'DATA_SOURCE_ALPACA_API', granularity: 'GRANULARITY_ONE_MINUTE' }] }),
+    )
+    expect((await listPanels()).items[0]!.granularity).toBe(Granularity.ONE_MINUTE)
+    fetchMock.mockResolvedValueOnce(jsonResponse({ ...DETAIL_JSON, granularity: 'GRANULARITY_ONE_WEEK' }))
+    expect((await getPanel(PANEL_ID)).granularity).toBe(Granularity.ONE_WEEK)
   })
 
   it('W1 the int32 maximum is sent as a JSON number', async () => {

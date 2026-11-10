@@ -196,9 +196,15 @@ class World:
         *,
         panel_id: uuid.UUID | None = None,
         new_source_version: bool = True,
+        granularity: Granularity = Granularity.ONE_DAY,
         **settings: Any,
     ) -> Seeded:
-        values: dict[str, Any] = {'name': name or f'panel-{uuid.uuid4().hex[:8]}', 'source': source}
+        # panel.granularity is NOT NULL with no schema default (ADR tj-rwoasb D2): a row written behind the crud states it.
+        values: dict[str, Any] = {
+            'name': name or f'panel-{uuid.uuid4().hex[:8]}',
+            'source': source,
+            'granularity': granularity,
+        }
         if panel_id is not None:
             values['id'] = panel_id
         result = await self.put(PANELS.insert().values(**values).returning(PANELS.c.id))

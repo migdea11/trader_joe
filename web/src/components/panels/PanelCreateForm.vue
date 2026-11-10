@@ -6,7 +6,7 @@
 // limit and an empty window is the store's default; an empty field is left out of the request. The write does not run the first pass: the page shows the new panel as first
 // pass pending and re-reads it. Panels are UI-only; nothing here is a client or SDK surface.
 import { computed, nextTick, ref, watch } from 'vue'
-import { DataSource } from '@generated/trader_joe/proto/market/v1/enums_pb'
+import { DataSource, Granularity } from '@generated/trader_joe/proto/market/v1/enums_pb'
 
 import { getSourceSettingsVersions } from '@/api'
 import { sourceLabel } from '@/catalog/labels'
@@ -14,7 +14,15 @@ import { usePanelsStore } from '@/stores/panels'
 import { titleCase } from '@/theme/copy'
 
 import PanelFilterFields from './PanelFilterFields.vue'
-import { createFieldErrors, draftToSettingsInit, emptyDraft, panelWriteNotice, parseCount } from './panelModel'
+import {
+  DEFAULT_PANEL_INTERVAL,
+  PANEL_INTERVALS,
+  createFieldErrors,
+  draftToSettingsInit,
+  emptyDraft,
+  panelWriteNotice,
+  parseCount,
+} from './panelModel'
 import type { PanelWriteNotice } from './panelModel'
 
 const emit = defineEmits<{
@@ -28,6 +36,7 @@ const SOURCES = [DataSource.ALPACA_API, DataSource.IB_API, DataSource.MANUAL_ENT
 
 const name = ref('')
 const source = ref<DataSource>(DataSource.UNSPECIFIED)
+const granularity = ref<Granularity>(DEFAULT_PANEL_INTERVAL)
 const draft = ref(emptyDraft())
 const reason = ref('')
 const ramp = ref('')
@@ -68,6 +77,7 @@ const errors = computed(() =>
     name: name.value,
     nameTaken: nameTaken.value,
     source: source.value,
+    granularity: granularity.value,
     sourceProblem: sourceProblem.value,
     sourceNeedsSettings: sourceNeedsSettings.value,
     ramp: ramp.value,
@@ -114,6 +124,7 @@ async function submit(): Promise<void> {
     ...sourceSettings,
     name: name.value.trim(),
     source: source.value,
+    granularity: granularity.value,
     reason: reason.value.trim(),
   })
   notice.value = panelWriteNotice(outcome, 'create')
@@ -213,6 +224,50 @@ async function submit(): Promise<void> {
             data-testid="create-source-error"
           >
             {{ shown.source }}
+          </p>
+        </div>
+        <div class="pn-field">
+          <label
+            class="pn-label"
+            for="create-granularity"
+          >{{ titleCase('Bar Interval') }}<span
+            class="pn-required"
+            :class="{ 'pn-required--marked': shown.granularity }"
+            aria-hidden="true"
+          > *</span></label>
+          <select
+            id="create-granularity"
+            v-model="granularity"
+            class="pn-input"
+            aria-required="true"
+            :aria-invalid="shown.granularity ? 'true' : undefined"
+            :aria-describedby="shown.granularity ? 'create-granularity-error create-granularity-hint' : 'create-granularity-hint'"
+            :disabled="busy"
+            data-testid="create-granularity"
+          >
+            <option
+              v-for="choice in PANEL_INTERVALS"
+              :key="choice.value"
+              :value="choice.value"
+            >
+              {{ choice.label }}
+            </option>
+          </select>
+          <p
+            v-if="shown.granularity"
+            id="create-granularity-error"
+            class="pn-field-error"
+            data-testid="create-granularity-error"
+          >
+            {{ shown.granularity }}
+          </p>
+          <p
+            id="create-granularity-hint"
+            class="pn-hint"
+            data-testid="create-granularity-hint"
+          >
+            Intraday bars arrive after the market close: the panel collects once a day, it is not a live feed.
+            The interval cannot be changed later; another interval is another panel.
           </p>
         </div>
       </div>

@@ -58,7 +58,7 @@ from sqlalchemy.engine import Engine
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 
 from common.enums.data_select import AssetType, DataType
-from common.enums.data_stock import DataSource
+from common.enums.data_stock import DataSource, Granularity
 from common.errors.vocabulary import InvalidRequestError, Reason
 from data.store.app.client_label import PANEL_OWNER
 from data.store.app.database.crud.panel_settings import (
@@ -134,6 +134,7 @@ async def panel(pg_async_engine: AsyncEngine, written: Written, run_identity):
             db,
             name=f'system-test-{run_identity.run_id}-panel-{uuid.uuid4().hex[:8]}',
             source=SOURCE,
+            granularity=Granularity.ONE_DAY,
             settings=SETTINGS_V1,
             actor='operator',
             reason='system test panel',
@@ -303,6 +304,72 @@ def test_a_raw_settings_row_without_include_otc_is_refused_by_postgres(pg_engine
     assert 'include_otc' in str(raised.value)
 
 
+# ADR tj-rwoasb D1/D2 (panel Bar Interval): panel.granularity is the last column, of the EXISTING native enum type
+# granularity (the one stock_market_activity and store_dataset_entry use, not a new type), NOT NULL, no default.
+
+
+def test_panel_granularity_is_the_last_column_of_the_shared_granularity_type_not_null_no_default(pg_engine):
+    with pg_engine.connect() as conn:
+        columns = conn.execute(
+            sa.text(
+                'SELECT column_name, data_type, udt_name, is_nullable, column_default FROM information_schema.columns '
+                "WHERE table_schema = current_schema() AND table_name = 'panel' ORDER BY ordinal_position"
+            )
+        ).all()
+        shared = (
+            conn.execute(
+                sa.text(
+                    'SELECT DISTINCT udt_name FROM information_schema.columns WHERE table_schema = current_schema() '
+                    "AND column_name = 'granularity' AND table_name IN ('panel', 'stock_market_activity', "
+                    "'store_dataset_entry')"
+                )
+            )
+            .scalars()
+            .all()
+        )
+        types = conn.execute(
+            sa.text("SELECT count(*) FROM pg_type WHERE typtype = 'e' AND typname LIKE '%granularity%'")
+        ).scalar_one()
+    assert columns[-1] == ('granularity', 'USER-DEFINED', 'granularity', 'NO', None), columns
+    assert shared == ['granularity'], shared
+    assert types == 1, f'{types} enum types named like granularity: the panel column must reuse the one type'
+
+
+def test_a_raw_panel_row_without_granularity_is_refused_by_postgres(pg_engine, run_identity):
+    """No schema default: a writer that forgets the column fails loudly naming it (D2)."""
+    with pg_engine.connect() as conn, pytest.raises(sa.exc.IntegrityError) as raised:
+        conn.execute(
+            PANELS.insert().values(name=f'system-test-{run_identity.run_id}-raw-{uuid.uuid4().hex[:8]}', source=SOURCE)
+        )  # a test-only write, rolled back with the connection
+    assert 'granularity' in str(raised.value)
+    assert 'not-null' in str(raised.value).lower() or 'null value' in str(raised.value).lower()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('granularity', [Granularity.ONE_MINUTE, Granularity.ONE_HOUR, Granularity.ONE_DAY])
+async def test_create_panel_stores_the_granularity_it_is_given_on_asyncpg(
+    pg_async_engine, pg_engine, written, run_identity, granularity, panel
+):
+    # `panel` first writes a source settings version of ours, so this create writes none the cleanup would miss.
+    async with AsyncSession(pg_async_engine, expire_on_commit=False) as db:
+        record, _ = await create_panel(
+            db,
+            name=f'system-test-{run_identity.run_id}-g-{uuid.uuid4().hex[:8]}',
+            source=SOURCE,
+            granularity=granularity,
+            settings=SETTINGS_V1,
+            actor='operator',
+            reason='system test panel granularity',
+        )
+    written.panels.append(record.id)
+    assert record.granularity == granularity
+    with pg_engine.connect() as conn:
+        stored = conn.execute(
+            sa.text('SELECT granularity::text FROM panel WHERE id = :id'), {'id': record.id}
+        ).scalar_one()
+    assert stored == granularity.name, stored
+
+
 @pytest.mark.asyncio
 async def test_include_otc_defaults_false_and_a_true_round_trips_on_asyncpg(pg_async_engine, pg_engine, panel):
     record, version_1, _ = panel
@@ -373,6 +440,7 @@ async def test_create_panel_refuses_source_settings_for_a_source_with_a_version_
                     db,
                     name=name,
                     source=SOURCE,
+                    granularity=Granularity.ONE_DAY,
                     settings=SETTINGS_V1,
                     actor='operator',
                     reason='system test refused panel',
@@ -475,6 +543,7 @@ async def test_concurrent_creates_with_source_settings_on_a_source_with_no_versi
                 db,
                 name=f'{tag}-{index}',
                 source=source,
+                granularity=Granularity.ONE_DAY,
                 settings=SETTINGS_V1,
                 actor='operator',
                 reason=f'{tag} reason {index}',
@@ -556,6 +625,7 @@ async def test_concurrent_creates_with_no_source_settings_on_a_source_with_no_ve
                 db,
                 name=f'{tag}-{index}',
                 source=source,
+                granularity=Granularity.ONE_DAY,
                 settings=SETTINGS_V1,
                 actor='operator',
                 reason=f'{tag} reason {index}',
@@ -622,6 +692,7 @@ async def test_a_mixed_race_bare_create_and_create_with_settings_writes_one_vers
                 db,
                 name=f'{tag}-{kind}',
                 source=source,
+                granularity=Granularity.ONE_DAY,
                 settings=SETTINGS_V1,
                 actor='operator',
                 reason=f'{tag} reason {kind}',

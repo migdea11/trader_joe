@@ -202,7 +202,14 @@ SOURCE_SETTINGS = [
 
 MESSAGES = {
     # (1) the selector.
-    'PanelListItem': [_f('id', 1, S), _f('name', 2, S), _f('source', 3, f'{M}DataSource'), _f('enabled', 4, B)],
+    'PanelListItem': [
+        _f('id', 1, S),
+        _f('name', 2, S),
+        _f('source', 3, f'{M}DataSource'),
+        _f('enabled', 4, B),
+        # ADR tj-rwoasb D1-D3: the panel's Bar Interval, the existing market.v1 enum, immutable like source.
+        _f('granularity', 5, f'{M}Granularity'),
+    ],
     'PanelList': [_r('items', 1, f'{UI}PanelListItem')],
     # (2) settings, the Q1 split.
     'PanelSettings': PANEL_SETTINGS,
@@ -240,6 +247,8 @@ MESSAGES = {
         _f('current_version', 5, f'{UI}PanelSettingsVersion'),
         _f('current_source_version', 6, f'{UI}PanelSourceSettingsVersion'),
         _f('counts', 7, f'{UI}PanelMembershipCounts'),
+        # ADR tj-rwoasb D1-D3: the panel's Bar Interval, the existing market.v1 enum, immutable like source.
+        _f('granularity', 8, f'{M}Granularity'),
     ],
     'PanelSettingsVersionPage': [_r('items', 1, f'{UI}PanelSettingsVersion'), _f('next_cursor', 2, S)],
     'PanelSourceSettingsVersionPage': [_r('items', 1, f'{UI}PanelSourceSettingsVersion'), _f('next_cursor', 2, S)],
@@ -331,6 +340,8 @@ MESSAGES = {
         _o('corporate_action_window_post_days', 16, I32),
         # ADR tj-ed4t8m D2: a panel setting numbered after the source settings, plain: absent is off.
         _f('include_otc', 17, B),
+        # ADR tj-rwoasb D2/D3: required, plain (UNSPECIFIED and every member outside 1 Minute, 1 Hour, 1 Day is 422).
+        _f('granularity', 18, f'{M}Granularity'),
     ],
 }
 
@@ -618,7 +629,29 @@ def test_the_create_body_is_the_read_settings_plus_reason_name_source_and_the_fi
     ]
     assert create[11:15] == [(name, number + 12, kind, False, True) for name, number, kind, _, _ in source]
     assert panel[8] == ('include_otc', 10, B, False, False)
-    assert create[15:] == [('include_otc', 17, B, False, False)]
+    # 18: the panel's Bar Interval (ADR tj-rwoasb D2/D3), a plain enum: UNSPECIFIED is what the route refuses.
+    assert create[15:] == [('include_otc', 17, B, False, False), ('granularity', 18, f'{M}Granularity', False, False)]
+
+
+@pytest.mark.parametrize(('message', 'number'), [('PanelListItem', 5), ('PanelDetail', 8), ('CreatePanelRequest', 18)])
+def test_granularity_is_the_market_v1_enum_at_its_fresh_number_documented_immutable(message: str, number: int):
+    """ADR tj-rwoasb D1-D3: the existing market.v1.Granularity at the message's next free number.
+
+    No new enum, a plain singular field, no number reused, and the comment says another granularity is another panel.
+    """
+    fields = messages(file_named(PANELS))[message].field
+    (field,) = [f for f in fields if f.name == 'granularity']
+    assert _shape(field) == ('granularity', number, f'{M}Granularity', False, False)
+    assert number == max(f.number for f in fields)
+    assert [f.number for f in fields].count(number) == 1
+    assert 'another granularity is another panel' in _comments(_path(message, 'granularity')).replace('\n', ' ')
+
+
+def test_the_create_granularity_documents_the_allowed_set_and_the_refusal():
+    text = ' '.join(_comments(_path('CreatePanelRequest', 'granularity')).split())
+    for words in ('ONE_MINUTE, ONE_HOUR and ONE_DAY', 'UNSPECIFIED and every other member is refused', '(422)'):
+        assert words in text, text
+    assert 'There is no default.' in text, text
 
 
 # ---------------------------------------------------------------------------------------------------
