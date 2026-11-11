@@ -91,6 +91,22 @@ async def note_instance_seen(db: AsyncSession, instance_id: str) -> InstanceSigh
         )
 
 
+async def ingest_instance_table_exists(db: AsyncSession) -> bool:
+    """Whether the ingest_instance table exists, by one catalogue read that does not open a write transaction.
+
+    The asset snapshot seed asks before its SELECT: on a never-migrated database the SELECT fails with
+    UndefinedTable and takes the lifespan, so the whole service, down with it.
+
+    Args:
+        db: A session.
+
+    Returns:
+        bool: True when the table resolves on the session's search path.
+    """
+    result = await db.execute(select(func.to_regclass(IngestInstance.__tablename__).is_not(None)))
+    return bool(result.scalar_one())
+
+
 async def live_instance_id(db: AsyncSession) -> str | None:
     """The newest instance the store has seen (the one not superseded), or None when it has seen none.
 

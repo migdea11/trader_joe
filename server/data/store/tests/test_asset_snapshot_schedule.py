@@ -60,7 +60,15 @@ from data.store.app.database.models.ingest_request import IngestRequestKind, Ing
 from data.store.app.database.models.ingest_run import IngestRunTrigger
 from data.store.app.ingest.instance_watch import InstanceWatcher
 from data.store.app.trading_calendar import calendar_for_source
-from data.store.tests.request_path_harness import INSTANCE_A, INSTANCE_B, REQUESTS, FakeSubmit, Harness, make_engine
+from data.store.tests.request_path_harness import (
+    INSTANCE_A,
+    INSTANCE_B,
+    INSTANCES,
+    REQUESTS,
+    FakeSubmit,
+    Harness,
+    make_engine,
+)
 from schemas.data_ingest.submit import AssetListStatus
 
 
@@ -627,6 +635,128 @@ async def test_seed_takes_the_newest_unsuperseded_instance(harness):
     assert schedule._handled_instance == INSTANCE_B
     async with harness.session() as db:
         assert await live_instance_id(db) == INSTANCE_B
+
+
+# --- the seed on a never-migrated database (tj-7zjov1.375) -----------------------------------------------------------
+#
+# DESIGN: tj-7zjov1.375 (architect diagnosis 2026-11-11), shaped like the sweep's guard (tj-s6r3rt.5). seed() asks
+# ingest_instance_table_exists (a to_regclass READ) before live_instance_id's SELECT; when the table is missing it logs
+# ONE warning naming make migrate and returns, leaving the handled instance None, so the first instance seen after
+# migrating counts as an ingest start. On a migrated database nothing changes.
+#
+# to_regclass here is the conftest's stand-in (registered on every SQLite connection: the name when the table exists,
+# NULL when not), so the crud's real statement runs against a table that is really there or really dropped. What it
+# cannot show is Postgres binding the argument (asyncpg); CI's System Start against an empty Postgres is that proof.
+
+SEED_SKIPPED = 'Asset snapshot seed skipped: the ingest_instance table does not exist'
+
+
+async def _drop_instances(harness: Harness) -> None:
+    async with harness.engine.begin() as connection:
+        await connection.execute(sa.text(f'DROP TABLE {INSTANCES.name}'))
+
+
+async def _create_instances(harness: Harness) -> None:
+    metadata = sa.MetaData()
+    INSTANCES.to_metadata(metadata)
+    async with harness.engine.begin() as connection:
+        await connection.run_sync(metadata.create_all)
+
+
+def _spy_crud(monkeypatch: pytest.MonkeyPatch, name: str) -> list[object]:
+    """Journal each call of asset_snapshot_schedule.<name> and what it returned, still calling the real one."""
+    journal: list[object] = []
+    real = getattr(asset_snapshot_schedule, name)
+
+    async def spy(*args, **kwargs):
+        result = await real(*args, **kwargs)
+        journal.append(result)
+        return result
+
+    monkeypatch.setattr(asset_snapshot_schedule, name, spy)
+    return journal
+
+
+async def test_on_a_never_migrated_database_the_seed_warns_once_and_handles_no_instance(harness, caplog, monkeypatch):
+    await _drop_instances(harness)
+    probed = _spy_crud(monkeypatch, 'ingest_instance_table_exists')
+    selected = _spy_crud(monkeypatch, 'live_instance_id')
+    schedule = _schedule(FakeSubmit())
+
+    with caplog.at_level(logging.DEBUG):
+        await schedule.seed()
+
+    assert probed == [False], 'the probe must have run, and answered that the table is missing'
+    assert selected == [], 'no SELECT may be attempted against a table that does not exist'
+    assert schedule._handled_instance is None
+    assert [r for r in caplog.records if r.levelno >= logging.ERROR] == []
+    assert [r for r in caplog.records if r.exc_info] == [], 'no traceback'
+    (warning,) = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert warning.name == asset_snapshot_schedule.__name__
+    assert warning.getMessage().startswith(SEED_SKIPPED)
+    assert 'make migrate' in warning.getMessage()
+
+
+async def test_on_a_migrated_database_the_probe_finds_the_table_and_the_seed_is_unchanged(harness, caplog, monkeypatch):
+    await harness.register(INSTANCE_A)
+    await harness.register(INSTANCE_B)  # supersedes A
+    probed = _spy_crud(monkeypatch, 'ingest_instance_table_exists')
+    schedule = _schedule(FakeSubmit())
+
+    with caplog.at_level(logging.DEBUG, logger=asset_snapshot_schedule.__name__):
+        await schedule.seed()
+
+    assert probed == [True]
+    assert schedule._handled_instance == INSTANCE_B, 'the live instance is taken as handled, as before'
+    assert _messages(caplog, logging.WARNING) == []
+    await schedule.on_instance_seen(INSTANCE_B)
+    assert await _lists(harness) == [], 'so a store restart is still not an ingest restart'
+
+
+async def test_after_a_skipped_seed_the_first_instance_seen_once_migrated_is_an_ingest_start(harness, monkeypatch):
+    """Through start_asset_snapshot_loops: the start survives the missing table, and the first sighting asks once."""
+    await _drop_instances(harness)
+    monkeypatch.setattr(asset_snapshot_schedule, 'run_periodic', lambda *a, **k: None)
+
+    loops = await start_asset_snapshot_loops(FakeSubmit(), {ALPACA: SnapshotCadence(daily_offset=None)})
+    assert loops is not None and loops.schedule._handled_instance is None
+
+    # make migrate runs; ingest registers its instance; the watcher's probe names it.
+    await _create_instances(harness)
+    await harness.register(INSTANCE_A)
+    await loops.schedule.on_instance_seen(INSTANCE_A)
+    assert await _lists(harness) == [(ALPACA, ACTIVE), (ALPACA, INACTIVE)], 'the first sighting is an ingest start'
+
+    await _finish_all(harness)
+    await loops.schedule.on_instance_seen(INSTANCE_A)
+    assert await _lists(harness) == [(ALPACA, ACTIVE), (ALPACA, INACTIVE)], 'and the same id again asks nothing'
+
+
+@pytest.mark.parametrize('exists', [True, False])
+async def test_the_instance_probe_is_one_to_regclass_read_of_the_models_table_name(exists):
+    """Under the Postgres dialect: SELECT to_regclass(<IngestInstance.__tablename__>) IS NOT NULL, a plain read."""
+    from sqlalchemy.dialects import postgresql
+
+    from data.store.app.database.crud.ingest_instance import ingest_instance_table_exists
+    from data.store.app.database.models.ingest_instance import IngestInstance
+
+    executed = []
+
+    class Result:
+        def scalar_one(self):
+            return exists
+
+    class Session:
+        async def execute(self, statement):
+            executed.append(statement)
+            return Result()
+
+    assert await ingest_instance_table_exists(Session()) is exists
+    (statement,) = executed
+    compiled = statement.compile(dialect=postgresql.dialect())
+    assert str(compiled).replace('\n', ' ') == 'SELECT to_regclass(%(to_regclass_1)s) IS NOT NULL AS anon_1'
+    assert compiled.params == {'to_regclass_1': IngestInstance.__tablename__}
+    assert IngestInstance.__tablename__ == 'ingest_instance', 'the table the warning names'
 
 
 async def test_a_store_restart_is_not_an_ingest_restart(harness, monkeypatch):

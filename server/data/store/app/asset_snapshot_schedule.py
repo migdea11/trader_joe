@@ -50,7 +50,7 @@ from common.rpc.clients.ingest_submit import IngestSubmitClient
 from common.scheduling import AfterTradingEvent, TradingEvent, run_periodic
 from data.store.app.daily_refresh import SCHEDULER_ACTOR, settle_delay
 from data.store.app.database.crud.asset_list import newest_snapshot
-from data.store.app.database.crud.ingest_instance import live_instance_id
+from data.store.app.database.crud.ingest_instance import ingest_instance_table_exists, live_instance_id
 from data.store.app.database.crud.ingest_request import create_request, open_asset_list_request_exists
 from data.store.app.database.database import own_session
 from data.store.app.database.models.ingest_run import IngestRunTrigger
@@ -128,6 +128,12 @@ class AssetSnapshotSchedule:
     async def seed(self) -> None:
         """Take the newest instance the store already knows as handled, so a store restart is not an ingest restart."""
         async with own_session() as db:
+            if not await ingest_instance_table_exists(db):
+                log.warning(
+                    'Asset snapshot seed skipped: the ingest_instance table does not exist; the database has not '
+                    'been migrated, run make migrate. The first instance seen after migrating counts as an ingest start'
+                )
+                return
             self._handled_instance = await live_instance_id(db)
 
     async def on_instance_seen(self, instance_id: str) -> None:
