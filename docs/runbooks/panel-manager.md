@@ -79,7 +79,17 @@ date is requested and nothing is backfilled.
   start stays that of the dataset created first.
 - A weekend or holiday start is fine: nothing is owed until the first session after it closes.
 - The name-change check still runs on every creation; it is what collects the member's corporate actions, and it
-  can move the start later.
+  can move the start later. It asks for the symbol's whole history and stores every record the vendor returns; the
+  corporate-action window days play no part in it. The same check runs on every `POST /store` for the symbol (any
+  owner, a repeat, and one later refused for overlapping the owner's own dataset) and on every panel creation,
+  including a second panel of another Bar Interval minting its own dataset for the symbol and a retry after a
+  clamp-unavailable deferral; each run requests the symbol's whole history again and stores every record again
+  (deduplicated by content: the same vendor action id with the same bytes is kept once). Corporate actions are stored
+  per source and symbol, not per dataset, so the events list (PR8) shows every stored event for the dataset's source
+  and symbol, newest effective date first. Nothing periodic requests corporate actions: not the DAILY refresh, not the
+  asset-snapshot schedule, not the ingest scheduler, not a manager pass for an existing member. The instance watcher
+  only re-sends PENDING requests or re-submits those held by a superseded ingest instance (the same request row, not a
+  new fetch).
 
 `CREATED` names the bars **request**, never a dataset: the delivery intake
 mints the dataset on the first delivered attempt, as for any POST, and the manager never waits for the verdict.
@@ -110,7 +120,7 @@ as `actor`, and an optional `reason`: a blank one means none, is stored as NULL 
 |---|---|---|
 | Create a panel | `POST /ui/v1/panels` | Writes the panel and its settings version 1 in one transaction, answers the panel detail with `effective_pass` unset ("first pass pending"). It runs no pass: the next tick does, once the panel is enabled |
 | Change a panel | `POST /ui/v1/panels/{panel_id}/settings-versions` | A new version replaces the settings as sent: an absent optional filter clears it. **Enable and disable are this same write with `enabled` changed** |
-| Change a source's rates | `POST /ui/v1/panel-sources/{source}/settings-versions` | The per-source `ramp_datasets_per_hour` (1 or more), `request_cap_per_hour` (2 or more) and the corporate-action window days (required, 0 or more). Both rates are optional: empty means no limit. They apply to every panel on the source |
+| Change a source's rates | `POST /ui/v1/panel-sources/{source}/settings-versions` | The per-source `ramp_datasets_per_hour` (1 or more), `request_cap_per_hour` (2 or more) and the corporate-action window days, before and after (both required on this write, 0 or more; a create that carries some source settings also fills 90 for each window count it omits, while the source's own settings write refuses an absent window field with 422). Both rates are optional: empty means no limit. They apply to every panel on the source. The window is saved and shown and bounds no fetch yet |
 
 Rules that decide a create (all refusals are `INVALID_REQUEST`, 422, with the store's message, and write nothing):
 
