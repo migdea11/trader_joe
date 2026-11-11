@@ -126,6 +126,17 @@ class ActionRow:
     as_of: datetime
 
 
+def action_sort_date(row: ActionRow) -> datetime | None:
+    """The date an action takes effect: ex_date, else effective_date, else process_date, None when none is set.
+
+    The same precedence as the ORDER BY of corporate_action_page (_ACTION_SORT_DATE); the two are kept side by side.
+    """
+    for candidate in (row.ex_date, row.effective_date, row.process_date):
+        if candidate is not None:
+            return candidate
+    return None
+
+
 def _chunks(items: Sequence) -> list[Sequence]:
     return [items[start : start + ROW_CHUNK] for start in range(0, len(items), ROW_CHUNK)]
 
@@ -478,23 +489,32 @@ async def dataset_identity(db: AsyncSession, dataset_id: uuid.UUID) -> tuple[Dat
 
 
 async def corporate_action_page(
-    db: AsyncSession, source: DataSource, symbol: str, *, after: tuple[datetime, uuid.UUID] | None, limit: int
+    db: AsyncSession,
+    source: DataSource,
+    symbol: str,
+    *,
+    after: tuple[datetime | None, datetime, uuid.UUID] | None,
+    limit: int,
 ) -> list[ActionRow]:
-    """Corporate-action observations for a source and requesting symbol, newest as_of first. One statement.
+    """Corporate-action observations for a source and requesting symbol, by effective date, newest first. One statement.
 
     EVERY observation with the source and a requesting symbol equal to the symbol, whichever request delivered it,
-    and NOT filtered by any window (ADR tj-26jt9w addendum 22). A vendor revision is its own row. The raw payload is
-    never selected.
+    and NOT filtered by any window (ADR tj-26jt9w addendum 22; whether the view filters is an open decision). A vendor
+    revision is its own row. The raw payload is never selected.
+
+    The order is COALESCE(ex_date, effective_date, process_date) descending with NULLs last, then as_of descending,
+    then id descending.
 
     Args:
         db: The request's session.
         source: The dataset's source.
         symbol: The dataset's symbol.
-        after: Keyset: the (as_of, id) of the last row of the previous page; rows strictly after it in the order.
+        after: Keyset: the (sort date or None, as_of, id) of the last row of the previous page; rows strictly after it
+            in the order, NULL sort dates last.
         limit: Rows to return at most.
 
     Returns:
-        list[ActionRow]: Ordered by as_of then id, both descending.
+        list[ActionRow]: In the order above.
     """
     stmt = select(
         _ACTION.c.id,
@@ -507,10 +527,19 @@ async def corporate_action_page(
         _ACTION.c.effective_date,
         _ACTION.c.as_of,
     ).where(_ACTION.c.source == source, _ACTION.c.requesting_symbol == symbol)
+    sort_date = func.coalesce(_ACTION.c.ex_date, _ACTION.c.effective_date, _ACTION.c.process_date)
     if after is not None:
-        as_of, action_id = after
-        stmt = stmt.where(or_(_ACTION.c.as_of < as_of, and_(_ACTION.c.as_of == as_of, _ACTION.c.id < action_id)))
-    rows = (await db.execute(stmt.order_by(_ACTION.c.as_of.desc(), _ACTION.c.id.desc()).limit(limit))).all()
+        last_date, as_of, action_id = after
+        tail = or_(_ACTION.c.as_of < as_of, and_(_ACTION.c.as_of == as_of, _ACTION.c.id < action_id))
+        if last_date is None:
+            stmt = stmt.where(sort_date.is_(None), tail)
+        else:
+            stmt = stmt.where(or_(sort_date < last_date, sort_date.is_(None), and_(sort_date == last_date, tail)))
+    rows = (
+        await db.execute(
+            stmt.order_by(sort_date.desc().nulls_last(), _ACTION.c.as_of.desc(), _ACTION.c.id.desc()).limit(limit)
+        )
+    ).all()
     return [
         ActionRow(
             id=row.id,
@@ -536,6 +565,7 @@ __all__ = [
     'PassRef',
     'SettingsVersionRow',
     'SourceVersionRow',
+    'action_sort_date',
     'active_snapshots',
     'catalog_rows',
     'corporate_action_page',

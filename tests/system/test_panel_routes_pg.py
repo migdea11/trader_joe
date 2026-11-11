@@ -23,6 +23,11 @@ enums, no varchar[], no row or advisory locks, one writer, and stores uuids as t
       no repeat;
   PR5 R7 on the ALPACA source reads the stack's own snapshots: one day per XNYS session in the window, ascending, each
       a known state, changed_count 0 unless SAVED.
+  PR6 R8's effective-date order on Postgres (owner ruling 2026-11-10, ADR tj-26jt9w addendum of that date,
+      tj-7zjov1.368): COALESCE(ex_date, effective_date, process_date) DESC NULLS LAST, then as_of, then id, descending,
+      in one page and walked at page sizes 1 and 2. Postgres sorts NULL FIRST under DESC by default, so this is the
+      test that pins NULLS LAST itself; SQLite sorts NULL lowest and cannot tell. WRITTEN, NOT YET RUN where it was
+      written (validator tj-7zjov1.370): it runs in the next Postgres window.
 
 ISOLATION. Panels are created DISABLED and on MANUAL_ENTRY where the source does not matter, so the panel manager never
 runs a pass for them (it skips a source with no trading calendar, and a disabled panel). Panel names carry the run id.
@@ -211,29 +216,35 @@ async def test_concurrent_creates_of_one_name_leave_one_panel_and_answer_422_oth
 # --------------------------------------------------------------------------------------------- PR4 R8 keyset on uuids
 
 
+def _insert_dataset(conn: sa.Connection, dataset: uuid.UUID, symbol: str) -> None:
+    conn.execute(
+        ENTRIES.insert().values(
+            id=dataset,
+            owner='panel',
+            source=DataSource.ALPACA_API,
+            feed=Feed.IEX,
+            asset_symbol=symbol,
+            asset_type=AssetType.STOCK,
+            data_type=DataType.MARKET_ACTIVITY,
+            granularity=Granularity.ONE_DAY,
+            start=datetime(2026, 9, 1, tzinfo=UTC),
+            end=NullableDateTime.EPOCH,
+            expiry_type=ExpiryType.ROLLING.value,
+            update_type=UpdateType.DAILY.value,
+            collect=True,
+        )
+    )
+
+
 def test_corporate_action_keyset_breaks_an_as_of_tie_by_uuid_descending_on_postgres(
     data_store, pg_engine, written, own_symbol
 ):
+    # Every row here is undated, so since the effective-date order (PR6) they all fall in the NULL partition, which
+    # still orders by as_of, then id, descending: this keyset test keeps its meaning unchanged.
     dataset = uuid.uuid4()
     instant = datetime(2026, 9, 15, tzinfo=UTC)
     with pg_engine.begin() as conn:
-        conn.execute(
-            ENTRIES.insert().values(
-                id=dataset,
-                owner='panel',
-                source=DataSource.ALPACA_API,
-                feed=Feed.IEX,
-                asset_symbol=own_symbol,
-                asset_type=AssetType.STOCK,
-                data_type=DataType.MARKET_ACTIVITY,
-                granularity=Granularity.ONE_DAY,
-                start=datetime(2026, 9, 1, tzinfo=UTC),
-                end=NullableDateTime.EPOCH,
-                expiry_type=ExpiryType.ROLLING.value,
-                update_type=UpdateType.DAILY.value,
-                collect=True,
-            )
-        )
+        _insert_dataset(conn, dataset, own_symbol)
         written.datasets.append(dataset)
         for n in range(7):
             action_id = uuid.uuid4()
@@ -272,6 +283,66 @@ def test_corporate_action_keyset_breaks_an_as_of_tie_by_uuid_descending_on_postg
     else:
         pytest.fail(f'the corporate-action cursor never ended: {seen}')
     assert seen == expected and len(seen) == 7
+
+
+# --------------------------------------------------------------------------------------------- PR6 R8 effective-date order
+
+
+def test_corporate_actions_order_by_effective_date_with_undated_rows_last_on_postgres(
+    data_store, pg_engine, written, own_symbol
+):
+    dataset = uuid.uuid4()
+    aug = {d: datetime(2026, 8, d, tzinfo=UTC) for d in (10, 20, 25)}
+    sep = {d: datetime(2026, 9, d, tzinfo=UTC) for d in (1, 10, 11, 12, 30)}
+    rows = (  # n orders the ids: the first 8 hex digits decide Postgres's uuid order
+        ('p1', sep[10], {'ex_date': aug[20]}),
+        ('p2', sep[10], {'ex_date': aug[20]}),
+        ('p3', sep[12], {'ex_date': aug[20]}),
+        ('p4', sep[10], {'effective_date': aug[20]}),  # tied on the sort date through the fallback
+        ('p5', sep[1], {'ex_date': aug[25]}),
+        ('p6', sep[30], {'process_date': aug[10]}),
+        ('n1', sep[10], {}),
+        ('n2', sep[10], {}),
+        ('n3', sep[11], {}),  # undated with the newest as_of but one: still after every dated row
+    )
+    with pg_engine.begin() as conn:
+        _insert_dataset(conn, dataset, own_symbol)
+        written.datasets.append(dataset)
+        for n, (name, as_of, dates) in enumerate(rows, start=1):
+            action_id = uuid.UUID(f'{n:08x}{uuid.uuid4().hex[8:]}')
+            conn.execute(
+                ACTIONS.insert().values(
+                    id=action_id,
+                    source=DataSource.ALPACA_API,
+                    vendor_action_id=name,
+                    action_type='cash_dividend',
+                    raw_payload=action_id.bytes,
+                    payload_hash=action_id.hex,
+                    request_id=uuid.uuid4(),
+                    attempt_no=1,
+                    requesting_symbol=own_symbol,
+                    as_of=as_of,
+                    **dates,
+                )
+            )
+            written.actions.append(action_id)
+    expected = ['p5', 'p3', 'p4', 'p2', 'p1', 'p6', 'n3', 'n2', 'n1']
+
+    whole = data_store.get(f'/ui/v1/datasets/{dataset}/corporate-actions').json()
+    assert [item['vendorActionId'] for item in whole['items']] == expected and 'nextCursor' not in whole
+    for limit in (1, 2):
+        seen: list[str] = []
+        cursor = None
+        for _ in range(12):  # bounded: at most nine pages are due
+            params = {'limit': limit} | ({'cursor': cursor} if cursor else {})
+            page = data_store.get(f'/ui/v1/datasets/{dataset}/corporate-actions', params=params).json()
+            seen += [item['vendorActionId'] for item in page.get('items', [])]
+            cursor = page.get('nextCursor')
+            if not cursor:
+                break
+        else:
+            pytest.fail(f'the corporate-action cursor never ended at limit {limit}: {seen}')
+        assert seen == expected, f'limit {limit}'
 
 
 # --------------------------------------------------------------------------------------------- PR5 R7 on XNYS

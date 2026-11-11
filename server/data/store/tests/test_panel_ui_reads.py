@@ -46,7 +46,7 @@ from sqlalchemy.sql import Select
 
 from common.enums.data_select import AssetType
 from data.store.app import panel_views
-from data.store.app.database.crud.panel_reads import MemberAssetEvents
+from data.store.app.database.crud.panel_reads import ActionRow, MemberAssetEvents, action_sort_date
 from data.store.app.database.database import async_db
 from data.store.app.database.models.asset_list import AssetListEventKind
 from data.store.app.database.models.dataset_override_log import OverrideAction
@@ -910,7 +910,7 @@ async def test_r7_statement_count_does_not_grow_with_the_days(world, client, his
 # --------------------------------------------------------------------------------------------- R8 corporate actions
 
 
-async def test_r8_serves_every_observation_of_the_datasets_source_and_symbol_newest_first(world, client):
+async def test_r8_serves_every_observation_of_the_datasets_source_and_symbol_by_effective_date(world, client):
     dataset = await world.dataset('AAA', bars=(ny_midnight(6),))
     early, middle, late = (datetime(2026, 9, d, tzinfo=UTC) for d in (1, 10, 20))
     long_ago = datetime(1995, 3, 1, tzinfo=UTC)
@@ -925,15 +925,18 @@ async def test_r8_serves_every_observation_of_the_datasets_source_and_symbol_new
 
     body = await get(client, f'/ui/v1/datasets/{dataset}/corporate-actions')
 
+    # The order is the date the action takes effect, COALESCE(ex_date, effective_date, process_date) descending with
+    # undated rows last (owner ruling 2026-11-10, ADR tj-26jt9w addendum of that date; it was as_of first before). The
+    # 1995 row is the only dated one, so it leads; the three undated rows follow by as_of, then id, descending.
     assert [(item['vendorActionId'], item['asOf']) for item in body['items']] == [
+        ('act-1', stamp(early)),
         ('act-1', stamp(late)),
         ('act-2', stamp(middle)),
         ('act-1', stamp(middle)),
-        ('act-1', stamp(early)),
     ]
-    oldest = body['items'][-1]
-    assert oldest['exDate'] == stamp(long_ago) and oldest['actionType'] == 'cash_dividend'
-    assert 'recordDate' not in oldest and 'payableDate' not in oldest
+    dated = body['items'][0]
+    assert dated['exDate'] == stamp(long_ago) and dated['actionType'] == 'cash_dividend'
+    assert 'recordDate' not in dated and 'payableDate' not in dated
     assert 'nextCursor' not in body
 
 
@@ -966,8 +969,10 @@ async def test_r8_errors(world, client):
 
     problem(await client.get(f'/ui/v1/datasets/{uuid.uuid4()}/corporate-actions'), status=404, reason='NOT_FOUND')
     problem(await client.get('/ui/v1/datasets/nope/corporate-actions'), status=422, reason='INVALID_REQUEST')
-    bad_time = forged({'o': 'corporate-actions', 's': str(dataset), 'k': ['not a time', str(uuid.uuid4())]})
-    bad_id = forged({'o': 'corporate-actions', 's': str(dataset), 'k': [T0.isoformat(), 'not-a-uuid']})
+    # Three keys since the effective-date order (sort date or empty, as_of, id); each bad cursor has the right width, so
+    # only the parse can refuse it. The old two-key width is pinned in test_r8_refuses_an_old_or_malformed_cursor.
+    bad_time = forged({'o': 'corporate-actions', 's': str(dataset), 'k': ['', 'not a time', str(uuid.uuid4())]})
+    bad_id = forged({'o': 'corporate-actions', 's': str(dataset), 'k': ['', T0.isoformat(), 'not-a-uuid']})
     for target, bad in ((other, cursor), (dataset, bad_time), (dataset, bad_id)):
         response = await client.get(f'/ui/v1/datasets/{target}/corporate-actions', params={'cursor': bad})
         problem(response, status=422, reason='INVALID_REQUEST')
@@ -986,6 +991,184 @@ async def test_r8_statement_count_does_not_grow_with_the_observations(world, cli
     for n in range(12):
         await world.action('CNT', T0 + n * DAY, vendor_action_id=f'c{n}')
     assert await statements_of(world, client, f'/ui/v1/datasets/{dataset}/corporate-actions') == one
+
+
+# R8's order (owner ruling 2026-11-10, ADR tj-26jt9w addendum of that date, tj-7zjov1.368): COALESCE(ex_date,
+# effective_date, process_date) DESC NULLS LAST, then as_of DESC, then id DESC; the cursor is [sort date ISO or '',
+# as_of ISO, id]. SQLite already sorts NULL lowest, so a DESC without NULLS LAST passes here: the Postgres twin in
+# tests/system/test_panel_routes_pg.py is the one that pins NULLS LAST itself.
+
+AUG = {d: datetime(2026, 8, d, tzinfo=UTC) for d in range(1, 32)}  # AUG[n] is 2026-08-n
+SEP = {d: datetime(2026, 9, d, tzinfo=UTC) for d in range(1, 31)}
+
+
+def cursor_key(cursor: str) -> list:
+    """The key of an opaque cursor, read as the store writes it (url-safe base64 JSON, padding stripped)."""
+    return json.loads(base64.urlsafe_b64decode(cursor + '=' * (-len(cursor) % 4)))['k']
+
+
+async def walk(client: httpx.AsyncClient, dataset: uuid.UUID, limit: int) -> tuple[list[str], list[str]]:
+    """Every page of R8 at one page size: the vendor ids in order, and each next cursor."""
+    seen: list[str] = []
+    cursors: list[str] = []
+    cursor = None
+    for _ in range(20):  # bounded: a cursor that does not advance fails instead of hanging
+        params = {'limit': limit} | ({'cursor': cursor} if cursor else {})
+        page = await get(client, f'/ui/v1/datasets/{dataset}/corporate-actions', **params)
+        seen += [item['vendorActionId'] for item in page.get('items', [])]
+        cursor = page.get('nextCursor')
+        if not cursor:
+            return seen, cursors
+        cursors.append(cursor)
+    pytest.fail(f'the corporate-action cursor never ended: {seen}')
+
+
+async def actions_of(client: httpx.AsyncClient, dataset: uuid.UUID) -> list[str]:
+    body = await get(client, f'/ui/v1/datasets/{dataset}/corporate-actions')
+    assert 'nextCursor' not in body
+    return [item['vendorActionId'] for item in body['items']]
+
+
+async def test_r8_rows_of_one_delivery_come_out_by_their_date_not_their_id(world, client):
+    dataset = await world.dataset('ONE')
+    # One delivery: every row shares as_of. Descending id order is a, b, c, d, which is not the date order.
+    for n, (name, day) in enumerate((('d', 28), ('c', 5), ('b', 20), ('a', 2)), start=1):
+        await world.action('ONE', SEP[15], action_id=ordered(n), vendor_action_id=name, ex_date=AUG[day])
+    assert await actions_of(client, dataset) == ['d', 'b', 'c', 'a']
+
+
+async def test_r8_falls_back_from_ex_date_to_effective_date_to_process_date(world, client):
+    dataset = await world.dataset('FBK')
+    rows = (
+        ('ex-10', {'ex_date': AUG[10]}),
+        ('eff-15', {'effective_date': AUG[15]}),  # a name change carries only effective_date
+        ('proc-12', {'process_date': AUG[12]}),  # some carry only process_date
+        ('ex-wins-5', {'ex_date': AUG[5], 'effective_date': AUG[25], 'process_date': AUG[27]}),
+        ('ex-14', {'ex_date': AUG[14]}),
+        ('eff-wins-8', {'effective_date': AUG[8], 'process_date': AUG[26]}),
+    )
+    for n, (name, dates) in enumerate(rows, start=1):
+        await world.action('FBK', SEP[15], action_id=ordered(n), vendor_action_id=name, **dates)
+    # Each row sorts by the date it holds, whichever column holds it; ex_date wins over both, effective over process.
+    assert await actions_of(client, dataset) == ['eff-15', 'ex-14', 'proc-12', 'ex-10', 'eff-wins-8', 'ex-wins-5']
+
+
+async def test_r8_undated_rows_come_last_by_as_of_then_id(world, client):
+    dataset = await world.dataset('NUL')
+    await world.action('NUL', SEP[1], action_id=ordered(20), vendor_action_id='dated-old', ex_date=AUG[1])
+    await world.action('NUL', SEP[2], action_id=ordered(21), vendor_action_id='dated-new', ex_date=AUG[3])
+    await world.action('NUL', SEP[20], action_id=ordered(10), vendor_action_id='u-a')
+    await world.action('NUL', SEP[20], action_id=ordered(11), vendor_action_id='u-b')
+    await world.action('NUL', SEP[25], action_id=ordered(1), vendor_action_id='u-c')
+    await world.action('NUL', SEP[10], action_id=ordered(12), vendor_action_id='u-d')
+    # Newer as_of does not lift an undated row above a dated one.
+    assert await actions_of(client, dataset) == ['dated-new', 'dated-old', 'u-c', 'u-b', 'u-a', 'u-d']
+
+
+PAGED = ['p5', 'p3', 'p4', 'p2', 'p1', 'p6', 'n3', 'n2', 'n1']
+
+
+@pytest_asyncio.fixture
+async def paged(world) -> uuid.UUID:
+    """Rows tied on the sort date (one through the effective_date fallback), tied on as_of, and undated rows."""
+    dataset = await world.dataset('PGD')
+    rows = (
+        ('p1', SEP[10], {'ex_date': AUG[20]}),
+        ('p2', SEP[10], {'ex_date': AUG[20]}),
+        ('p3', SEP[12], {'ex_date': AUG[20]}),
+        ('p4', SEP[10], {'effective_date': AUG[20]}),
+        ('p5', SEP[1], {'ex_date': AUG[25]}),
+        ('p6', SEP[30], {'process_date': AUG[10]}),
+        ('n1', SEP[10], {}),
+        ('n2', SEP[10], {}),
+        ('n3', SEP[11], {}),
+    )
+    for n, (name, as_of, dates) in enumerate(rows, start=1):
+        await world.action('PGD', as_of, action_id=ordered(n), vendor_action_id=name, **dates)
+    return dataset
+
+
+async def test_r8_paged_rows_in_one_page_are_in_the_ruled_order(paged, client):
+    assert await actions_of(client, paged) == PAGED
+
+
+@pytest.mark.parametrize('limit', [1, 2, 3, 6, 8])
+async def test_r8_paging_walks_every_row_once_across_equal_dates_and_the_undated_boundary(paged, client, limit):
+    seen, cursors = await walk(client, paged, limit)
+    assert seen == PAGED  # in order, so no duplicate and no gap
+    assert all(len(cursor_key(cursor)) == 3 for cursor in cursors)
+
+
+async def test_r8_cursor_of_the_last_dated_row_and_of_an_undated_row(paged, client):
+    path = f'/ui/v1/datasets/{paged}/corporate-actions'
+    first = await get(client, path, limit=6)  # ends on p6, the last dated row
+    assert [item['vendorActionId'] for item in first['items']][-1] == 'p6'
+    date_text, as_of_text, action_id = cursor_key(first['nextCursor'])
+    assert datetime.fromisoformat(date_text) == AUG[10] and datetime.fromisoformat(as_of_text) == SEP[30]
+    assert uuid.UUID(action_id) == ordered(6)
+    rest = await get(client, path, limit=6, cursor=first['nextCursor'])
+    assert [item['vendorActionId'] for item in rest['items']] == ['n3', 'n2', 'n1'] and 'nextCursor' not in rest
+
+    second = await get(client, path, limit=7)  # ends on n3, an undated row
+    assert cursor_key(second['nextCursor'])[0] == ''
+    rest = await get(client, path, limit=7, cursor=second['nextCursor'])
+    assert [item['vendorActionId'] for item in rest['items']] == ['n2', 'n1'] and 'nextCursor' not in rest
+
+
+async def test_r8_refuses_an_old_or_malformed_cursor(paged, client):
+    scope = str(paged)
+    good = cursor_key((await get(client, f'/ui/v1/datasets/{paged}/corporate-actions', limit=1))['nextCursor'])
+    keys = {
+        'old two-key cursor': [SEP[1].isoformat(), str(ordered(5))],
+        'four keys': [*good, 'extra'],
+        'bad sort date': ['not a date', *good[1:]],
+        'sort date not a string': [20260820, *good[1:]],
+        'bad as_of': [good[0], 'not a time', good[2]],
+        'bad id': [*good[:2], 'not-a-uuid'],
+    }
+    for name, key in keys.items():
+        bad = forged({'o': 'corporate-actions', 's': scope, 'k': key})
+        response = await client.get(f'/ui/v1/datasets/{paged}/corporate-actions', params={'cursor': bad})
+        assert response.status_code == 422, name
+        problem(response, status=422, reason='INVALID_REQUEST')
+    await get(
+        client,
+        f'/ui/v1/datasets/{paged}/corporate-actions',
+        cursor=forged({'o': 'corporate-actions', 's': scope, 'k': good}),
+    )
+
+
+async def test_r8_serves_events_far_outside_any_window(world, client):
+    """Every stored event is returned; whether the view should filter by a window is open (decision B), not pinned."""
+    dataset = await world.dataset('WIN')
+    await world.action(
+        'WIN', SEP[1], action_id=ordered(1), vendor_action_id='past', ex_date=datetime(1990, 1, 2, tzinfo=UTC)
+    )
+    await world.action(
+        'WIN', SEP[2], action_id=ordered(2), vendor_action_id='future', ex_date=datetime(2040, 6, 1, tzinfo=UTC)
+    )
+    await world.action('WIN', SEP[3], action_id=ordered(3), vendor_action_id='recent', process_date=AUG[30])
+    await world.action('WIN', SEP[4], action_id=ordered(4), vendor_action_id='undated')
+    assert await actions_of(client, dataset) == ['future', 'recent', 'past', 'undated']
+
+
+@pytest.mark.parametrize(
+    ('dates', 'expected'),
+    [
+        ({}, None),
+        ({'process_date': AUG[3]}, AUG[3]),
+        ({'effective_date': AUG[2]}, AUG[2]),
+        ({'ex_date': AUG[1]}, AUG[1]),
+        ({'effective_date': AUG[2], 'process_date': AUG[3]}, AUG[2]),
+        ({'ex_date': AUG[1], 'process_date': AUG[3]}, AUG[1]),
+        ({'ex_date': AUG[1], 'effective_date': AUG[2], 'process_date': AUG[3]}, AUG[1]),
+        ({'record_date': AUG[4], 'payable_date': AUG[5]}, None),  # neither is an effective date
+    ],
+)
+async def test_action_sort_date_precedence(dates, expected):
+    blank = dict.fromkeys(('ex_date', 'record_date', 'payable_date', 'process_date', 'effective_date'))
+    row = ActionRow(id=ordered(1), vendor_action_id='a', action_type='cash_dividend', as_of=SEP[1], **(blank | dates))
+    assert action_sort_date(row) == expected
 
 
 # --------------------------------------------------------------------------------------------- the pure rule and the read module

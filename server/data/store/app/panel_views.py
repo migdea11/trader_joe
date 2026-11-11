@@ -535,17 +535,21 @@ async def asset_list_history(
 async def corporate_action_events(
     db: AsyncSession, dataset_id: uuid.UUID, *, cursor: str | None, limit: int
 ) -> ActionPageView | None:
-    """One page of a dataset's corporate-action observations, newest as_of first, or None for an unknown dataset.
+    """One page of a dataset's corporate-action observations, by the date they take effect, newest first, or None for an unknown dataset.
+
+    The order is COALESCE(ex_date, effective_date, process_date) descending with undated rows last, then as_of, then id,
+    both descending. Every stored observation is shown: no window filters the view.
 
     Raises:
         InvalidRequestError: INVALID_REQUEST (422) for a cursor made for another route or dataset.
     """
     scope = str(dataset_id)
-    after: tuple[datetime, uuid.UUID] | None = None
+    after: tuple[datetime | None, datetime, uuid.UUID] | None = None
     if cursor is not None:
-        as_of_text, action_id = _cursor_key(cursor, _ACTIONS_ROUTE, scope, 2)
+        date_text, as_of_text, action_id = _cursor_key(cursor, _ACTIONS_ROUTE, scope, 3)
         try:
-            after = (datetime.fromisoformat(as_of_text).astimezone(UTC), uuid.UUID(action_id))
+            sort_date = datetime.fromisoformat(date_text).astimezone(UTC) if date_text else None
+            after = (sort_date, datetime.fromisoformat(as_of_text).astimezone(UTC), uuid.UUID(action_id))
         except (TypeError, ValueError):
             raise invalid_cursor() from None
     identity = await panel_reads.dataset_identity(db, dataset_id)
@@ -555,7 +559,10 @@ async def corporate_action_events(
     rows = await panel_reads.corporate_action_page(db, source, symbol, after=after, limit=limit + 1)
     page = rows[:limit]
     more = len(rows) > limit
-    return ActionPageView(
-        items=page,
-        next_cursor=_cursor(_ACTIONS_ROUTE, scope, [page[-1].as_of.isoformat(), str(page[-1].id)]) if more else '',
-    )
+    next_cursor = ''
+    if more:
+        last = page[-1]
+        last_date = panel_reads.action_sort_date(last)
+        key = [last_date.isoformat() if last_date else '', last.as_of.isoformat(), str(last.id)]
+        next_cursor = _cursor(_ACTIONS_ROUTE, scope, key)
+    return ActionPageView(items=page, next_cursor=next_cursor)
