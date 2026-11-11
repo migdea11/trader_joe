@@ -978,9 +978,14 @@ jobs:
               echo "::error::no ${service} container to inspect"
               exit 1
             fi
-            networks="$(docker inspect --format '{{range $name, $net := .NetworkSettings.Networks}}{{$name}} {{$net.IPAddress}} {{$net.GlobalIPv6Address}}{{println}}{{end}}' "${container}")"
-            echo "${service} networks (name, IPv4, IPv6):"
-            printf '%s\n' "${networks}"
+            networks_raw="$(docker inspect --format '{{range $name, $net := .NetworkSettings.Networks}}{{$name}} {{$net.IPAddress}} {{$net.GlobalIPv6Address}}{{println}}{{end}}' "${container}")"
+            echo "${service} networks (name, IPv4, IPv6), as docker reports them:"
+            printf '%s\n' "${networks_raw}"
+            # An unset IPv6 address renders as empty, as 'invalid IP' (two words) or as
+            # '<invalid IP>', depending on the engine. Keep after the name only the fields that are
+            # addresses (a dotted-quad IPv4, or anything with a colon, an IPv6), so no junk word is
+            # ever compared or dialled as an address.
+            networks="$(printf '%s\n' "${networks_raw}" | awk '{ line = $1; for (i = 2; i <= NF; i++) if ($i ~ /^[0-9]+[.][0-9]+[.][0-9]+[.][0-9]+$/ || $i ~ /:/) line = line " " $i; print line }')"
             ingest_store="$(printf '%s\n' "${networks}" | awk '$1 ~ /_ingest_store$/')"
             matches="$(printf '%s\n' "${ingest_store}" | awk 'NF { n++ } END { print n + 0 }')"
             if [ "${matches}" -ne 1 ]; then
@@ -1219,7 +1224,11 @@ jobs:
             echo "::error::no data_ingest container or no APP_INTERNAL_GRPC_PORT in it (port '${grpc_port}'), so its gRPC port cannot be probed"
             exit 1
           fi
+          # An unset IPv6 address renders as empty, 'invalid IP' or '<invalid IP>' depending on the
+          # engine; the first awk keeps only the fields that are addresses (dotted-quad IPv4 or
+          # containing a colon), so no junk word is dialled.
           grpc_addresses="$(docker inspect --format '{{range $name, $net := .NetworkSettings.Networks}}{{$name}} {{$net.IPAddress}} {{$net.GlobalIPv6Address}}{{println}}{{end}}' "${ingest_container}" \
+            | awk '{ line = $1; for (i = 2; i <= NF; i++) if ($i ~ /^[0-9]+[.][0-9]+[.][0-9]+[.][0-9]+$/ || $i ~ /:/) line = line " " $i; print line }' \
             | awk '$1 ~ /_ingest_store$/ { for (i = 2; i <= NF; i++) print $i }')"
           if [ -z "${grpc_addresses}" ]; then
             echo "::error::docker inspect reports no ingest_store address for data_ingest, so its gRPC port cannot be probed"
@@ -1265,7 +1274,10 @@ jobs:
             echo "::error::no data_store container or no APP_INTERNAL_GRPC_PORT in it (port '${store_grpc_port}'), so its gRPC port cannot be probed"
             exit 1
           fi
-          store_networks="$(docker inspect --format '{{range $name, $net := .NetworkSettings.Networks}}{{$name}} {{$net.IPAddress}} {{$net.GlobalIPv6Address}}{{println}}{{end}}' "${store_container}")"
+          # Same normalisation as above: an unset IPv6 address renders as empty, 'invalid IP' or
+          # '<invalid IP>' depending on the engine, and only address fields are kept.
+          store_networks="$(docker inspect --format '{{range $name, $net := .NetworkSettings.Networks}}{{$name}} {{$net.IPAddress}} {{$net.GlobalIPv6Address}}{{println}}{{end}}' "${store_container}" \
+            | awk '{ line = $1; for (i = 2; i <= NF; i++) if ($i ~ /^[0-9]+[.][0-9]+[.][0-9]+[.][0-9]+$/ || $i ~ /:/) line = line " " $i; print line }')"
           store_ingest_addresses="$(printf '%s\n' "${store_networks}" | awk '$1 ~ /_ingest_store$/ { for (i = 2; i <= NF; i++) print $i }')"
           store_all_addresses="$(printf '%s\n' "${store_networks}" | awk '{ for (i = 2; i <= NF; i++) print $i }')"
           if [ -z "${store_ingest_addresses}" ]; then

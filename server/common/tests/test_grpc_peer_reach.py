@@ -80,6 +80,7 @@ from common.tests.test_grpc_bind_network import (
     DS_API_V6,
     DS_DB_V4,
     DS_INGEST_V4,
+    DS_INGEST_V6,
     EGRESS_NET,
     EGRESS_V4,
     EGRESS_V6,
@@ -91,6 +92,7 @@ from common.tests.test_grpc_bind_network import (
     STORE_PORT,
     STORE_V4,
     STORE_V6,
+    UNSET_V6,
     _model,
     _net,
     _report,
@@ -996,6 +998,142 @@ async def test_the_lockdown_fails_on_any_reach_or_any_missing_fact(tmp_path: Pat
     result, logs = await _run_step(tmp_path, LOCKDOWN_STEP, build())
     assert result.returncode == 1, _report(result)
     assert not logs['unmodelled'], logs['unmodelled']
+    assert printed in result.stdout, f'expected the step to say {printed!r}:\n{_report(result)}'
+
+
+# --- tj-7zjov1.378: an unset IPv6 address, however the engine renders it ----------------------------
+#
+# Both lockdown inspect sites -- data_ingest's ingest_store addresses (probed from data_store, then
+# test_client) and data_store's addresses (probed from data_ingest, then test_client on every one) --
+# keep only the fields that are addresses. The scenario carries the engine's rendering of the unset
+# IPv6 as the GlobalIPv6Address string, which the shared renderer prints verbatim (pinned in
+# test_grpc_bind_network.py). A junk word that reached a probe would be dialled: the stub routes no
+# such host, so the call goes UNMODELLED, and the connect log shows it.
+
+JUNK_HOSTS = frozenset({'invalid', 'IP', '<invalid', 'IP>', ''})
+EXPECTED_STORE_CONNECTS = [(DATA_INGEST, DS_INGEST_V4)] + [
+    (TEST_CLIENT, address) for address in (DS_INGEST_V4, DS_API_V4, DS_DB_V4)
+]
+
+
+def _ingest_unset(unset: str) -> dict:
+    return {'networks': {STORE_NET: _net(STORE_V4, unset), EGRESS_NET: _net(EGRESS_V4, unset)}}
+
+
+def _store_unset(unset: str) -> dict:
+    return {
+        'store_networks': {
+            STORE_NET: _net(DS_INGEST_V4, unset),
+            API_NET: _net(DS_API_V4, unset),
+            DB_NET: _net(DS_DB_V4, unset),
+        }
+    }
+
+
+def _probes(logs: dict, port: str) -> list[tuple[str, str]]:
+    return [(call['container'], call['host']) for call in logs['connect'] if call['port'] == int(port)]
+
+
+def _assert_no_junk_dialled(logs: dict, result: subprocess.CompletedProcess) -> None:
+    dialled = {call['host'] for call in logs['connect']}
+    assert not dialled & JUNK_HOSTS, f'a non-address was dialled: {sorted(dialled & JUNK_HOSTS)}\n{_report(result)}'
+    assert not logs['unmodelled'], logs['unmodelled']
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('unset', list(UNSET_V6.values()), ids=list(UNSET_V6))
+async def test_the_lockdown_probes_only_data_ingests_real_addresses_when_its_ipv6_is_unset(tmp_path: Path, unset: str):
+    """Site 2: data_ingest's ingest_store address set is its IPv4 address alone, probed control first."""
+    result, logs = await _run_step(tmp_path, LOCKDOWN_STEP, _lockdown_scenario(**_ingest_unset(unset)))
+    assert result.returncode == 0, _report(result)
+    _assert_no_junk_dialled(logs, result)
+    assert _probes(logs, PORT) == [(DATA_STORE, STORE_V4), (TEST_CLIENT, STORE_V4)], logs['connect']
+    assert _probes(logs, STORE_PORT) == EXPECTED_STORE_CONNECTS, logs['connect']
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('unset', list(UNSET_V6.values()), ids=list(UNSET_V6))
+async def test_the_lockdown_probes_only_data_stores_real_addresses_when_its_ipv6_is_unset(tmp_path: Path, unset: str):
+    """Site 3: the control dials data_store's ingest_store IPv4 alone, test_client its three IPv4 addresses."""
+    result, logs = await _run_step(tmp_path, LOCKDOWN_STEP, _lockdown_scenario(**_store_unset(unset)))
+    assert result.returncode == 0, _report(result)
+    _assert_no_junk_dialled(logs, result)
+    assert _probes(logs, PORT) == [(DATA_STORE, STORE_V4), (TEST_CLIENT, STORE_V4)], logs['connect']
+    assert _probes(logs, STORE_PORT) == EXPECTED_STORE_CONNECTS, logs['connect']
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('unset', list(UNSET_V6.values()), ids=list(UNSET_V6))
+async def test_the_lockdown_still_probes_a_real_ipv6_beside_an_unset_one(tmp_path: Path, unset: str):
+    """Dual-stack on ingest_store for both services, the other networks unset: each real IPv6 is dialled as one."""
+    reach = {
+        DATA_STORE: {f'{STORE_V6} {PORT}': 0},
+        DATA_INGEST: {f'{DS_INGEST_V6} {STORE_PORT}': 0},
+        TEST_CLIENT: {f'{STORE_V6} {PORT}': errno.ENETUNREACH, f'{DS_INGEST_V6} {STORE_PORT}': errno.ENETUNREACH},
+    }
+    scenario = _lockdown_scenario(
+        reach,
+        networks={STORE_NET: _net(STORE_V4, STORE_V6), EGRESS_NET: _net(EGRESS_V4, unset)},
+        store_networks={
+            STORE_NET: _net(DS_INGEST_V4, DS_INGEST_V6),
+            API_NET: _net(DS_API_V4, unset),
+            DB_NET: _net(DS_DB_V4, unset),
+        },
+    )
+    result, logs = await _run_step(tmp_path, LOCKDOWN_STEP, scenario)
+    assert result.returncode == 0, _report(result)
+    _assert_no_junk_dialled(logs, result)
+    assert _probes(logs, PORT) == [
+        (DATA_STORE, STORE_V4),
+        (TEST_CLIENT, STORE_V4),
+        (DATA_STORE, STORE_V6),
+        (TEST_CLIENT, STORE_V6),
+    ], logs['connect']
+    assert _probes(logs, STORE_PORT) == [
+        (DATA_INGEST, DS_INGEST_V4),
+        (DATA_INGEST, DS_INGEST_V6),
+        (TEST_CLIENT, DS_INGEST_V4),
+        (TEST_CLIENT, DS_INGEST_V6),
+        (TEST_CLIENT, DS_API_V4),
+        (TEST_CLIENT, DS_DB_V4),
+    ], logs['connect']
+    v6_families = {call['family'] for call in logs['connect'] if call['host'] in (STORE_V6, DS_INGEST_V6)}
+    assert v6_families == {int(socket.AF_INET6)}, logs['connect']
+
+
+# (scenario builder taking the rendering, the fragment the step prints)
+_LOCKDOWN_UNSET_FAILING = {
+    'site 2: test_client connects to the gRPC port': (
+        lambda unset: _lockdown_scenario({TEST_CLIENT: {f'{STORE_V4} {PORT}': 0}}, **_ingest_unset(unset)),
+        f"test_client connected to data_ingest's gRPC port at {STORE_V4}:{PORT}",
+    ),
+    'site 2: inspect reports no ingest_store address': (
+        lambda unset: _lockdown_scenario(networks={STORE_NET: _net('', unset), EGRESS_NET: _net(EGRESS_V4, unset)}),
+        'docker inspect reports no ingest_store address for data_ingest',
+    ),
+    'site 3: test_client connects to the store gRPC port on store_api': (
+        lambda unset: _lockdown_scenario({TEST_CLIENT: {f'{DS_API_V4} {STORE_PORT}': 0}}, **_store_unset(unset)),
+        f"test_client connected to data_store's gRPC port at {DS_API_V4}:{STORE_PORT}",
+    ),
+    'site 3: inspect reports no ingest_store address for data_store': (
+        lambda unset: _lockdown_scenario(
+            store_networks={STORE_NET: _net('', unset), API_NET: _net(DS_API_V4, unset), DB_NET: _net(DS_DB_V4, unset)}
+        ),
+        'docker inspect reports no ingest_store address for data_store',
+    ),
+}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('unset', list(UNSET_V6.values()), ids=list(UNSET_V6))
+@pytest.mark.parametrize(
+    ('build', 'printed'), list(_LOCKDOWN_UNSET_FAILING.values()), ids=list(_LOCKDOWN_UNSET_FAILING)
+)
+async def test_the_lockdown_keeps_its_meaning_with_an_unset_ipv6(tmp_path: Path, unset: str, build, printed: str):
+    """A reach from test_client, or no ingest_store address, still fails with the same message; no junk is dialled."""
+    result, logs = await _run_step(tmp_path, LOCKDOWN_STEP, build(unset))
+    assert result.returncode == 1, _report(result)
+    _assert_no_junk_dialled(logs, result)
     assert printed in result.stdout, f'expected the step to say {printed!r}:\n{_report(result)}'
 
 

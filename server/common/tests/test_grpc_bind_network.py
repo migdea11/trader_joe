@@ -57,6 +57,7 @@ from common.tests.compose_model import BASE_FILE, InterpolationRefused, interpol
 from common.tests.test_ci_invariants import (
     ENV_DEFAULT_FILE,
     GRPC_BIND_STEP,
+    LOCKDOWN_STEP,
     MAKEFILE,
     REPO_ROOT,
     _compose_calls,
@@ -749,3 +750,193 @@ def test_the_stub_refuses_what_it_does_not_model(template: str):
     data = {'NetworkSettings': {'Networks': {'a_net': {'IPAddress': '10.0.0.1'}}}}
     with pytest.raises(stub.Unmodelled):
         stub.render_template(template, data)
+
+
+# --- tj-7zjov1.378: an unset IPv6 address, however the engine renders it ----------------------------
+#
+# Go's netip.Addr zero value prints as 'invalid IP' on current engines (the owner's runner logged the
+# ingest_store line as '172.20.0.2 invalid IP'), older engines print an empty string, and some print
+# '<invalid IP>'. The step keeps after the network name only the fields that are addresses. The
+# scenario carries the rendering as the GlobalIPv6Address string itself, which the stub's renderer
+# prints verbatim, so the step meets the very bytes the engine would print.
+
+UNSET_V6 = {'empty': '', 'invalid IP': 'invalid IP', '<invalid IP>': '<invalid IP>'}
+JUNK_WORDS = frozenset({'invalid', 'IP', '<invalid', 'IP>'})
+_INSPECT_FORMAT = re.compile(r"docker inspect --format '([^']*)'")
+
+
+def test_every_networks_template_in_the_workflow_is_the_one_the_stub_renders_the_unset_ipv6_through():
+    """The three inspect sites share one template, and the stub renders it as the engine printed it.
+
+    The owner's runner printed the ingest_store line as '<network> 172.20.0.2 invalid IP'. The stub
+    renders the scenario's GlobalIPv6Address string verbatim, so a scenario carrying 'invalid IP'
+    reproduces that line byte for byte, and the step under test parses what the engine printed.
+    """
+    templates = _INSPECT_FORMAT.findall(_system_step(GRPC_BIND_STEP).get('run') or '')
+    templates += _INSPECT_FORMAT.findall(_system_step(LOCKDOWN_STEP).get('run') or '')
+    assert len(templates) == 3, f'expected the three inspect sites of tj-7zjov1.378, found {templates}'
+    assert len(set(templates)) == 1, f'the inspect sites use different templates: {templates}'
+    data = {'NetworkSettings': {'Networks': {STORE_NET: _net('172.20.0.2', 'invalid IP')}}}
+    assert stub.render_template(templates[0], data) == f'{STORE_NET} 172.20.0.2 invalid IP\n'
+    for rendering in UNSET_V6.values():
+        data = {'NetworkSettings': {'Networks': {STORE_NET: _net(STORE_V4, rendering)}}}
+        assert stub.render_template(templates[0], data) == f'{STORE_NET} {STORE_V4} {rendering}\n'
+
+
+def _ingest_networks(unset: str) -> dict:
+    return {STORE_NET: _net(STORE_V4, unset), EGRESS_NET: _net(EGRESS_V4, unset)}
+
+
+def _store_networks(unset: str) -> dict:
+    return {STORE_NET: _net(DS_INGEST_V4, unset), API_NET: _net(DS_API_V4, unset), DB_NET: _net(DS_DB_V4, unset)}
+
+
+def _unset_scenario(unset: str, side: str, **changes: object) -> dict:
+    """A healthy stack whose SIDE ('ingest', 'store' or 'both') renders every unset IPv6 as UNSET."""
+    store = _store_scenario(**({'networks': _store_networks(unset)} if side in ('store', 'both') else {}))
+    scenario = _scenario(**{stub.DATA_STORE: store})
+    if side in ('ingest', 'both'):
+        scenario['networks'] = _ingest_networks(unset)
+    scenario.update(changes)
+    return scenario
+
+
+def _address_line(result: subprocess.CompletedProcess, service: str) -> str:
+    prefix = f"{service}'s ingest_store address(es): "
+    lines = [line for line in result.stdout.splitlines() if line.startswith(prefix)]
+    assert len(lines) == 1, _report(result)
+    return lines[0][len(prefix) :]
+
+
+@pytest.mark.parametrize('side', ['ingest', 'store', 'both'])
+@pytest.mark.parametrize('unset', list(UNSET_V6.values()), ids=list(UNSET_V6))
+def test_the_bind_check_ignores_an_unset_ipv6_however_the_engine_renders_it(tmp_path: Path, unset: str, side: str):
+    """The step passes, and each service's ingest_store address set is its IPv4 address alone.
+
+    The raw inspect output is still printed as the engine gave it, so the CI log shows what was dropped.
+    """
+    result, docker, _ = _run_step(tmp_path, _unset_scenario(unset, side))
+    assert result.returncode == 0, _report(result)
+    assert 'not modelled' not in result.stderr, _report(result)
+    _assert_checked_both_services(result, docker)
+    assert _address_line(result, DATA_INGEST) == STORE_V4, _report(result)
+    assert _address_line(result, stub.DATA_STORE) == DS_INGEST_V4, _report(result)
+    if unset:
+        raw = f'{STORE_NET} {STORE_V4} {unset}' if side != 'store' else f'{STORE_NET} {DS_INGEST_V4} {unset}'
+        assert raw in result.stdout.splitlines(), (
+            f'the raw inspect line {raw!r} is no longer printed:\n{_report(result)}'
+        )
+
+
+@pytest.mark.parametrize('unset', list(UNSET_V6.values()), ids=list(UNSET_V6))
+def test_the_bind_check_keeps_a_real_ipv6_beside_an_unset_one(tmp_path: Path, unset: str):
+    """Dual-stack on ingest_store, the other networks IPv4-only: the real IPv6 is kept and still compared."""
+    scenario = _scenario(
+        resolves={HOST: [STORE_V4, STORE_V6]},
+        networks={STORE_NET: _net(STORE_V4, STORE_V6), EGRESS_NET: _net(EGRESS_V4, unset)},
+        **{
+            stub.DATA_STORE: _store_scenario(
+                resolves={STORE_HOST: [DS_INGEST_V4, DS_INGEST_V6]},
+                networks={
+                    STORE_NET: _net(DS_INGEST_V4, DS_INGEST_V6),
+                    API_NET: _net(DS_API_V4, unset),
+                    DB_NET: _net(DS_DB_V4, unset),
+                },
+            )
+        },
+    )
+    result, docker, _ = _run_step(tmp_path, scenario)
+    assert result.returncode == 0, _report(result)
+    _assert_checked_both_services(result, docker)
+    assert _address_line(result, DATA_INGEST) == f'{STORE_V4} {STORE_V6}', _report(result)
+    assert _address_line(result, stub.DATA_STORE) == f'{DS_INGEST_V4} {DS_INGEST_V6}', _report(result)
+
+    # The IPv6 is still compared, not merely tolerated: the name answering IPv4 alone fails.
+    missing_v6 = {**scenario, stub.DATA_STORE: {**scenario[stub.DATA_STORE], 'resolves': {STORE_HOST: [DS_INGEST_V4]}}}
+    second_run = tmp_path / 'ipv4-only'
+    second_run.mkdir()
+    result, _, _ = _run_step(second_run, missing_v6)
+    assert result.returncode == 1, _report(result)
+    assert f'not to its ingest_store address(es) [{DS_INGEST_V4} {DS_INGEST_V6}] alone' in result.stdout, _report(
+        result
+    )
+
+
+SECOND_ADDRESS = '172.20.0.9'
+# (scenario builder taking the rendering, the failing service, the fragment its one ::error:: line carries)
+_UNSET_FAILING = {
+    'the name answers with the egress address': (
+        lambda unset: _unset_scenario(unset, 'both', resolves={HOST: [EGRESS_V4]}),
+        DATA_INGEST,
+        f'{HOST} resolves inside {DATA_INGEST} to {EGRESS_V4}, its address on {EGRESS_NET}, which is not ingest_store',
+    ),
+    'the name answers with a second address': (
+        lambda unset: _unset_scenario(unset, 'both', resolves={HOST: [STORE_V4, SECOND_ADDRESS]}),
+        DATA_INGEST,
+        f'to [{STORE_V4} {SECOND_ADDRESS}], not to its ingest_store address(es) [{STORE_V4}] alone',
+    ),
+    'inspect reports no ingest_store address': (
+        lambda unset: _unset_scenario(
+            unset, 'both', networks={STORE_NET: _net('', unset), EGRESS_NET: _net(EGRESS_V4, unset)}
+        ),
+        DATA_INGEST,
+        f'docker inspect reports no address for {DATA_INGEST} on ingest_store',
+    ),
+    'the store alias answers with the store_api address': (
+        lambda unset: _unset_scenario(
+            unset,
+            'both',
+            **{stub.DATA_STORE: _store_scenario(networks=_store_networks(unset), resolves={STORE_HOST: [DS_API_V4]})},
+        ),
+        stub.DATA_STORE,
+        f'{STORE_HOST} resolves inside data_store to {DS_API_V4}, its address on {API_NET}, which is not ingest_store',
+    ),
+    'the store alias answers with a second address': (
+        lambda unset: _unset_scenario(
+            unset,
+            'both',
+            **{
+                stub.DATA_STORE: _store_scenario(
+                    networks=_store_networks(unset), resolves={STORE_HOST: [DS_INGEST_V4, SECOND_ADDRESS]}
+                )
+            },
+        ),
+        stub.DATA_STORE,
+        f'to [{DS_INGEST_V4} {SECOND_ADDRESS}], not to its ingest_store address(es) [{DS_INGEST_V4}] alone',
+    ),
+    'inspect reports no ingest_store address for data_store': (
+        lambda unset: _unset_scenario(
+            unset,
+            'both',
+            **{
+                stub.DATA_STORE: _store_scenario(
+                    networks={
+                        STORE_NET: _net('', unset),
+                        API_NET: _net(DS_API_V4, unset),
+                        DB_NET: _net(DS_DB_V4, unset),
+                    }
+                )
+            },
+        ),
+        stub.DATA_STORE,
+        'docker inspect reports no address for data_store on ingest_store',
+    ),
+}
+
+
+@pytest.mark.parametrize('unset', list(UNSET_V6.values()), ids=list(UNSET_V6))
+@pytest.mark.parametrize(('build', 'service', 'fragment'), list(_UNSET_FAILING.values()), ids=list(_UNSET_FAILING))
+def test_the_bind_check_keeps_its_meaning_with_an_unset_ipv6(
+    tmp_path: Path, unset: str, build, service: str, fragment: str
+):
+    """A mis-bound name, an extra address or no ingest_store address still fails, with the same message."""
+    result, docker, _ = _run_step(tmp_path, build(unset))
+    assert result.returncode == 1, _report(result)
+    assert 'not modelled' not in result.stderr, _report(result)
+    errors = [line for line in result.stdout.splitlines() if line.startswith('::error::')]
+    assert len(errors) == 1 and fragment in errors[0], (
+        f'expected one ::error:: carrying {fragment!r}:\n{_report(result)}'
+    )
+    assert not JUNK_WORDS & set(errors[0].replace('[', ' ').replace(']', ' ').split()), _report(result)
+    if service == DATA_INGEST:
+        assert not _execs_into(docker, stub.DATA_STORE), f'the step went on to data_store after failing: {docker}'
