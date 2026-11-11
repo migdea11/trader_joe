@@ -1656,9 +1656,13 @@ describe('PanelSourceSettingsForm', () => {
     expect(form.find('label[for="source-cap"]').text()).toBe('Requests per Hour')
     const hint = form.findAll('.pn-hint').map((p) => p.text().replace(/\s+/g, ' '))
     expect(hint).toContain(
-      'Leave new datasets per hour or requests per hour empty for no limit. The requests minimum is 2: each new panel dataset costs 2 requests. To pause a panel, turn Enabled off. The corporate action days are the span before a dataset\'s start and after its end that actions are pulled for.',
+      'Leave new datasets per hour or requests per hour empty for no limit. The requests minimum is 2: each new panel dataset costs 2 requests. To pause a panel, turn Enabled off. The corporate action days are saved and shown, but they do not yet limit any corporate action fetch.',
     )
     expect(form.text()).not.toContain('pauses')
+    // Nothing reads the window yet (tj-7zjov1.369): the hint must not claim the days bound what is fetched.
+    const text = form.text().replace(/\s+/g, ' ')
+    expect(text).not.toContain('pulled for')
+    expect(text).not.toMatch(/span before a dataset/i)
   })
 
   // Live validation (tj-crl7pm): the one-line problem and Save follow each keystroke, no press needed.

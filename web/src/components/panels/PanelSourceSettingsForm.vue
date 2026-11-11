@@ -186,8 +186,8 @@ async function save(): Promise<void> {
       </div>
       <p class="pn-hint">
         Leave new datasets per hour or requests per hour empty for no limit. The requests minimum is 2: each new
-        panel dataset costs 2 requests. To pause a panel, turn Enabled off. The corporate action days are the span before a
-        dataset's start and after its end that actions are pulled for.
+        panel dataset costs 2 requests. To pause a panel, turn Enabled off. The corporate action days are saved and shown, but
+        they do not yet limit any corporate action fetch.
       </p>
       <p
         v-if="problem"
