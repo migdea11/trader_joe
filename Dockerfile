@@ -230,7 +230,7 @@ RUN --mount=type=bind,from=web_gen,target=/gen/proto/ts \
 # The server. Caddy serves /srv and proxies the one data_store route (deploy/web/Caddyfile). Non-root
 # on the unprivileged port 8080. XDG_* point at /tmp, which compose mounts as tmpfs, because the root
 # filesystem is read-only there and Caddy writes a little state under them.
-FROM caddy:2.11.7-alpine@sha256:d8542f48d34a9cf4e4c11a478865229840e87e4c96ea3f439101f31a5d35f75f AS web_image
+FROM caddy:2.11.9-alpine@sha256:0bbb055bda6793c999bde78b1b5ce3e89f829fb031af2cf50056ea1246559fee AS web_image
 COPY --from=web_build_image /web/dist /srv
 RUN --mount=type=bind,from=web_deploy,source=Caddyfile,target=/mnt/Caddyfile cp /mnt/Caddyfile /etc/caddy/Caddyfile
 ENV XDG_DATA_HOME=/tmp/caddy-data XDG_CONFIG_HOME=/tmp/caddy-config
