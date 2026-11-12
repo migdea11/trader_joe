@@ -27,6 +27,12 @@ run's symbol survives in either table. Nothing is truncated, and nothing is dele
 did not create, so the suite is safe to point at a database that holds other data and passes on
 a second consecutive run (the symbol and owner are new each time).
 
+THE INGEST RECORDS ARE CLEANED LAST, by pattern (tj-7zjov1.380). Every POST /store writes ingest_request rows (the
+bars request and the name_change clamp's corporate-actions request) and, per attempt, ingest_run rows, none of which
+any entry cascade reaches. `ingest_records_cleanup` deletes, at the very end of the session, every ingest_request,
+ingest_run and corporate_action row carrying this run's symbol (bare or scenario-prefixed) or owner, and fails if
+one survives. CI's Seed Dump runs straight after the suite on the same database and refuses any such row.
+
 NO DOCKER, NO MIGRATION, NO DOWNGRADE is driven from here. The stack is already up and migrated
 when the suite starts; the make target says so and does neither.
 
@@ -58,6 +64,9 @@ from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
 from common.enums.data_select import AssetType, DataType
 from common.enums.data_stock import DataSource, ExpiryType, Feed, Granularity, UpdateType
+from data.store.app.database.models.corporate_action import CorporateAction
+from data.store.app.database.models.ingest_request import IngestRequest
+from data.store.app.database.models.ingest_run import IngestRun
 from data.store.app.database.models.stock_market_activity import StockMarketActivity
 from data.store.app.database.models.store_dataset_entry import StoreDatasetEntry
 from routers.common.app_endpoints import InterfaceRest
@@ -881,6 +890,80 @@ def scenario_entries(pg_engine: Engine, run_identity: RunIdentity) -> Iterator[C
         pytest.fail(
             f'system suite cleanup: {entries_left} entries and {bars_left} bars with a scenario-prefixed '
             f"{run_identity.symbol}* symbol survived the delete of this run's {len(ids)} scenario entries",
+            pytrace=False,
+        )
+
+
+REQUEST_TABLE = IngestRequest.__table__
+RUN_TABLE = IngestRun.__table__
+CORPORATE_ACTION_TABLE = CorporateAction.__table__
+
+
+def run_symbol_prefixes(run_identity: RunIdentity) -> list[str]:
+    """Every symbol prefix this run writes under: its own symbol, and that symbol behind each FakeRead scenario prefix."""
+    return [run_identity.symbol, *(f'{prefix}{run_identity.symbol}' for prefix in SCENARIO_PREFIXES)]
+
+
+def _this_runs_rows(table: sa.Table, symbol_column: str, owner_column: str | None, run_identity: RunIdentity):
+    """The WHERE clause that matches a row of `table` this run wrote: by its symbol prefix, or by its owner prefix.
+
+    startswith(autoescape=True), so the underscore in a scenario prefix (EMPTY_, FAIL_) is literal, not LIKE's wildcard.
+    The owner prefix takes alt_owner's suffixes (system-test-<run>-overlap, -identity) too; it is never a prefix of
+    another run's owner, because the run id is a fixed eight hex characters.
+    """
+    symbol = table.c[symbol_column]
+    clauses = [symbol.startswith(prefix, autoescape=True) for prefix in run_symbol_prefixes(run_identity)]
+    if owner_column is not None:
+        clauses.append(table.c[owner_column].startswith(run_identity.owner, autoescape=True))
+    return sa.or_(*clauses)
+
+
+@pytest.fixture(scope='session', autouse=True)
+def ingest_records_cleanup(pg_settings: PgSettings, run_identity: RunIdentity) -> Iterator[None]:
+    """Delete every ingest request, attempt row and corporate action this run wrote, at the END of the session.
+
+    Autouse and session-scoped, so it is set up ahead of the fixtures the tests request and torn down after them: the
+    entry registries have deleted this run's entries (so the DAILY refresh can no longer owe one of them a request)
+    before this runs, and nothing a test reads mid-suite is gone early. Matched by pattern, never by a recorded id,
+    because the rows are written by the store, not by the suite: ingest_request by asset_symbol or client_label (the
+    POST's owner; a DAILY refresh request carries the scheduler's label and the run's symbol), ingest_run by
+    asset_symbol or actor, corporate_action by requesting_symbol, and the attempt rows and observations of every matched
+    request by request_id as well. Then it counts what still matches and fails naming the counts, as the entry
+    registries do: CI's Seed Dump runs straight after the suite on this database and refuses every such row.
+
+    It takes pg_settings, not pg_engine, and opens its own engine only here at the end, so a test that needs no
+    Postgres is not made to connect at setup.
+    """
+    yield
+    engine = sa.create_engine(
+        pg_settings.url(), connect_args={'connect_timeout': pg_settings.connect_timeout}, pool_pre_ping=True
+    )
+    requests = _this_runs_rows(REQUEST_TABLE, 'asset_symbol', 'client_label', run_identity)
+    runs = _this_runs_rows(RUN_TABLE, 'asset_symbol', 'actor', run_identity)
+    actions = _this_runs_rows(CORPORATE_ACTION_TABLE, 'requesting_symbol', None, run_identity)
+    request_ids = sa.select(REQUEST_TABLE.c.id).where(requests).scalar_subquery()
+    try:
+        with engine.begin() as conn:
+            # Children of the matched requests first, while the subquery can still find them; no foreign key orders it.
+            conn.execute(sa.delete(RUN_TABLE).where(sa.or_(runs, RUN_TABLE.c.request_id.in_(request_ids))))
+            conn.execute(
+                sa.delete(CORPORATE_ACTION_TABLE).where(
+                    sa.or_(actions, CORPORATE_ACTION_TABLE.c.request_id.in_(request_ids))
+                )
+            )
+            conn.execute(sa.delete(REQUEST_TABLE).where(requests))
+        with engine.connect() as conn:
+            left = {
+                table.name: conn.execute(sa.select(sa.func.count()).select_from(table).where(clause)).scalar_one()
+                for table, clause in ((REQUEST_TABLE, requests), (RUN_TABLE, runs), (CORPORATE_ACTION_TABLE, actions))
+            }
+    finally:
+        engine.dispose()
+    if any(left.values()):
+        counts = ', '.join(f'{count} {name}' for name, count in left.items())
+        pytest.fail(
+            f'system suite cleanup: {counts} row(s) with symbol {run_identity.symbol}* (bare or scenario-prefixed) '
+            f"or owner {run_identity.owner}* survived the delete of this run's ingest records",
             pytrace=False,
         )
 
