@@ -10,9 +10,10 @@ import vue from '@vitejs/plugin-vue'
 // answer 400 to a spelling prod forwards. A path the proxy does not own (/api/ingest/*, //api/...)
 // falls through to Vite's SPA fallback, where prod answers 404 (known gap, follow-up tj-xc3laz).
 // Under /api/store it:
-//   1. forwards only the four Caddy rules (see isAllowedStoreRequest): GET and HEAD under
+//   1. forwards only the Caddy rules (see isAllowedStoreRequest): GET and HEAD under
 //      /api/store/ui/v1/ (the events WebSocket upgrade is a GET), PATCH on one dataset's /expiry,
-//      PATCH on one dataset's /collecting, and DELETE on one dataset. Anything else answers 404 here without
+//      PATCH on one dataset's /collecting, DELETE on one dataset, and the three panel POSTs (create a
+//      panel, save one panel's settings version, save one source's settings version). Anything else answers 404 here without
 //      reaching data_store; a path containing '..' answers 400 (stricter than Caddy, whose @traversal 400 never fires under /api:
 //      there a traversal is cleaned onto the /api/* 404 and a literal a..b is forwarded). The decision is made on the
 //      DECODED, CLEANED path, as Caddy matches (it decodes and cleans before it matches): http-proxy
@@ -50,10 +51,14 @@ export function resolveDevProxyTarget(env: Readonly<Record<string, string | unde
 
 const UI_V1_PREFIX = '/api/store/ui/v1/'
 const UUID = '[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}'
-// Character for character the Caddyfile's @store_ui_expiry, @store_ui_collecting and @store_ui_delete regexes.
+// Character for character the Caddyfile's @store_ui_expiry, @store_ui_collecting, @store_ui_delete and
+// panel write regexes.
 const EXPIRY_PATH = new RegExp(`^/api/store/ui/v1/datasets/${UUID}/expiry$`)
 const COLLECTING_PATH = new RegExp(`^/api/store/ui/v1/datasets/${UUID}/collecting$`)
 const DELETE_PATH = new RegExp(`^/api/store/ui/v1/datasets/${UUID}$`)
+const PANEL_CREATE_PATH = /^\/api\/store\/ui\/v1\/panels$/
+const PANEL_SETTINGS_PATH = new RegExp(`^/api/store/ui/v1/panels/${UUID}/settings-versions$`)
+const PANEL_SOURCE_SETTINGS_PATH = /^\/api\/store\/ui\/v1\/panel-sources\/DATA_SOURCE_[A-Z0-9_]+\/settings-versions$/
 
 function pathOnly(url: string): string {
   const q = url.indexOf('?')
@@ -70,7 +75,7 @@ const ENCODED_SEPARATOR = /%2f|%5c/i
  * character such as %0a decodes to something the raw path is not, so the bypass's raw-equals-cleaned
  * check refuses it.) The query string is excluded. Caddy is looser: it forwards %252e, %5c, %2f, a..b, // and
  * <uuid>%2fexpiry when they stay under /ui/v1, and data_store answers 404 or routes them to the same route, so
- * none reaches a write route other than the three intended (expiry, collecting, delete). This dev proxy refuses all of them with 400, so dev
+ * none reaches a write route other than the six intended (expiry, collecting, delete and the three panel POSTs). This dev proxy refuses all of them with 400, so dev
  * is stricter than prod.
  */
 function decodePath(path: string): string | null {
@@ -101,13 +106,14 @@ export function isTraversalPath(path: string): boolean {
 }
 
 /**
- * Whether the prod proxy forwards this request: the Caddyfile's four rules, matched on the unstripped
+ * Whether the prod proxy forwards this request: the Caddyfile's rules (reads, three dataset writes, three panel POSTs), matched on the unstripped
  * path (the query string is ignored, the method is compared upper-cased).
  */
 export function isAllowedStoreRequest(method: string, path: string): boolean {
   const p = pathOnly(path)
   const m = method.toUpperCase()
   if (m === 'GET' || m === 'HEAD') return p.startsWith(UI_V1_PREFIX)
+  if (m === 'POST') return PANEL_CREATE_PATH.test(p) || PANEL_SETTINGS_PATH.test(p) || PANEL_SOURCE_SETTINGS_PATH.test(p)
   if (m === 'PATCH') return EXPIRY_PATH.test(p) || COLLECTING_PATH.test(p)
   if (m === 'DELETE') return DELETE_PATH.test(p)
   return false

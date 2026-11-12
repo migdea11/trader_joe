@@ -3,14 +3,17 @@
 # Keep sorted. Adding an interface is meant to cost a line here, in the same diff.
 #
 # ZERO IS A DECLARATION HERE, NOT AN OVERSIGHT -- decision tj-3wgh03. data_ingest exposes nothing
-# this file can enumerate: routers/data_ingest holds a domain handler (fetch_dataset_handler.py) and
-# no wire type at all, by decision tj-tkm4tn D1, and it registers no HTTP route.
+# this file can enumerate: routers/data_ingest holds domain handlers (submit_handler.py,
+# instance_handler.py) and no wire type at all, by decision tj-tkm4tn D1, and it registers no HTTP
+# route. fetch_dataset_handler.py was the first of them until tj-7zjov1.275 deleted it with the
+# FetchDataset pull stream (owner ruling 2026-11-02 on tj-7zjov1.18).
 #
 # DO NOT READ THIS AS "data_ingest HAS NO INTERFACE". Its real interface is the gRPC IngestService,
 # built by common/rpc/ingest.py and registered in data/ingest/app/grpc_host.py -- outside routers/,
 # where ADR tj-8konfu D3 keeps the generated package. It is pinned where it lives, by
 # data/ingest/tests/test_grpc_host.py, which asserts in a fresh interpreter that registered_services()
-# returns exactly that service. Each surface is pinned where it lives (tj-3wgh03 D4).
+# returns exactly that service, built with no fetch handler. Each surface is pinned where it lives
+# (tj-3wgh03 D4).
 #
 # Until tj-3mk3u5.32 this file held one `rpc` line, for the Kafka RPC handler that tj-3mk3u5.11
 # deletes. An HTTP route added to routers/data_ingest later still reds this test.

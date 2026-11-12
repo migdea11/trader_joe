@@ -10,8 +10,8 @@ What only Postgres shows, and is pinned here:
   * the pending predicate compares timestamptz INSTANTS through asyncpg (SQLite compares wall-clock text);
   * the delete cascades through the real ON DELETE CASCADE foreign key and the record counts the bars it took;
   * the deletion row's SensitiveString owner, gen_random_uuid() id and now() timestamp round-trip;
-  * the real audit_tables_exist (to_regclass) answers False before revision d7e2a9c35b18, and the enabled pass then
-    deletes nothing;
+  * the real audit_tables_exist (to_regclass) answers False when the audit tables are absent, and the enabled pass
+    then deletes nothing;
   * the running ingest_run partial-index read finds the RUNNING dataset.
 And, over real HTTP against the running stack: GET /ui/v1/reaper/pending lists an expired dataset this run created,
 flagged reaperPending, and the stack (default env) reports deletesEnabled false.
@@ -220,12 +220,9 @@ async def test_enabled_on_postgres_before_the_audit_revision_deletes_nothing(
 ):
     """The REAL to_regclass probe answers False when the audit tables are absent, so nothing is deleted unrecorded.
 
-    THE ABSENCE IS MADE AT HEAD, NOT BY STOPPING AT b3d9e1a47c62 (tj-grna9p.176). This test used to migrate only to
-    PRE_AUDIT_REVISION, which worked while every revision after it left store_dataset_entry alone. e5c8b1d4f703 adds
-    store_dataset_entry.collect, and the head's reaper reads the whole entry row (and the seed's RETURNING names
-    every model column), so a database below that revision is no longer one the head's code can run on at all. The
-    audit tables are renamed away and back instead: to_regclass sees exactly what it saw below d7e2a9c35b18, on an
-    entry table the head's code matches.
+    THE ABSENCE IS MADE AT HEAD (tj-grna9p.176). Since the alpha baseline (ADR tj-kg521d) there is no revision
+    below the audit tables at all, and the head's reaper reads the whole entry row anyway. The audit tables are
+    renamed away and back: to_regclass sees a database without them, on an entry table the head's code matches.
     """
     scratch_db.must('upgrade', _head())
     seeded = _seed(scratch_db.engine, entry_values, bar_values, run_identity)

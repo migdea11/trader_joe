@@ -1,52 +1,299 @@
-// THE data_ingest -> data_store BOOTSTRAP CONTRACT (tj-grna9p.44; decision tj-grna9p.9 item 6).
-// This is the OPPOSITE direction to ingest.proto: data_store serves it and data_ingest calls it,
-// once, at start-up, to rebuild what ingest holds only in memory.
+// THE data_ingest -> data_store RESULT-PATH CONTRACT (tj-7zjov1.14, P31; owner rulings of 2026-10-24 on
+// tj-26jt9w: push result path, store gRPC server, acknowledged attempts, restart re-request).
+// This is the OPPOSITE direction to ingest.proto: data_store serves it and data_ingest calls it.
+//   DeliverAttempt    client-streaming. Ingest reports ONE attempt, success or failure, and the answer is
+//                     the acknowledgement. The store has written everything durably before it answers.
+//   RegisterInstance  unary. Ingest announces the id it minted at start (the restart marker).
+// Bootstrap, the one call this file declared before, is REMOVED: it was never served, and the restart
+// ruling inverts it (the store re-requests what the old instance held; ingest reads nothing from the
+// store at start). Its messages (BootstrapRequest, BootstrapResponse, QuotaWindow, RequestRef,
+// WindowUsage) go with it. This is the only non-additive change here; the package is internal, so
+// buf breaking ignores it.
+//
+// THE ACK GATE IS PART OF THE CONTRACT. Every attempt, success or failure, is reported and acknowledged
+// before ingest runs a retry or makes any further vendor call for that request. The store writes the
+// attempt record, any data, the durable attempt count, the summed spend and the verdict in ONE
+// transaction, commits, and only then answers. A report that does not reach the store, or whose answer
+// does not reach ingest, is REDELIVERED with the SAME attempt number: that is not a broker retry and
+// costs no vendor call. DeliverAttempt is IDEMPOTENT on (request_id, attempt_no) in its header; a
+// duplicate is answered from the stored row and writes nothing.
 //
 // INTERNAL: both ends ship from this repository in one release, and buf's breaking checks ignore
-// trader_joe.proto.internal. A contract may import market/v1 and never another contract, which is
-// why nothing here embeds the fetch request: a request is named by a RequestRef instead.
+// trader_joe.proto.internal. A contract may import market/v1 and never another contract, which is why
+// BarPage, VendorCallStats, VendorReported and ServedRange are restated below rather than imported from ingest.proto
+// (which no longer carries them: the shapes are defined here, and the mappers tj-7zjov1.15 and
+// tj-7zjov1.16 build the ingest-side domain models from them).
 //
-// NO CREDENTIAL MATERIAL crosses here. quota_key is a non-secret configured label, never key
-// material and never a hash of it.
+// NO CREDENTIAL MATERIAL crosses here. quota_key is a non-secret configured label, never key material
+// and never a hash of it. The vendor asset id is the vendor's public instrument key, not a credential.
 syntax = "proto3";
 
 package trader_joe.proto.internal.store.v1;
 
+import "google/protobuf/timestamp.proto";
+import "trader_joe/proto/market/v1/bar.proto";
+import "trader_joe/proto/market/v1/enums.proto";
+
 service StoreService {
-  // Unary. The wire path is /trader_joe.proto.internal.store.v1.StoreService/Bootstrap.
-  rpc Bootstrap(BootstrapRequest) returns (BootstrapResponse);
+  // Client-streaming. One call per attempt. The stream is, in order: ONE header, then zero or more
+  // payload messages (bar_page, asset_records or corporate_action_records, all of the one kind the
+  // request was), then ONE trailer. A stream that ends without a trailer is incomplete: the store
+  // writes nothing for it and ingest redelivers the whole attempt. The answer is the acknowledgement.
+  // A failed attempt, and an expired report, are delivered the same way and carry no payload. The wire
+  // path is /trader_joe.proto.internal.store.v1.StoreService/DeliverAttempt.
+  rpc DeliverAttempt(stream DeliverAttemptRequest) returns (DeliverAttemptResponse);
+
+  // Unary. Ingest announces the instance id it minted at start and when it started, so the store
+  // notices a restart without waiting for a probe. Idempotent: an id the store already holds is
+  // answered again. Retried by ingest with backoff and never blocks its start. The wire path is
+  // /trader_joe.proto.internal.store.v1.StoreService/RegisterInstance.
+  rpc RegisterInstance(RegisterInstanceRequest) returns (RegisterInstanceResponse);
 }
 
-// The quota windows ingest wants usage for.
-message QuotaWindow {
-  string quota_key = 1;
-  uint64 window_seconds = 2;
+// One message of the DeliverAttempt stream. The oneof is declared from day one so that adding a payload
+// kind later is additive (ADR tj-8konfu D7.1).
+message DeliverAttemptRequest {
+  oneof part {
+    DeliveryHeader header = 1;
+    // Bars: the payload for a bars request.
+    BarPage bar_page = 2;
+    // The vendor's asset list, raw: the payload for an asset_list request.
+    AssetRecords asset_records = 3;
+    // Corporate actions, raw: the payload for a corporate_actions request.
+    CorporateActionRecords corporate_action_records = 4;
+    DeliveryTrailer trailer = 5;
+  }
 }
 
-message BootstrapRequest {
-  repeated QuotaWindow windows = 1;
-}
-
-// A request in the store's log, by handle.
-message RequestRef {
-  // The request-log id, as text.
+// ALWAYS THE FIRST MESSAGE. Everything the store needs to place the attempt, before any payload.
+message DeliveryHeader {
+  // The store's durable handle for the request, as ingest received it on Submit. The first half of the
+  // idempotency key.
   string request_id = 1;
-  // The scope it was charged to, empty when it was not yet charged.
-  string quota_key = 2;
-  uint64 estimated_vendor_calls = 3;
+
+  // The ingest process making this report: the id it minted at start. The store learns of a restart
+  // from an id it has not seen, and a report from a superseded instance is still written (its data is
+  // valid at its receipt time) and answered FINAL so the old process stops. The same id rides
+  // RegisterInstanceRequest, and every payload message and the trailer belong to the header's stream and
+  // so to this instance.
+  string instance_id = 2;
+
+  // The attempt this report is about, numbered from the request's durable attempt count plus one
+  // (SubmitRequest.attempt_count), so a restart never resets the budget. The second half of the
+  // idempotency key: the same number is sent again when a report is redelivered, and a new number only
+  // for a new vendor attempt. Starts at 1.
+  uint32 attempt_no = 3;
+
+  // The quota scope this attempt was charged to: a NON-SECRET CONFIGURED LABEL, never key material and
+  // never a hash of it. EMPTY ON AN EXPIRED OR EXHAUSTED REPORT: no vendor call was made, so nothing was
+  // charged to any quota.
+  string quota_key = 4;
+
+  // THE FEED FOLLOWS THE SUBMIT RULE (architect ruling, tj-7zjov1.13 gate). For a BARS attempt it is the
+  // resolved tape, and never FEED_UNSPECIFIED. For an ASSET_LIST or CORPORATE_ACTIONS attempt it is
+  // always FEED_UNSPECIFIED: those kinds have no tape. An EXPIRED or EXHAUSTED report made no vendor call and
+  // carries the request's kind rule unchanged, so a bars request that expired still names the resolved tape.
+  trader_joe.proto.market.v1.Feed feed = 5;
+
+  // The vendor's own key for the instrument, REPORTED BY THE BROKER HANDLE AS OPAQUE DATA: an opaque
+  // string the store keys on and nothing here parses, compares or interprets. It is never an argument of
+  // any call made to the handle. Empty when the attempt has no single instrument (asset_list), when the
+  // attempt failed before the vendor named one, and on an expired or exhausted report.
+  string vendor_asset_id = 6;
 }
 
-// Vendor calls already charged to a scope in its current window.
-message WindowUsage {
-  string quota_key = 1;
-  uint64 window_seconds = 2;
-  uint64 calls_in_window = 3;
+// How an attempt ended. Distinct values, so a verdict is never inferred from absent stats.
+enum DeliveryOutcome {
+  DELIVERY_OUTCOME_UNSPECIFIED = 0;
+  // The vendor answered and the payload (possibly empty) is complete.
+  DELIVERY_OUTCOME_SUCCEEDED = 1;
+  // A vendor call was made and the attempt did not succeed; error_class says how.
+  DELIVERY_OUTCOME_FAILED = 2;
+  // The request was taken off the queue after its ready_by (owner ruling on R4, 2026-10-24) and so was
+  // NEVER SENT TO THE VENDOR. It carries no vendor_stats, no payload and no served_range, spends nothing,
+  // and is not an attempt: the store writes the request FAILED with cause expired, answers FINAL and
+  // writes no attempt row.
+  DELIVERY_OUTCOME_EXPIRED = 3;
+  // The request arrived with its attempt budget already spent (its durable attempt count at or past
+  // ingest's max_attempts; architect ruling tj-wisp-g9rmw0), so it was NEVER SENT TO THE VENDOR. Ingest
+  // accepts it, does not queue it and reports it here. Shaped exactly as EXPIRED: no vendor_stats, no
+  // payload, no served_range, no as_of, empty quota_key, empty vendor_asset_id, error_class UNSPECIFIED and
+  // last_attempt false; the feed follows the request kind's rule unchanged. attempt_no is the request's
+  // attempt count plus one and is only the idempotency key. It spends nothing and is not an attempt: the
+  // store writes the request FAILED with cause attempts exhausted, writes no attempt row, leaves the
+  // durable attempt count as it was, records no spend and answers FINAL. FAILED is not used for this
+  // because it means a vendor call was made.
+  DELIVERY_OUTCOME_EXHAUSTED = 4;
 }
 
-message BootstrapResponse {
-  // Requests the store had sent to ingest and not seen finish.
-  repeated RequestRef in_flight = 1;
-  // Requests queued and not yet sent.
-  repeated RequestRef pending = 2;
-  repeated WindowUsage usage = 3;
+// What kind of failure, so the store can tell a permanent refusal (FINAL) from one worth another attempt.
+enum DeliveryErrorClass {
+  DELIVERY_ERROR_CLASS_UNSPECIFIED = 0;
+  // Worth another attempt after a backoff: a timeout, a connection fault, a vendor 5xx.
+  DELIVERY_ERROR_CLASS_TRANSIENT = 1;
+  // The vendor answered with a rate-limit status (HTTP 429).
+  DELIVERY_ERROR_CLASS_RATE_LIMITED = 2;
+  // No further attempt can succeed as asked: the vendor refused it for good.
+  DELIVERY_ERROR_CLASS_PERMANENT = 3;
 }
+
+// ALWAYS THE LAST MESSAGE.
+message DeliveryTrailer {
+  DeliveryOutcome outcome = 1;
+
+  // Set only when outcome is FAILED; UNSPECIFIED otherwise.
+  DeliveryErrorClass error_class = 2;
+
+  // For a human, and never parsed. It carries no secret, no vendor body and no stack trace.
+  string detail = 3;
+
+  // What this attempt cost at the vendor, FAILED attempts included. Unset on EXPIRED and EXHAUSTED, which made no call.
+  VendorCallStats vendor_stats = 4;
+
+  // The window actually served, on SUCCEEDED for bars and corporate actions. Unset otherwise.
+  ServedRange served_range = 5;
+
+  // When the vendor answered. UTC. Unset on EXPIRED and EXHAUSTED.
+  google.protobuf.Timestamp as_of = 6;
+
+  // Set by ingest when it will make no further attempt for this request because its attempt budget is
+  // spent with this attempt. Ingest holds the budget, so only ingest can say so; the store uses it to
+  // close a request that will not be retried (answer FINAL, write the request FAILED) instead of leaving
+  // it queued for ever. Meaningful only on FAILED. A PERMANENT error class is final regardless of this
+  // flag. Failures are reported, never inferred.
+  bool last_attempt = 7;
+
+  // The vocabulary Reason value of a FAILED attempt (common/errors; the domain is always the
+  // vocabulary's ERROR_DOMAIN, so it is not carried). Empty on any other outcome, and empty when ingest
+  // has no typed reason. Additive. A receiver that does not recognise the value treats it as empty and
+  // never refuses the delivery: a refused delivery is redelivered and lost at an ingest restart.
+  string reason = 8;
+}
+
+// What the store tells ingest to do next.
+enum DeliveryVerdict {
+  DELIVERY_VERDICT_UNSPECIFIED = 0;
+  // The request is not finished: ingest may schedule its next attempt after the backoff.
+  DELIVERY_VERDICT_CONTINUE = 1;
+  // The request is finished (success, a permanent refusal, the last attempt, an expiry, a budget
+  // already spent, or it was superseded): ingest drops it and runs no retry.
+  DELIVERY_VERDICT_FINAL = 2;
+}
+
+// THE ACKNOWLEDGEMENT. Sent only after the attempt, its data, the count, the spend and the verdict are
+// committed. Answering a redelivered duplicate repeats the stored answer.
+message DeliverAttemptResponse {
+  DeliveryVerdict verdict = 1;
+
+  // The store's durable attempt count for the request after this report. A recovered request resumes
+  // numbering from it.
+  uint32 attempt_count = 2;
+}
+
+// A BOUNDED PAGE OF BARS, the bars of one delivery. No dataset_id: the store stamps its own rows, and
+// the header names the request.
+//
+// THE PAGE SIZE IS 5000 BARS, and it is the server's to honour -- the wire cannot express it. The
+// figures are MEASURED on this contract, not estimated: a full page is 345000 bytes (337 KiB, 69.0
+// bytes a bar), and 385000 bytes (376 KiB, 77.0 a bar) with every optional field populated, the
+// nanosecond field non-zero and the varints at their widest. That is about a third of the ~1 MiB ADR
+// tj-8konfu D6.3 targets for a bulk chunk, and 9.2 % of the 4 MiB ceiling in common/rpc/config.py --
+// which is a bug guard rather than a working limit, so a message that approaches it is a defect to
+// surface. In the other direction 5000 bars is about 12.8 trading days of one-minute bars (390 to a
+// regular session) or some twenty years of daily ones, so an ordinary fetch is one or two pages and
+// the per-page overhead stays irrelevant.
+message BarPage {
+  repeated trader_joe.proto.market.v1.Bar bars = 1;
+}
+
+// Raw asset-list records. The asset list is the one non-reproducible past state on this hop, so the
+// store writes it with its receipt time in the acknowledgement transaction and answers only after.
+message AssetRecords {
+  repeated AssetRecord records = 1;
+}
+
+// One vendor asset, carried RAW: vendor-neutral names for the few fields the store needs, and the vendor's
+// own payload untouched in raw_payload.
+message AssetRecord {
+  // The vendor's key for the asset, opaque (see DeliveryHeader.vendor_asset_id).
+  string vendor_asset_id = 1;
+  // The ticker the vendor lists it under now.
+  string symbol = 2;
+  // The vendor's record as received, byte for byte.
+  bytes raw_payload = 3;
+  // These three are the few further vendor-neutral fields the store needs; everything else stays in
+  // raw_payload. The store detects delistings from status flips between snapshots, and filters assets on
+  // exchange, active and tradable, without parsing the vendor's raw_payload.
+  //
+  // The vendor lists the asset as active. OPTIONAL so that unset (the vendor said nothing) is never read
+  // as inactive.
+  optional bool active = 4;
+  // The vendor lists the asset as tradable. Same presence rule as active.
+  optional bool tradable = 5;
+  // The vendor's venue wording, uninterpreted. Empty when the vendor gave none.
+  string exchange = 6;
+  // The vendor's name for the asset (company or fund name). Empty when the vendor gave none.
+  string name = 7;
+}
+
+message CorporateActionRecords {
+  repeated CorporateActionRecord records = 1;
+}
+
+// One vendor corporate action, carried RAW. The five dates are the vendor's effective dates; unset when
+// the vendor gave none. The store stamps the receipt time itself.
+message CorporateActionRecord {
+  // The vendor's id for the action, opaque.
+  string vendor_action_id = 1;
+  // The vendor's type wording, uninterpreted.
+  string action_type = 2;
+  google.protobuf.Timestamp ex_date = 3;
+  google.protobuf.Timestamp record_date = 4;
+  google.protobuf.Timestamp payable_date = 5;
+  // Instrument identifiers the vendor gave (such as CUSIP or ISIN), keyed by the vendor's own name.
+  map<string, string> identifiers = 6;
+  // The vendor's record as received, byte for byte.
+  bytes raw_payload = 7;
+  // The vendor's process and effective dates, beside ex, record and payable. Each is unset when the vendor
+  // gave none: a name change carries process_date only, a stock merger both.
+  google.protobuf.Timestamp process_date = 8;
+  google.protobuf.Timestamp effective_date = 9;
+}
+
+// The vendor calls one attempt made. Counted by ingest. The shape is defined here,
+// because a contract never imports another contract.
+message VendorCallStats {
+  uint64 calls = 1;
+  uint64 pages = 2;
+  // Calls the vendor answered with a rate-limit status (HTTP 429).
+  uint64 throttled_429 = 3;
+  uint64 retries = 4;
+  google.protobuf.Timestamp first_call_at = 5;
+  google.protobuf.Timestamp last_call_at = 6;
+  // Unset when the vendor reported nothing. Corroboration only; ingest's own count is the record.
+  VendorReported vendor_reported = 7;
+}
+
+// What the vendor's response headers said about its limit, when they said anything.
+message VendorReported {
+  optional uint64 limit = 1;
+  optional uint64 remaining = 2;
+  google.protobuf.Timestamp reset_at = 3;
+}
+
+// The served window; the shape is defined here, as a contract never imports another contract.
+message ServedRange {
+  // Inclusive.
+  google.protobuf.Timestamp start = 1;
+  // EXCLUSIVE, and never open.
+  google.protobuf.Timestamp end = 2;
+}
+
+message RegisterInstanceRequest {
+  // Minted once, when the ingest process starts. A different id is a different process.
+  string instance_id = 1;
+  google.protobuf.Timestamp started_at = 2;
+}
+
+// Nothing to say: the call succeeding is the acknowledgement.
+message RegisterInstanceResponse {}

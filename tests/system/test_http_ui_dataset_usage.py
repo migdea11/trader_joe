@@ -73,11 +73,9 @@ DAILY_TABLE = test_usage_record.DAILY_TABLE
 def hide_usage_tables(engine: sa.Engine) -> None:
     """Rename both usage tables away, so usage_tables_exist's to_regclass answers as on a database without them.
 
-    WHY NOT MIGRATE ONLY TO THE REVISION BEFORE THEM (tj-grna9p.176). The unmigrated tests used to stop at
-    test_usage_record.PARENT_REVISION, which worked while no later revision touched store_dataset_entry.
-    e5c8b1d4f703 adds store_dataset_entry.collect and the catalog selects the whole entry, so the head's code no
-    longer runs on a database below that revision. Migrated to head with the two tables renamed, the probe sees
-    exactly the absence it saw before, on an entry table the head's code matches.
+    WHY NOT MIGRATE ONLY TO A REVISION BEFORE THEM (tj-grna9p.176). There is none since the alpha baseline (ADR
+    tj-kg521d), and the catalog selects the whole entry, so the head's code runs only on the head's entry table.
+    Migrated to head with the two tables renamed, the probe sees the absence of the usage tables.
     """
     with engine.begin() as conn:
         for table in (READ_TABLE.name, DAILY_TABLE.name):

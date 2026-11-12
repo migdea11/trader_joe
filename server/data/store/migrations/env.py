@@ -50,12 +50,17 @@ if config.config_file_name is not None:
 # An ImportError propagates: a model that fails to import leaves target_metadata incomplete, so
 # carrying on would migrate/autogenerate against a partial schema.
 ALLOWED_MODELS = {
+    'asset_list',
     'base_market_activity',
+    'corporate_action',
     'dataset_deletion',
     'dataset_override_log',
     'dataset_read',
     'dataset_read_daily',
+    'ingest_instance',
+    'ingest_request',
     'ingest_run',
+    'panel',
     'stock_market_activity',
     'store_dataset_entry',
 }
@@ -68,18 +73,16 @@ log.debug(f'Registered tables: {list(target_metadata.tables.keys())}')
 
 # Tables that live in the database on purpose but are in NO model, so autogenerate would
 # propose dropping them and `alembic check` would fail on every correctly migrated database
-# (ADR tj-x3ig38, 2026-10-02 addendum item 1). Each name's provenance:
-#   stock_market_activity_superseded_8f41c2d7a3b9 -- 8f41c2d7a3b9 creates it (CREATE TABLE IF
-#   NOT EXISTS ... LIKE), eec8f88a7443 step 4 deliberately keeps it, and tj-n3terv owns its
-#   eventual cleanup.
+# (ADR tj-x3ig38, 2026-10-02 addendum item 1). None exists: the alpha baseline (ADR tj-kg521d)
+# did not carry the one earlier revisions left behind (the bar archive table), so the set is empty.
 # RULE FOR FUTURE REVISIONS: a revision that creates a table outside the models adds its name
 # here IN THE SAME COMMIT.
 # EXPLICIT NAMES ONLY -- never a prefix and never a pattern. The whole point of the check is
 # that a stray or misspelled table still shows as drift; a pattern would silently swallow the
 # next accidental table, which is exactly the class of bug this exists to surface (tj-5h30md:
-# head eec8f88a7443 with uq_stock_market_activity_natural_key missing, and `alembic current`
-# showing nothing wrong).
-OUT_OF_MODEL_TABLES = frozenset({'stock_market_activity_superseded_8f41c2d7a3b9'})
+# a head with uq_stock_market_activity_natural_key missing, and `alembic current` showing
+# nothing wrong).
+OUT_OF_MODEL_TABLES: frozenset[str] = frozenset()
 
 
 def include_object(object_, name, type_, reflected, compare_to) -> bool:
@@ -134,7 +137,7 @@ def run_migrations_offline() -> None:
         literal_binds=True,
         dialect_opts={'paramstyle': 'named'},
         include_object=include_object,
-        # Server defaults render differently in model and database -- '1' in eec8f88a7443 against
+        # Server defaults render differently in model and database -- '1' in a migration against
         # str(ExpiryType.BULK.value) in the model, gen_random_uuid() on id -- so comparing them is
         # pure noise (ADR tj-x3ig38 addendum item 4). This is alembic's default; it is stated here
         # so the choice is visible. It makes server-default drift a blind spot. compare_type is

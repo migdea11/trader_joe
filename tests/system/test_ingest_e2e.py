@@ -11,8 +11,9 @@ THE STACK MUST BE IN FAKE MODE: data_ingest's log carries the 'FAKE BROKER:' ban
 real broker these symbols are not tickers and every test here fails -- never skips.
 
 EVERY ENTRY HERE IS CREATED BY THE DATASET POST, the one route that reaches data_ingest: data_store
-upserts the entry, asks data_ingest over the FetchDataset gRPC stream, and writes the bars it gets
-back -- the Kafka RPC it used to ask over went on tj-3mk3u5.11 and .12. Entry ids
+writes the request, Submits it to data_ingest, and writes the entry and the bars from the attempt
+ingest delivers back (P35; the FetchDataset pull stream that replaced the Kafka RPC of tj-3mk3u5.11
+and .12 is gone too, P37). Entry ids
 are read by SQL (the POST answers with a count, not an id) and adopted for cleanup whether or not
 the POST succeeded. Bars are read back over HTTP, FILTERED BY dataset_id: the store's read is
 half-open [start, end) like the broker range since tj-86g751.3 (tj-j4wknb addendum 5), but two
@@ -40,15 +41,19 @@ Items, tj-vhboky.14 numbering where they moved here from Sys-4:
     and the RESOLVED tape is recorded on BOTH the bars and the entry (tj-3mk3u5.16 A2). Sent with
     the RIGHT secret and asserted 2xx: this CLOSES 7c FOR THE DATASET POST (Sys-3 asserted its 409
     half; architect note 16:51 UTC 2026-09-28 on tj-vhboky.63).
-  * an unservable feed -- a POST naming a tape this deployment cannot serve is a 422
-    FEED_NOT_AVAILABLE naming the refused tape, and writes no entry and no bar (tj-3mk3u5.16 A2).
+  * IEX named -- served, not refused (owner ruling 2026-11-06, tj-7zjov1.343): a POST naming IEX over
+    the window of the default (SIP) dataset is a SEPARATE entry whose entry, bars and attempt row
+    all carry IEX, beside the SIP one.
+  * an unservable feed -- a POST naming a feed Alpaca has no tape for (NOT_APPLICABLE; the body's
+    feed is Feed | None, so the POST admits it) is a 422 FEED_NOT_AVAILABLE naming the refused feed,
+    and writes no entry and no bar (tj-3mk3u5.16 A2).
   * EMPTY, GAPS, FAIL, SLOW, FAILONCE -- one test each, symbols carrying the scenario's prefix.
   * 4 -- an exact repeat resolves to the same entry, adds none, and answers with the SAME BODY
     (tj-gp5xxi: data_points and served_range, not just a 200); changing only expiry_type, then
     only owner, each makes a new entry; no entry takes the stronger expiry_type of the two. Feed IS
-    part of an entry's identity since c4a1f7b2e905, but it cannot be varied from here: the entry
-    records the tape the ACK resolved, and this deployment resolves one. Varying it is the unit
-    tier's (data/store/tests/test_dataset_entry_identity.py).
+    part of an entry's identity since c4a1f7b2e905; since tj-7zjov1.342 it is varied from here by
+    naming IEX (the IEX-named test above), and the unit tier holds the rest
+    (data/store/tests/test_dataset_entry_identity.py).
   * 5 (success half) -- a different owner's overlapping range is a separate entry, and both hold
     their own bars at the shared instants.
   * 8 (HTTP half) -- a range of more bars than POSTGRES_MAX_BIND_PARAMETERS //
@@ -73,8 +78,10 @@ from sqlalchemy.engine import Engine
 
 from common.enums.data_select import AssetType, DataType
 from common.enums.data_stock import DataSource, ExpiryType, Feed, Granularity
-from common.errors.vocabulary import Reason
+from common.errors.vocabulary import ERROR_DOMAIN, Reason
 from data.store.app.database.crud.stock.asset_market_activity import POSTGRES_MAX_BIND_PARAMETERS
+from data.store.app.database.models.ingest_request import IngestRequest, IngestRequestKind, IngestRequestState
+from data.store.app.database.models.ingest_run import IngestRun, IngestRunState, IngestRunTrigger
 from data.store.app.database.models.stock_market_activity import StockMarketActivity
 from data.store.app.database.models.store_dataset_entry import StoreDatasetEntry
 from routers.data_store.app_endpoints import AssetDataInterface, AssetDatasetStoreInterface, UiDatasetsInterface
@@ -89,7 +96,7 @@ from tests.fakes.market_data import (
     grid_index,
     grid_timestamps,
 )
-from tests.fakes.market_data import FEED as FAKE_DEPLOYMENT_FEED
+from tests.fakes.market_data import FEED as FAKE_DEFAULT_FEED
 from tests.system.problem_json import assert_problem
 
 
@@ -104,23 +111,29 @@ READ_PATH = AssetDataInterface.GET_ASSET_DATA.format(
     asset_type=AssetType.STOCK.value, data_type=DataType.MARKET_ACTIVITY.value
 )
 ENTRY_TABLE = StoreDatasetEntry.__table__
+REQUEST_TABLE = IngestRequest.__table__
+RUN_TABLE = IngestRun.__table__
 
 # What a stored bar is compared on: (timestamp, open, high, low, close, volume, trade_count).
 BarTuple = tuple[datetime, float, float, float, float, int, int]
 
-# The tape this deployment serves, read off the fake rather than restated, so that rebuilding the
-# stack with another entitlement moves both halves of the feed pair together.
-SERVED_FEED = FAKE_DEPLOYMENT_FEED
-# A tape it does not serve. FakeRead refuses any named feed that is not its deployment feed, so
-# this is unservable by construction rather than by configuration. Restated rather than derived
-# from Feed, because a derived "any other member" silently becomes vacuous the day the enum has
-# one member; the guard below is what keeps the pair honest instead.
-UNSERVABLE_FEED = Feed.SIP
+# The tape a POST naming no feed is served on: SIP, the production default the fake follows (owner ruling 2026-11-06,
+# option A: the system tier follows production). Read off the fake and pinned to SIP, so a fake that drifted from
+# production fails here rather than passing on its own default.
+SERVED_FEED = FAKE_DEFAULT_FEED
+assert SERVED_FEED is Feed.SIP, f'the fake serves an unnamed request on {SERVED_FEED}, not the production default SIP'
+# The tape served only when a POST names it.
+NAMED_FEED = Feed.IEX
+# A feed Alpaca has no tape for, refused by the handle's feed policy (broker_api.resolve_feed) and FakeRead alike.
+# Restated rather than derived from Feed, because a derived "any other member" silently becomes vacuous the day the
+# enum changes; the guard in the test is what keeps it honest instead.
+UNSERVABLE_FEED = Feed.NOT_APPLICABLE
 
 # SLOW_MARGIN_SECONDS IS GONE (tj-xhcoyc). It padded a second read taken after FakeRead's SLOW_
 # delay, to catch a late RPC answer arriving once data_store had already given up on it. There is
-# no giving up to observe any more: the Kafka RPC's 5 s deadline became
-# DEFAULT_FETCH_DEADLINE_S = 300 s under tj-3mk3u5.10, so an 8 s vendor is served rather than
+# no giving up to observe any more: the Kafka RPC's 5 s deadline became a 300 s fetch deadline under
+# tj-3mk3u5.10 (today the POST's verdict deadline, STORE_VERDICT_DEADLINE_SECONDS, default 300 s since
+# P37a), so an 8 s vendor is served rather than
 # abandoned, and the SLOW case now asserts it completes. See that test for what is no longer
 # provable at this tier and where it is pinned instead.
 
@@ -225,7 +238,7 @@ def test_default_round_trip_stores_exactly_the_generated_bars(
     """Default round trip, with the RIGHT secret and a 2xx: this closes 7c for the dataset POST.
 
     The pipeline loses, adds and changes nothing: the bars read back under the new entry are the
-    generator's for [start, end), timestamps preserved, each labelled with FakeRead's feed (IEX),
+    generator's for [start, end), timestamps preserved, each labelled with the default feed (SIP),
     and data_points and the listing's item_count both equal the count.
 
     THE RESOLVED FEED IS ASSERTED ON THE ENTRY AS WELL AS ON THE BARS (tj-3mk3u5.16 A2). The bar
@@ -234,8 +247,8 @@ def test_default_round_trip_stores_exactly_the_generated_bars(
     entirely, and nothing here would have noticed. The entry's feed is the one tj-3mk3u5.31 made
     a NOT NULL identity column, and the one a caller filters on, so it is the one that has to be
     the resolution rather than a preference. This POST sends NO feed at all -- the ordinary
-    request, meaning "the deployment decides" -- which is what makes the stored value evidence of
-    a resolution: there was no preference for it to have been copied from.
+    request, meaning "the broker's default decides" -- which is what makes the stored value evidence
+    of a resolution: there was no preference for it to have been copied from.
     """
     expected = _expected(own_symbol)
 
@@ -254,16 +267,64 @@ def test_default_round_trip_stores_exactly_the_generated_bars(
     assert listed['feed'] == SERVED_FEED.value, f'the entry was stored with feed {listed["feed"]!r}'
 
 
+def test_naming_iex_is_served_as_a_separate_iex_dataset_beside_the_default_sip_one(
+    own_symbol: str, run_identity, data_store, adopt_entries: Callable[[str], list[UUID]], pg_engine: Engine
+) -> None:
+    """IEX named is SERVED, not refused (owner ruling 2026-11-06; tj-7zjov1.342, tj-7zjov1.343).
+
+    RE-POINTED from "a POST naming IEX is refused FEED_NOT_AVAILABLE": the Alpaca handle decides the feed per request,
+    so IEX is served whenever it is asked for. Feed is part of the entry's identity, so the IEX answer over the SAME
+    window as the default (SIP) one is a SECOND entry, and each entry, its bars and its finishing attempt row carry
+    its own tape. The same window on purpose: the feed-blind own-overlap check refuses a PARTIAL cross-tape overlap
+    (ruled acceptable, tj-7zjov1.351, backlog tj-7zjov1.352), never the identical window.
+    """
+    assert NAMED_FEED is not SERVED_FEED, 'the named feed is the default; the test proves nothing'
+    expected = _expected(own_symbol)
+
+    default, after_default = _post(data_store, adopt_entries, own_symbol, _body(run_identity.owner))
+    named, after_named = _post(data_store, adopt_entries, own_symbol, _body(run_identity.owner, feed=NAMED_FEED.value))
+
+    assert default.status_code == 200, data_store.describe(default)
+    assert named.status_code == 200, data_store.describe(named)
+    assert named.json()['data_points'] == len(expected), data_store.describe(named)
+    assert len(after_default) == 1, f'expected one entry after the default POST, found {after_default}'
+    assert len(after_named) == 2 and after_named[0] == after_default[0], f'IEX named: {after_named}'
+    sip_entry, iex_entry = after_named
+    listed = _listing(data_store, own_symbol)
+    assert {listed[str(sip_entry)]['feed'], listed[str(iex_entry)]['feed']} == {SERVED_FEED.value, NAMED_FEED.value}
+    assert listed[str(sip_entry)]['feed'] == SERVED_FEED.value
+    assert listed[str(iex_entry)]['feed'] == NAMED_FEED.value
+    for entry_id, feed in ((sip_entry, SERVED_FEED), (iex_entry, NAMED_FEED)):
+        bars = _read(data_store, entry_id)
+        assert {bar['feed'] for bar in bars} == {feed.value}, f'entry {entry_id}: {sorted({b["feed"] for b in bars})}'
+        stored = _stored(data_store, entry_id)
+        assert stored == expected, f'entry {entry_id}: {_diff(stored, expected)}'
+
+    # Two BARS requests, each finished SUCCEEDED naming its own entry, each with a written attempt row.
+    requests = _bars_requests(pg_engine, own_symbol)
+    assert [request.dataset_id for request in requests] == [sip_entry, iex_entry], requests
+    for request in requests:
+        assert request.state == IngestRequestState.SUCCEEDED, f'request {request.id} finished {request.state}'
+        attempts = _attempt_rows(pg_engine, request.id)
+        assert [row.state for row in attempts] == [IngestRunState.SUCCEEDED], attempts
+        assert attempts[0].dataset_id == request.dataset_id
+        assert attempts[0].bars_written == len(expected)
+
+
 def test_an_unservable_feed_is_refused_and_leaves_no_entry_and_no_bar(
     own_symbol: str, run_identity, data_store, adopt_entries: Callable[[str], list[UUID]]
 ) -> None:
-    """A POST naming a tape this deployment cannot serve is refused, and writes nothing.
+    """A POST naming a feed Alpaca has no tape for is refused, and writes nothing.
 
-    THE ONE IN-BAND FAILURE OF THE FETCH STREAM, which is why it earns a system test rather than
+    RE-POINTED by tj-7zjov1.343: SIP and IEX are both served now, so the refused feed is NOT_APPLICABLE. The POST
+    body's feed is Feed | None (schemas/data_store/asset_dataset_store.py), so it admits it, and the request row's
+    feed column is the same enum, so it reaches the handle's intake, which refuses it on the ack.
+
+    THE ONE IN-BAND FAILURE OF THE HOP, which is why it earns a system test rather than
     a unit one. FEED_NOT_AVAILABLE never travels as a gRPC status: data_ingest answers it on the
-    FetchDataset ack's refused arm and that ack is the stream's only event (tj-3mk3u5.22 Q5;
-    common/rpc/ingest.py, schemas/data_ingest/fetch_dataset.py::FetchRefused). So this is the one
-    failure that reaches data_store as a successful stream carrying a refusal, and the only place
+    Submit ack's refused arm (tj-3mk3u5.22 Q5; common/rpc/ingest.py,
+    schemas/data_ingest/fetch_dataset.py::FetchRefused). So this is the one
+    failure that reaches data_store as a successful call carrying a refusal, and the only place
     the store has to turn one into a 4xx. Every other failure arrives as an error already.
 
     NOTHING WRITTEN IS THE SECOND HALF AND IS NOT A RESTATEMENT OF THE FAIL SCENARIO. Both end
@@ -282,6 +343,7 @@ def test_an_unservable_feed_is_refused_and_leaves_no_entry_and_no_bar(
     assert UNSERVABLE_FEED is not SERVED_FEED, (
         f'this test asks for {UNSERVABLE_FEED.value}, the tape the fake serves, so it proves nothing'
     )
+    assert UNSERVABLE_FEED is not NAMED_FEED, f'{UNSERVABLE_FEED.value} is served when named, so it proves nothing'
 
     response, ids = _post(data_store, adopt_entries, own_symbol, _body(run_identity.owner, feed=UNSERVABLE_FEED.value))
 
@@ -338,10 +400,10 @@ def test_fail_scenario_is_not_2xx_and_stores_no_bars(
 
     RE-PINNED TO THE RULED ORDER (tj-xhcoyc, item 2). This case used to assert the opposite --
     "the entry is upserted before the fetch, so a failed fetch leaves exactly one entry" -- and it
-    was CORRECT when d1e363b wrote it. tj-3mk3u5.10 then reversed the order: the store opens the
-    FetchDataset stream FIRST and upserts the entry on the ACK, because only the ack carries the
-    resolved feed, and the entry, every page and the commit live in ONE transaction that commits
-    after FetchDone. A fetch that fails before the ack therefore writes nothing at all. The
+    was CORRECT when d1e363b wrote it. tj-3mk3u5.10 then reversed the order: the store opened the
+    (since removed, P37) FetchDataset stream FIRST and upserted the entry on the ACK, because only the
+    ack carries the resolved feed; since P35 the entry and its bars are written in ONE delivery
+    transaction from the delivered attempt. A fetch that fails therefore writes nothing at all. The
     assertion was never re-pinned because nothing ran this suite between the cutover and
     tj-3mk3u5.12's gate.
 
@@ -380,8 +442,9 @@ def test_slow_scenario_is_served_rather_than_abandoned(
     than a concession (tj-xhcoyc, item 2). It was written against data_store's Kafka RPC deadline
     of 5 s, which is why FakeRead's delay is 8 s -- tests/fakes/market_data.py still says, in the
     comment on DEFAULT_SLOW_DELAY_SECONDS, "longer than data_store's 5 s Kafka RPC deadline, so
-    SLOW_ outlives the caller by default". tj-3mk3u5.10 replaced that transport, and
-    common/rpc/clients/ingest_fetch.py sets DEFAULT_FETCH_DEADLINE_S to 300 s DELIBERATELY: the
+    SLOW_ outlives the caller by default". tj-3mk3u5.10 replaced that transport with a 300 s fetch
+    deadline, which the store's verdict deadline keeps (STORE_VERDICT_DEADLINE_SECONDS) now that
+    the fetch client is gone (P37), DELIBERATELY: the
     5 s deadline "abandoned requests the vendor was still serving", since one rate-limited Alpaca
     call alone can cost 10 s or more of SDK sleep (tj-6znw1h). An 8 s vendor no longer outlives
     anything.
@@ -418,38 +481,123 @@ def test_slow_scenario_is_served_rather_than_abandoned(
     assert stored == expected, _diff(stored, expected)
 
 
-def test_failonce_scenario_fails_then_the_identical_post_creates_the_entry_and_fills_it(
-    own_symbol: str, run_identity, data_store, scenario_entries: Callable[[str], list[UUID]]
+def _bars_requests(pg_engine: Engine, symbol: str) -> list[sa.Row]:
+    """The BARS ingest_request rows for the symbol, oldest first. The POST's name_change clamp query is not one."""
+    with pg_engine.connect() as connection:
+        return list(
+            connection.execute(
+                sa.select(REQUEST_TABLE.c.id, REQUEST_TABLE.c.state, REQUEST_TABLE.c.dataset_id)
+                .where(REQUEST_TABLE.c.asset_symbol == symbol, REQUEST_TABLE.c.kind == IngestRequestKind.BARS)
+                .order_by(REQUEST_TABLE.c.created_at, REQUEST_TABLE.c.id)
+            )
+        )
+
+
+def _attempt_rows(pg_engine: Engine, request_id: UUID) -> list[sa.Row]:
+    """The attempt rows (ingest_run) of one request, by attempt number."""
+    with pg_engine.connect() as connection:
+        return list(
+            connection.execute(
+                sa.select(
+                    RUN_TABLE.c.attempt_no,
+                    RUN_TABLE.c.state,
+                    RUN_TABLE.c.trigger,
+                    RUN_TABLE.c.dataset_id,
+                    RUN_TABLE.c.bars_written,
+                    RUN_TABLE.c.error_message,
+                    RUN_TABLE.c.error_domain,
+                    RUN_TABLE.c.error_reason,
+                    RUN_TABLE.c.verdict,
+                    RUN_TABLE.c.served_start,
+                    RUN_TABLE.c.served_end,
+                )
+                .where(RUN_TABLE.c.request_id == request_id)
+                .order_by(RUN_TABLE.c.attempt_no)
+            )
+        )
+
+
+def test_failonce_scenario_is_retried_inside_the_post_and_fills_one_entry(
+    own_symbol: str, run_identity, data_store, scenario_entries: Callable[[str], list[UUID]], pg_engine: Engine
 ) -> None:
-    """A failed POST leaves nothing; the identical retry then creates the entry and fills it.
+    """A transient vendor failure is retried INSIDE the one POST: a 200, one entry, every bar once.
 
-    RE-PINNED TO THE RULED ORDER (tj-xhcoyc, item 2). The old version asserted the failed POST
-    left one entry and the retry resolved to THAT id -- true before tj-3mk3u5.10, when the entry
-    was written before the fetch. Under the ruled order the first POST rolls back entirely, so the
-    retry CREATES the entry rather than filling one.
+    THE OLD SHAPE IS GONE. This test was "the first POST fails, the identical retry creates the
+    entry and fills it" (tj-xhcoyc, item 2), true while a POST was one fetch. Since the push path
+    (P35, tj-7zjov1.28; server/data/store/CLAUDE.md "Delivery intake") the retry moved inside the
+    request: ingest reports attempt 1 FAILED, the intake answers CONTINUE on a non-final failure,
+    ingest runs attempt 2, which is delivered and answered FINAL, and the POST's await_verdict --
+    polling the REQUEST ROW until it is not open -- answers 200 from the request's state and its
+    finishing attempt row. FakeRead's FAILONCE_ fails only the first call per (symbol,
+    granularity, start, end) on its instance (tests/fakes/market_data.py), so the second attempt
+    is served. A second POST is not made here: the exact repeat is
+    test_identity_repeat_resolves_and_policy_or_owner_change_makes_a_new_entry's claim.
 
-    THE RETRY CLAIM IS STRONGER AFTER THE CHANGE, NOT WEAKER, which is why this is a re-pin and
-    not a deletion. The old assertion could be satisfied by a store that never cleaned up after a
-    failure; this one requires that a failure leaves the database exactly as it was AND that the
-    identical request then succeeds in full -- one entry, every bar. That is the real idempotency
-    claim a retried POST rests on, and FAILONCE is the only scenario that can make it.
+    THE IDEMPOTENCY CLAIM THE OLD SHAPE CARRIED IS NOW THE ENTRY AND THE ATTEMPT ROWS, and tj-
+    xhcoyc item 2's order still holds: nothing is written for a failed attempt but its own attempt
+    row. So attempt 1 has no dataset id and wrote 0 bars -- no entry and no bar existed before the
+    delivered attempt -- and the one entry holds exactly the generator's bars, none duplicated by
+    the retry and none lost. The bars arm writes the entry on the FIRST DELIVERED attempt, which is
+    why attempt 2, not attempt 1, carries the dataset id.
+
+    THE TYPED REASON, across the whole stack (tj-7zjov1.236 ruled option C; tj-7zjov1.345, .346,
+    .316; pinned by tj-7zjov1.347). The FAILED attempt 1, a non-last attempt answered CONTINUE,
+    carries FakeRead's VENDOR_UNAVAILABLE in the vocabulary's domain: ingest put it on the trailer,
+    the wire carried it as DeliveryTrailer.reason, the intake wrote it. The served attempt 2 carries
+    none. (This paragraph replaces the earlier "not asserted, on purpose", which held while the
+    owner question was open.)
+
+    The regression this catches: an intake answering FINAL on a transient FAILED attempt. The
+    request would finish FAILED after attempt 1 and the POST would answer 503.
     """
     symbol = f'{FAILONCE_PREFIX}{own_symbol}'
-    body = _body(run_identity.owner)
     expected = _expected(symbol)
+    assert expected, 'the range holds no bar; the test proves nothing'
 
-    first, first_ids = _post(data_store, scenario_entries, symbol, body)
+    response, ids = _post(data_store, scenario_entries, symbol, _body(run_identity.owner))
 
-    assert not _is_2xx(first), data_store.describe(first)
-    assert first_ids == [], f'the failed first POST left {len(first_ids)} entry/entries for {symbol}: {first_ids}'
+    # (1) One POST, answered from the delivered attempt.
+    assert response.status_code == 200, data_store.describe(response)
+    assert response.json()['data_points'] == len(expected), data_store.describe(response)
 
-    second, second_ids = _post(data_store, scenario_entries, symbol, body)
-
-    assert second.status_code == 200, data_store.describe(second)
-    assert len(second_ids) == 1, f'the retry left {len(second_ids)} entries for {symbol}, not one: {second_ids}'
-    assert second.json()['data_points'] == len(expected), data_store.describe(second)
-    stored = _stored(data_store, second_ids[0])
+    # (2) Exactly one entry, holding exactly the generator's bars.
+    assert len(ids) == 1, f'the retried request left {len(ids)} entries for {symbol}, not one: {ids}'
+    entry_id = ids[0]
+    stored = _stored(data_store, entry_id)
     assert stored == expected, _diff(stored, expected)
+
+    # (3) Exactly one BARS request, finished SUCCEEDED and naming the entry.
+    requests = _bars_requests(pg_engine, symbol)
+    assert len(requests) == 1, f'expected one BARS request for {symbol}, found {len(requests)}'
+    request = requests[0]
+    assert request.state == IngestRequestState.SUCCEEDED, f'the request finished {request.state}'
+    assert request.dataset_id == entry_id, f'the request names dataset {request.dataset_id}, not {entry_id}'
+
+    # (4) Exactly two attempt rows: the failure that wrote nothing, then the retry that wrote everything.
+    attempts = _attempt_rows(pg_engine, request.id)
+    assert [row.attempt_no for row in attempts] == [1, 2], (
+        f'attempt numbers {[row.attempt_no for row in attempts]}, not [1, 2]'
+    )
+    failed, served = attempts
+
+    assert failed.state == IngestRunState.FAILED, f'attempt 1 is {failed.state}'
+    assert failed.trigger == IngestRunTrigger.REQUEST, f'attempt 1 has trigger {failed.trigger}'
+    assert failed.dataset_id is None, f'the failed attempt names dataset {failed.dataset_id}: an entry before delivery'
+    assert failed.bars_written == 0, f'the failed attempt wrote {failed.bars_written} bars'
+    assert failed.error_message, 'the failed attempt row carries no error message'
+    assert failed.verdict == 'CONTINUE', f'attempt 1 was answered {failed.verdict}, not CONTINUE'
+    assert (failed.error_domain, failed.error_reason) == (ERROR_DOMAIN, Reason.VENDOR_UNAVAILABLE.value), (
+        f'attempt 1 carries ({failed.error_domain!r}, {failed.error_reason!r}), not its typed reason'
+    )
+
+    assert served.state == IngestRunState.SUCCEEDED, f'attempt 2 is {served.state}'
+    assert served.trigger == IngestRunTrigger.RETRY, f'attempt 2 has trigger {served.trigger}'
+    assert served.dataset_id == entry_id, f'attempt 2 names dataset {served.dataset_id}, not {entry_id}'
+    assert served.bars_written == len(expected), f'attempt 2 wrote {served.bars_written} bars, not {len(expected)}'
+    assert served.served_start is not None and served.served_end is not None, (
+        f'attempt 2 has served range [{served.served_start}, {served.served_end})'
+    )
+    assert (served.error_domain, served.error_reason) == (None, None), 'the served attempt carries a reason'
 
 
 # ---------------------------------------------------------------------------------------------

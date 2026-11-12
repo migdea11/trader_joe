@@ -76,12 +76,39 @@ EXPECTED_DEV_TIMEOUT_SECONDS = 60
 DEV_VERBS = ('ps', 'logs')
 
 
-def _dev_steps(rig) -> list[list[str]]:
+# ps's ONE plain-docker read (ADR tj-4rr0la addendum 32 (6); tj-7zjov1.268): the project's non-one-off containers'
+# service label and the two env labels, so ps can report test_env's overrides by NAME. Read-only, project-filtered,
+# and never a container's environment. It is not a compose argv, so it is pinned whole here and kept out of the
+# compose-prefix sweeps below, which stay exactly as tj-tq2hn6 wrote them for every compose step.
+EXPECTED_ENV_LABEL_READ = [
+    EXPECTED_DOCKER,
+    'ps',
+    '-a',
+    '--filter',
+    f'label=com.docker.compose.project={EXPECTED_DEV_PROJECT}',
+    '--filter',
+    'label=com.docker.compose.oneoff=False',
+    '--format',
+    '{{.Label "com.docker.compose.service"}}|{{.Label "trader_joe.agent.env_generation"}}|'
+    '{{.Label "trader_joe.agent.env_names"}}',
+]
+
+
+def _all_steps(rig) -> list[list[str]]:
     return [list(step.argv) for step in rig.docker.steps]
 
 
+def _dev_steps(rig) -> list[list[str]]:
+    """The compose steps; any other argv must be ps's one env-label read, word for word, and only ps's."""
+    argvs = _all_steps(rig)
+    plain = [argv for argv in argvs if argv[1:2] != ['compose']]
+    assert plain in ([], [EXPECTED_ENV_LABEL_READ]), plain
+    return [argv for argv in argvs if argv[1:2] == ['compose']]
+
+
 def _words(rig) -> set[str]:
-    return {word for step in rig.docker.steps for word in step.argv}
+    """Every word of the compose steps (ps's env-label read is pinned whole by _dev_steps instead)."""
+    return {word for argv in _dev_steps(rig) for word in argv}
 
 
 # ===============================================================================================
@@ -450,6 +477,11 @@ def test_every_accepted_dev_argv_also_passes_check_dev_argv_independently(
     assert rig.call(verb, dict(arguments))['status'] == 'ok'
     for argv in _dev_steps(rig):
         stack.check_dev_argv(argv)
+    # ps's env-label read has its own re-check, which accepts that one argv and nothing else.
+    labels = [argv for argv in _all_steps(rig) if argv[1:2] != ['compose']]
+    assert labels == ([EXPECTED_ENV_LABEL_READ] if verb == 'ps' else []), labels
+    for argv in labels:
+        stack.check_agent_env_labels_argv(argv)
 
 
 def test_the_dev_verbs_run_outside_the_repository_and_name_no_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):

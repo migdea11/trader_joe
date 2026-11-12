@@ -18,18 +18,29 @@ under the error_id it mints. It is never put in a detail or in metadata.
 """
 
 import math
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from datetime import UTC, datetime, timedelta
 from email.utils import parsedate_to_datetime
 from http import HTTPStatus
-from typing import Final
+from typing import Final, Protocol
 
 from alpaca.common.exceptions import APIError
 from requests import exceptions as requests_exceptions
 
 from common.enums.data_stock import DataSource
 from common.errors.vocabulary import ExogenousError, InvalidRequestError, Reason, TraderJoeError
-from data.ingest.app.brokers.rate_budget import RateBudget
+
+
+class RefillWindow(Protocol):
+    """A quota's declared window: what a 429 that names no reset is turned into.
+
+    The scheduler's ScopeWindow conforms.
+    """
+
+    @property
+    def declared_window_seconds(self) -> float:
+        """float: The vendor's declared window, the longest limit interval of the scope; 0.0 when none."""
+        ...
 
 
 # What the HTTP session raises, unwrapped by alpaca-py, when the vendor cannot be reached, does not answer in
@@ -44,7 +55,7 @@ _TRANSPORT_FAILURES: Final = (
 )
 
 # What the vendor's client raises that means the vendor could not be served, and nothing else: an error status
-# comes out as APIError, after the SDK has already retried a 429 and a 504 itself, and the rest is transport.
+# comes out as APIError (broker_api.request_page makes one request and never retries), and the rest is transport.
 VENDOR_FAILURES: Final = (APIError, *_TRANSPORT_FAILURES)
 
 # Unix seconds, the instant the rate-limit window resets.
@@ -56,7 +67,11 @@ _VENDOR: Final = {'vendor': DataSource.ALPACA_API.value}
 
 
 def classify_vendor_error(
-    error: BaseException, *, rate_budget: RateBudget, clock: Callable[[], datetime]
+    error: BaseException,
+    *,
+    rate_budget: RefillWindow,
+    clock: Callable[[], datetime],
+    last_reset: datetime | None = None,
 ) -> TraderJoeError | None:
     """Turn a failure of the vendor's client into the typed error it stands for.
 
@@ -67,10 +82,12 @@ def classify_vendor_error(
 
     Args:
         error (BaseException): What the vendor's client raised.
-        rate_budget (RateBudget): This vendor's budget, whose refill time stands in for a 429's reset when
+        rate_budget (RefillWindow): This vendor's quota scope, whose declared window stands in for a 429's reset when
             the response names none.
         clock (Callable[[], datetime]): The reader's clock: now for a reset_at, and the clock the error
             derives retry_after from.
+        last_reset (datetime | None): The reset the last response of the same scope named, still ahead of now, or
+            None. The first fallback of a 429 that names no reset itself (tj-7zjov1.56).
 
     Returns:
         TraderJoeError | None: The error, with `error` as its __cause__, or None when this cannot say what
@@ -80,7 +97,7 @@ def classify_vendor_error(
     """
     classified: TraderJoeError | None
     if isinstance(error, APIError):
-        classified = _classify_status(error, rate_budget, clock)
+        classified = _classify_status(error, rate_budget, clock, last_reset)
     elif isinstance(error, _TRANSPORT_FAILURES):
         classified = ExogenousError(
             Reason.VENDOR_UNAVAILABLE,
@@ -94,12 +111,14 @@ def classify_vendor_error(
     return classified
 
 
-def _classify_status(error: APIError, rate_budget: RateBudget, clock: Callable[[], datetime]) -> TraderJoeError | None:
+def _classify_status(
+    error: APIError, rate_budget: RefillWindow, clock: Callable[[], datetime], last_reset: datetime | None
+) -> TraderJoeError | None:
     status = error.status_code
     if status is None:
         return None
     if status == HTTPStatus.TOO_MANY_REQUESTS:
-        return _rate_limited(error, rate_budget, clock)
+        return _rate_limited(error, rate_budget, clock, last_reset)
     if status in (HTTPStatus.UNAUTHORIZED, HTTPStatus.FORBIDDEN):
         return ExogenousError(
             Reason.VENDOR_AUTH,
@@ -130,26 +149,38 @@ def _vendor_message(error: APIError, status: int) -> str:
     return f'Alpaca answered HTTP {status} without a readable message.'
 
 
-def _rate_limited(error: APIError, rate_budget: RateBudget, clock: Callable[[], datetime]) -> ExogenousError:
+def _rate_limited(
+    error: APIError, rate_budget: RefillWindow, clock: Callable[[], datetime], last_reset: datetime | None
+) -> ExogenousError:
     """Build VENDOR_RATE_LIMITED, which always says when the window resets (the error refuses to build without).
 
     The reset comes from the first source that gives one: the response's X-RateLimit-Reset (Unix seconds),
-    else its Retry-After, else the time this vendor's own RateBudget needs to refill completely.
+    else its Retry-After, else the reset the last response of the same scope named, else the vendor's declared
+    window (the longest limit interval of the scope).
     """
     now = clock()
     headers = getattr(getattr(error, 'response', None), 'headers', None) or {}
     reset_at = (
         _reset_from_header(headers.get(RATE_LIMIT_RESET_HEADER))
         or _reset_from_retry_after(headers.get(RETRY_AFTER_HEADER), now)
-        or now + timedelta(seconds=rate_budget.full_refill_seconds)
+        or last_reset
+        or now + timedelta(seconds=rate_budget.declared_window_seconds)
     )
     return ExogenousError(
-        Reason.VENDOR_RATE_LIMITED,
-        'Alpaca rate-limited the request, even after retrying it.',
-        metadata=_VENDOR,
-        reset_at=reset_at,
-        clock=clock,
+        Reason.VENDOR_RATE_LIMITED, 'Alpaca rate-limited the request.', metadata=_VENDOR, reset_at=reset_at, clock=clock
     )
+
+
+def reset_from_rate_limit_header(headers: Mapping[str, str]) -> datetime | None:
+    """Read the instant the rate-limit window resets off a response's headers, good or bad.
+
+    Args:
+        headers (Mapping[str, str]): The response headers.
+
+    Returns:
+        datetime | None: X-RateLimit-Reset as an instant, or None when absent or unreadable.
+    """
+    return _reset_from_header(headers.get(RATE_LIMIT_RESET_HEADER))
 
 
 def _reset_from_header(value: str | None) -> datetime | None:

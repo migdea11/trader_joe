@@ -40,6 +40,20 @@ on that route, so a regression that dropped its guard would stop at the 422 and 
 subscription that is collecting (by SQL, before the one request), and the request stops it with a
 confirmed override: past the guard, collect really goes false and an override row is written.
 
+THE PANEL WRITES (tj-7zjov1.36 W1 to W3, added by tj-7zjov1.242): the panel create, a panel's settings
+version and a source's settings version, all POST. Each request is one that WOULD write past the guard, so
+the 401 test's "nothing written" bites: the row counts of panel, panel_settings_version and
+panel_source_settings_version are taken before the request and compared after it. That needs a panel and a
+source settings version to exist, so a fixture seeds both BY SQL (the create names no source settings; on a source
+with no version it would write that source's version 1 itself, ADR tj-2ayia2, and the 7c row count would then
+depend on what the source already held). The source is MANUAL_ENTRY on
+purpose: it has no trading calendar, so the panel manager skips its panels, and the seeded panel is
+disabled besides; ALPACA_API holds the seed cast's panel and is the one the manager runs on. 7c is the write
+itself: 201, and exactly the rows it should add. Every row the fixture seeded or a request added carries
+this run's name prefix or reason marker and is deleted by SQL at teardown (test-only deletes: the panel
+tables are append-only). The 7d panel reads are the detail, its settings versions and the source's settings
+versions.
+
 NOT HERE: 7e (secret unset, restart -> every write 401) and 7f (no secret in the container logs)
 need container control; they are shell steps in the CI job (Sys-5, tj-vhboky.52).
 
@@ -52,7 +66,9 @@ assertion expression contains a response body from a write route. See DataStoreH
 conftest.py for how a failure is kept from printing it.
 """
 
+import uuid
 from collections.abc import Callable, Iterator
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Any
@@ -63,13 +79,26 @@ import sqlalchemy as sa
 from sqlalchemy.engine import Engine
 
 from common.enums.data_select import AssetType, DataType
-from common.enums.data_stock import ExpiryType, UpdateType
+from common.enums.data_stock import DataSource, ExpiryType, Granularity, UpdateType
 from data.store.app.database.models.dataset_deletion import DatasetDeletion
 from data.store.app.database.models.dataset_override_log import DatasetOverrideLog
+from data.store.app.database.models.panel import (
+    Panel,
+    PanelCadence,
+    PanelPass,
+    PanelSettingsVersion,
+    PanelSourceSettingsVersion,
+)
 from data.store.app.database.models.stock_market_activity import StockMarketActivity
 from data.store.app.database.models.store_dataset_entry import StoreDatasetEntry
 from routers.common.instance_secret import INSTANCE_SECRET_REJECTION_DETAIL
-from routers.data_store.app_endpoints import AssetDataInterface, AssetDatasetStoreInterface, UiDatasetWritesInterface
+from routers.data_store.app_endpoints import (
+    AssetDataInterface,
+    AssetDatasetStoreInterface,
+    UiDatasetWritesInterface,
+    UiPanelsInterface,
+    UiPanelWritesInterface,
+)
 from tests.system.problem_json import PROBLEM_JSON
 
 
@@ -90,6 +119,23 @@ SEED_END = datetime.fromisoformat('2001-03-30T21:00:00+00:00')
 POST_START = datetime.fromisoformat('2001-02-01T14:30:00+00:00')
 POST_END = datetime.fromisoformat('2001-04-30T21:00:00+00:00')
 
+PANEL_TABLE = Panel.__table__
+PANEL_SETTINGS_TABLE = PanelSettingsVersion.__table__
+SOURCE_SETTINGS_TABLE = PanelSourceSettingsVersion.__table__
+PANEL_PASS_TABLE = PanelPass.__table__
+# No trading calendar, so the panel manager never runs a pass on a panel here; see the module docstring.
+PANEL_SOURCE = DataSource.MANUAL_ENTRY
+# The {source} segment as the UI and the edge spell it: the proto enum name.
+PANEL_SOURCE_NAME = f'DATA_SOURCE_{PANEL_SOURCE.name}'
+# Complete settings: enabled has no default and the cadence is required on a new version (a panel has no size).
+PANEL_SETTINGS_BODY = {'enabled': False, 'cadence': 'PANEL_CADENCE_MONTHLY'}
+SOURCE_SETTINGS_BODY = {
+    'ramp_datasets_per_hour': 1,
+    'request_cap_per_hour': 2,
+    'corporate_action_window_pre_days': 3,
+    'corporate_action_window_post_days': 4,
+}
+
 
 class WriteRoute(StrEnum):
     DATASET_POST = 'dataset-post'
@@ -98,9 +144,29 @@ class WriteRoute(StrEnum):
     UI_EXPIRY_PATCH = 'ui-expiry-patch'
     UI_DATASET_DELETE = 'ui-dataset-delete'
     UI_COLLECTING_PATCH = 'ui-collecting-patch'
+    UI_PANEL_CREATE = 'ui-panel-create'
+    UI_PANEL_SETTINGS_POST = 'ui-panel-settings-post'
+    UI_SOURCE_SETTINGS_POST = 'ui-source-settings-post'
 
 
 REJECTED = ('absent', 'empty', 'wrong')
+
+
+@dataclass(frozen=True)
+class SeededPanel:
+    """The panel the panel writes address, and the names its rows and a request's rows carry.
+
+    Attributes:
+        id: The seeded panel, version 1 only.
+        source_version_no: The source settings version seeded for PANEL_SOURCE.
+        created_name: The name the create request gives its new panel.
+        reason: The reason every seeded row and every panel request carries, unique to the run.
+    """
+
+    id: uuid.UUID
+    source_version_no: int
+    created_name: str
+    reason: str
 
 
 def _dataset_path(symbol: str) -> str:
@@ -182,9 +248,108 @@ def seeded_entry(insert_entry: Callable[..., sa.Row], own_symbol: str, pg_engine
             conn.execute(sa.delete(table).where(table.c.dataset_id == entry.id))
 
 
+def _panel_rows(pg_engine: Engine) -> tuple[int, int, int]:
+    """(panel, panel_settings_version, panel_source_settings_version) rows in the whole database."""
+    with pg_engine.connect() as conn:
+        return tuple(
+            conn.execute(sa.select(sa.func.count()).select_from(table)).scalar_one()
+            for table in (PANEL_TABLE, PANEL_SETTINGS_TABLE, SOURCE_SETTINGS_TABLE)
+        )
+
+
+def _settings_version_nos(pg_engine: Engine, panel_id: Any) -> list[int]:
+    with pg_engine.connect() as conn:
+        return list(
+            conn.execute(
+                sa.select(PANEL_SETTINGS_TABLE.c.version_no)
+                .where(PANEL_SETTINGS_TABLE.c.panel_id == panel_id)
+                .order_by(PANEL_SETTINGS_TABLE.c.version_no)
+            ).scalars()
+        )
+
+
+def _panels_named(pg_engine: Engine, name: str) -> list[Any]:
+    with pg_engine.connect() as conn:
+        return list(conn.execute(sa.select(PANEL_TABLE.c.id).where(PANEL_TABLE.c.name == name)).scalars())
+
+
+def _source_versions_with_reason(pg_engine: Engine, reason: str) -> list[int]:
+    with pg_engine.connect() as conn:
+        return list(
+            conn.execute(
+                sa.select(SOURCE_SETTINGS_TABLE.c.version_no)
+                .where(SOURCE_SETTINGS_TABLE.c.source == PANEL_SOURCE, SOURCE_SETTINGS_TABLE.c.reason == reason)
+                .order_by(SOURCE_SETTINGS_TABLE.c.version_no)
+            ).scalars()
+        )
+
+
 @pytest.fixture
-def send_write(data_store, run_identity, bar_create_body, adopt_entries, pg_engine) -> Callable[..., httpx.Response]:
-    """Send one write on `route` against `entry`, carrying `auth`. The owner is always the entry's own."""
+def seeded_panel(pg_engine: Engine, run_identity) -> Iterator[SeededPanel]:
+    """A disabled panel on PANEL_SOURCE with its version 1, on a source settings version of its own, seeded by SQL.
+
+    Teardown deletes every panel named with this test's prefix (the seeded one and any a create made), their
+    versions and passes, and every PANEL_SOURCE settings version carrying this test's reason.
+    """
+    tag = uuid.uuid4().hex[:8]
+    prefix = f'system-test-{run_identity.run_id}-secret-{tag}'
+    reason = f'secret probe {run_identity.run_id} {tag}'
+    try:
+        with pg_engine.begin() as conn:
+            latest = conn.execute(
+                sa.select(sa.func.coalesce(sa.func.max(SOURCE_SETTINGS_TABLE.c.version_no), 0)).where(
+                    SOURCE_SETTINGS_TABLE.c.source == PANEL_SOURCE
+                )
+            ).scalar_one()
+            conn.execute(
+                sa.insert(SOURCE_SETTINGS_TABLE).values(
+                    source=PANEL_SOURCE,
+                    version_no=latest + 1,
+                    # NULL is no limit (ADR tj-2ayia2): 0/0 is refused by the CHECKs now. The seeded panel is disabled
+                    # on a source with no calendar, so no limit lets the manager do nothing it would not anyway.
+                    ramp_datasets_per_hour=None,
+                    request_cap_per_hour=None,
+                    corporate_action_window_pre_days=90,
+                    corporate_action_window_post_days=90,
+                    actor='operator',
+                    reason=reason,
+                )
+            )
+            panel_id = conn.execute(
+                sa.insert(PANEL_TABLE)
+                .values(name=f'{prefix}-seeded', source=PANEL_SOURCE, granularity=Granularity.ONE_DAY)
+                .returning(PANEL_TABLE.c.id)
+            ).scalar_one()
+            conn.execute(
+                sa.insert(PANEL_SETTINGS_TABLE).values(
+                    panel_id=panel_id,
+                    version_no=1,
+                    enabled=False,
+                    cadence=PanelCadence.MONTHLY,
+                    include_otc=False,  # NOT NULL with no database default (ADR tj-ed4t8m D1)
+                    actor='operator',
+                    reason=reason,
+                )
+            )
+        yield SeededPanel(id=panel_id, source_version_no=latest + 1, created_name=f'{prefix}-created', reason=reason)
+    finally:
+        with pg_engine.begin() as conn:
+            panels = sa.select(PANEL_TABLE.c.id).where(PANEL_TABLE.c.name.like(f'{prefix}-%'))
+            conn.execute(sa.delete(PANEL_PASS_TABLE).where(PANEL_PASS_TABLE.c.panel_id.in_(panels)))
+            conn.execute(sa.delete(PANEL_SETTINGS_TABLE).where(PANEL_SETTINGS_TABLE.c.panel_id.in_(panels)))
+            conn.execute(sa.delete(PANEL_TABLE).where(PANEL_TABLE.c.name.like(f'{prefix}-%')))
+            conn.execute(
+                sa.delete(SOURCE_SETTINGS_TABLE).where(
+                    SOURCE_SETTINGS_TABLE.c.source == PANEL_SOURCE, SOURCE_SETTINGS_TABLE.c.reason == reason
+                )
+            )
+
+
+@pytest.fixture
+def send_write(
+    data_store, run_identity, bar_create_body, adopt_entries, pg_engine, seeded_panel
+) -> Callable[..., httpx.Response]:
+    """Send one write on `route` against `entry` (or the seeded panel), carrying `auth`. The owner is the entry's own."""
 
     def _send(route: WriteRoute, entry: sa.Row, auth: str) -> httpx.Response:
         match route:
@@ -216,6 +381,24 @@ def send_write(data_store, run_identity, bar_create_body, adopt_entries, pg_engi
                 _as_collecting_subscription(pg_engine, entry.id)
                 path = UiDatasetWritesInterface.PATCH_UI_DATASET_COLLECTING.format(dataset_id=entry.id)
                 return data_store.patch(path, json={'collect': False, 'override': UI_OVERRIDE}, auth=auth)
+            case WriteRoute.UI_PANEL_CREATE:
+                # No source settings: PANEL_SOURCE has the seeded version, so the create needs none.
+                body = {
+                    **PANEL_SETTINGS_BODY,
+                    'name': seeded_panel.created_name,
+                    'source': PANEL_SOURCE_NAME,
+                    'granularity': 'GRANULARITY_ONE_DAY',
+                    'reason': seeded_panel.reason,
+                }
+                return data_store.post(UiPanelWritesInterface.POST_UI_PANELS, json=body, auth=auth)
+            case WriteRoute.UI_PANEL_SETTINGS_POST:
+                path = UiPanelWritesInterface.POST_UI_PANEL_SETTINGS_VERSIONS.format(panel_id=seeded_panel.id)
+                body = {**PANEL_SETTINGS_BODY, 'reason': seeded_panel.reason}
+                return data_store.post(path, json=body, auth=auth)
+            case WriteRoute.UI_SOURCE_SETTINGS_POST:
+                path = UiPanelWritesInterface.POST_UI_PANEL_SOURCE_SETTINGS_VERSIONS.format(source=PANEL_SOURCE_NAME)
+                body = {**SOURCE_SETTINGS_BODY, 'reason': seeded_panel.reason}
+                return data_store.post(path, json=body, auth=auth)
         raise AssertionError(f'unhandled route {route!r}')
 
     return _send
@@ -233,6 +416,7 @@ def test_write_without_the_right_secret_is_401_and_changes_nothing(
     pg_engine: Engine,
 ) -> None:
     """7a/7b: absent, empty or wrong secret -> 401 with the fixed detail, no secret in the body, no change."""
+    panel_rows = _panel_rows(pg_engine)
     response = send_write(route, seeded_entry, auth)
 
     # FIRST, and as a bool: if the body leaked the secret, no later assertion may print the body.
@@ -269,12 +453,15 @@ def test_write_without_the_right_secret_is_401_and_changes_nothing(
     assert collect == _collect_before(route, seeded_entry), f'{route} {auth}: collect moved to {collect} after a 401'
     audit = _audit_rows(pg_engine, seeded_entry.id)
     assert audit == (0, 0), f'{route} {auth}: (override, deletion) audit rows {audit} after a 401'
+    after = _panel_rows(pg_engine)
+    assert after == panel_rows, f'{route} {auth}: (panel, settings, source settings) rows {panel_rows} -> {after}'
 
 
 @pytest.mark.parametrize('route', list(WriteRoute))
 def test_write_with_the_right_secret_reaches_the_handler(
     route: WriteRoute,
     seeded_entry: sa.Row,
+    seeded_panel: SeededPanel,
     send_write: Callable[..., httpx.Response],
     data_store,
     adopt_entries: Callable[[str], list],
@@ -286,8 +473,11 @@ def test_write_with_the_right_secret_reaches_the_handler(
     docstring for why this is the success signal here. DELETE: 200 and the entry is gone. Bar
     POST: 200 and the bar is stored. /ui/v1 PATCH: 200, the expiry stored and one override row.
     /ui/v1 DELETE: 204, the entry gone, one override row and one deletion row. /ui/v1 collecting
-    PATCH: 200, collect stored false and one override row.
+    PATCH: 200, collect stored false and one override row. Panel create: 201, one panel of the
+    name sent with its version 1, no source version. Panel settings POST: 201 and the seeded panel's
+    version 2. Source settings POST: 201 and one more PANEL_SOURCE version, numbered after the seeded one.
     """
+    panel_rows = _panel_rows(pg_engine)
     response = send_write(route, seeded_entry, 'right')
 
     # FIRST, as in the 401 test. This is the one path where the RECEIVED header value IS the
@@ -318,6 +508,49 @@ def test_write_with_the_right_secret_reaches_the_handler(
             assert response.status_code == 200, data_store.describe(response)
             assert _stored_collect(pg_engine, seeded_entry.id) is False, data_store.describe(response)
             assert _audit_rows(pg_engine, seeded_entry.id) == (1, 0), data_store.describe(response)
+        case WriteRoute.UI_PANEL_CREATE:
+            assert response.status_code == 201, data_store.describe(response)
+            (created,) = _panels_named(pg_engine, seeded_panel.created_name)
+            assert response.json()['id'] == str(created), data_store.describe(response)
+            assert _settings_version_nos(pg_engine, created) == [1], data_store.describe(response)
+            assert _delta(panel_rows, _panel_rows(pg_engine)) == (1, 1, 0), data_store.describe(response)
+        case WriteRoute.UI_PANEL_SETTINGS_POST:
+            assert response.status_code == 201, data_store.describe(response)
+            assert _settings_version_nos(pg_engine, seeded_panel.id) == [1, 2], data_store.describe(response)
+            assert _delta(panel_rows, _panel_rows(pg_engine)) == (0, 1, 0), data_store.describe(response)
+        case WriteRoute.UI_SOURCE_SETTINGS_POST:
+            assert response.status_code == 201, data_store.describe(response)
+            seeded_no = seeded_panel.source_version_no
+            versions = _source_versions_with_reason(pg_engine, seeded_panel.reason)
+            assert versions == [seeded_no, seeded_no + 1], data_store.describe(response)
+            assert _delta(panel_rows, _panel_rows(pg_engine)) == (0, 0, 1), data_store.describe(response)
+
+
+def _delta(before: tuple[int, ...], after: tuple[int, ...]) -> tuple[int, ...]:
+    return tuple(now - then for then, now in zip(before, after, strict=True))
+
+
+@pytest.mark.parametrize('auth', ['absent', 'wrong'])
+def test_panel_reads_are_open_without_the_secret(auth: str, seeded_panel: SeededPanel, data_store) -> None:
+    """7d for the panel writes: the detail, its settings versions and the source's versions answer 200 without it."""
+    detail = data_store.get(UiPanelsInterface.GET_UI_PANEL.format(panel_id=seeded_panel.id), auth=auth)
+    assert detail.status_code == 200, data_store.describe(detail)
+    assert detail.json()['id'] == str(seeded_panel.id), data_store.describe(detail)
+
+    versions = data_store.get(
+        UiPanelsInterface.GET_UI_PANEL_SETTINGS_VERSIONS.format(panel_id=seeded_panel.id), auth=auth
+    )
+    assert versions.status_code == 200, data_store.describe(versions)
+    assert [item['versionNo'] for item in versions.json()['items']] == [1], data_store.describe(versions)
+
+    sources = data_store.get(
+        UiPanelsInterface.GET_UI_PANEL_SOURCE_SETTINGS_VERSIONS.format(source=PANEL_SOURCE_NAME), auth=auth
+    )
+    assert sources.status_code == 200, data_store.describe(sources)
+    newest = sources.json()['items'][0]
+    assert (newest['versionNo'], newest['reason']) == (seeded_panel.source_version_no, seeded_panel.reason), (
+        data_store.describe(sources)
+    )
 
 
 @pytest.mark.parametrize('auth', ['absent', 'wrong'])

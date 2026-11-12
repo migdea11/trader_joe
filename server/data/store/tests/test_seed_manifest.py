@@ -138,6 +138,21 @@ def test_each_select_follows_the_documented_algorithm():
     assert select.endswith(' FROM "store_dataset_entry"')
 
 
+def test_the_instance_marker_digests_in_instance_id_order():
+    """ingest_instance has no id (bead tj-7zjov1.100): every select orders by dump.order_column, instance_id."""
+    selects = _selects(column_digest_sql('ingest_instance', ['instance_id', 'superseded_at']))
+    assert len(selects) == 2
+    for select in selects:
+        assert "E'\\n' ORDER BY instance_id)" in select
+        assert 'ORDER BY id)' not in select
+
+
+@pytest.mark.parametrize('table', ['stock_market_activity', 'ingest_request', 'ingest_run'])
+def test_every_other_seed_table_digests_in_id_order(table):
+    (select,) = _selects(column_digest_sql(table, ['id']))
+    assert "E'\\n' ORDER BY id)" in select
+
+
 def test_identifiers_are_quoted_and_literals_escaped():
     """Names come from information_schema, not from a constant: a quote in one must not escape."""
     (select,) = _selects(column_digest_sql('we"ird', ['o\'dd"col']))

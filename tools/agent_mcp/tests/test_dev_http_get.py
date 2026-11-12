@@ -38,7 +38,13 @@ from pathlib import Path
 import pytest
 
 from tools.agent_mcp import runner, stack
-from tools.agent_mcp.tests.harness import FakeDocker, default_response, forbid_real_subprocesses, make_rig
+from tools.agent_mcp.tests.harness import (
+    FakeDocker,
+    assert_no_budget_wording,
+    default_response,
+    forbid_real_subprocesses,
+    make_rig,
+)
 
 
 pytestmark = pytest.mark.build_infra
@@ -1468,13 +1474,14 @@ def test_zero_or_several_containers_are_refused_with_no_exec(
 
 
 def test_the_migrate_status_docstring_scopes_writes_nothing_to_the_database():
-    """dev_migrate_status' scoping, kept by migrate_status (tj-iee6sn.10), which adds that it charges no budget."""
+    """dev_migrate_status' scoping, kept by migrate_status (tj-iee6sn.10); its budget clause went with addendum 33."""
     doc = runner.AgentStack._migrate_status.__doc__ or ''
     assert (
-        'Takes no argument, charges no budget and writes nothing to the database (Python may write bytecode '
+        'Takes no argument and writes nothing to the database (Python may write bytecode '
         'caches into the bind-mounted checkout, as make migrate-status does);'
     ) in doc
     assert 'Takes no argument, writes nothing,' not in doc
+    assert_no_budget_wording(doc)
 
 
 def test_the_http_get_docstring_names_the_three_paths_and_the_bound():

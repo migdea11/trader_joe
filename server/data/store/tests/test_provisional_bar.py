@@ -7,7 +7,7 @@ period addendum) is the context:
         (DAILY_REFRESH_SETTLE_MINUTES, default 30, the same setting the refresh waits by). The period is the SESSION
         for 1min..1day (an intraday bar is judged by its session's close, not its own end: tj-grna9p.172), the last
         session of the week or month for 1week and 1month, in the calendar's zone. A period holding no session has
-        no close, so its bar is final. The margin reaches the rule as an argument (FreshnessConfig.settle_margin):
+        no close, so its bar is final. The margin reaches the rule as an argument (HealthConfig.settle_margin):
         the evaluation never reads the environment.
     (2) a DAILY dataset reads FRESH only when its newest bar is of the expected period AND final; a provisional one
         reads LATE with the normal deadline (the next session's open after the expected period), OVERDUE after it.
@@ -61,17 +61,18 @@ from data.store.app.database.models.stock_market_activity import StockMarketActi
 from data.store.app.health import (
     SETTLE_ENV,
     DatasetHealth,
-    FreshnessConfig,
-    FreshnessStatus,
+    DatasetHealthStatus,
+    HealthConfig,
     bar_period_close,
     evaluate_dataset,
     last_bar_is_provisional,
     settle_margin_from_env,
+    written_before_its_stamp,
 )
 from data.store.app.trading_calendar import NaiveDatetimeError, session_of
 from data.store.tests import test_daily_refresh, test_ui_datasets_route
 from data.store.tests.test_daily_refresh import LAST_BAR, LAST_CLOSE, ScriptedClient, World, _add, _scheduled_run
-from data.store.tests.test_freshness_periods import (
+from data.store.tests.test_health_periods import (
     GRID_LAST_BARS,
     GRID_NOWS,
     GRID_RANGES,
@@ -343,9 +344,9 @@ def test_the_margin_passed_moves_the_final_instant_to_the_close_plus_that_margin
 
 
 @pytest.mark.parametrize('granularity', [Granularity.ONE_MINUTE, DAY, WEEK, MONTH], ids=str)
-def test_the_default_margin_is_thirty_minutes_and_a_freshness_config_s(granularity):
+def test_the_default_margin_is_thirty_minutes_and_a_health_config_s(granularity):
     assert health.DEFAULT_SETTLE_MINUTES == 30
-    assert health.DEFAULT_SETTLE_MARGIN == SETTLE == FreshnessConfig().settle_margin
+    assert health.DEFAULT_SETTLE_MARGIN == SETTLE == HealthConfig().settle_margin
     bar_at, close = {
         Granularity.ONE_MINUTE: (z('2026-10-20T15:00:00Z'), OCT20_CLOSE),
         DAY: (SEED_BAR, OCT20_CLOSE),
@@ -358,8 +359,8 @@ def test_the_default_margin_is_thirty_minutes_and_a_freshness_config_s(granulari
 
 def test_a_negative_margin_is_refused_by_the_config():
     with pytest.raises(ValueError):
-        FreshnessConfig(settle_margin=-MINUTE)
-    assert FreshnessConfig(settle_margin=timedelta(0)).settle_margin == timedelta(0)
+        HealthConfig(settle_margin=-MINUTE)
+    assert HealthConfig(settle_margin=timedelta(0)).settle_margin == timedelta(0)
 
 
 @pytest.mark.parametrize('granularity', list(Granularity), ids=str)
@@ -376,39 +377,54 @@ def test_a_naive_write_time_is_refused():
         daily(SUB_START, OCT20_CLOSE, SEED_BAR, DAY, datetime(2026, 10, 20, 16, 16))
 
 
-# ------------------------------------------------------------------------------------------------- DAILY freshness
+# ---------------------------------------------------------------------------------------------------- DAILY health
 
 # (now, written, status) for the seed: the expected period is Tue 20 Oct from its close until Wed 21 Oct's close.
 SEED_CASES = {
-    'at the 20:30Z pass, written mid-session: LATE': (z('2026-10-20T20:30:00Z'), SEED_WRITTEN, FreshnessStatus.LATE),
-    'at the close itself, written mid-session: LATE': (OCT20_CLOSE, SEED_WRITTEN, FreshnessStatus.LATE),
-    'a tick before the next open: still LATE': (OCT21_OPEN - TICK, SEED_WRITTEN, FreshnessStatus.LATE),
-    'at the next open: OVERDUE': (OCT21_OPEN, SEED_WRITTEN, FreshnessStatus.OVERDUE),
-    'during the next session: OVERDUE': (z('2026-10-21T17:00:00Z'), SEED_WRITTEN, FreshnessStatus.OVERDUE),
-    'a tick before the next close: OVERDUE': (z('2026-10-21T20:00:00Z') - TICK, SEED_WRITTEN, FreshnessStatus.OVERDUE),
-    'written at the close, inside the margin: LATE': (z('2026-10-20T20:45:00Z'), OCT20_CLOSE, FreshnessStatus.LATE),
+    'at the 20:30Z pass, written mid-session: LATE': (
+        z('2026-10-20T20:30:00Z'),
+        SEED_WRITTEN,
+        DatasetHealthStatus.LATE,
+    ),
+    # 'at the close itself, written mid-session: LATE' was removed on 2026-11-10: the owner's ruling (addendum on
+    # decision tj-grna9p.8, built in 8ecbb33a) owes the 20th only from its close plus SETTLE, so at the bare close the
+    # expected period is the 19th and the provisional bar of the 20th reads FRESH. That row is
+    # test_the_seed_s_provisional_bar_reads_fresh_until_the_close_plus_the_margin below.
+    'a tick before the next open: still LATE': (OCT21_OPEN - TICK, SEED_WRITTEN, DatasetHealthStatus.LATE),
+    'at the next open: OVERDUE': (OCT21_OPEN, SEED_WRITTEN, DatasetHealthStatus.OVERDUE),
+    'during the next session: OVERDUE': (z('2026-10-21T17:00:00Z'), SEED_WRITTEN, DatasetHealthStatus.OVERDUE),
+    'a tick before the next close: OVERDUE': (
+        z('2026-10-21T20:00:00Z') - TICK,
+        SEED_WRITTEN,
+        DatasetHealthStatus.OVERDUE,
+    ),
+    'written at the close, inside the margin: LATE': (z('2026-10-20T20:45:00Z'), OCT20_CLOSE, DatasetHealthStatus.LATE),
     'written 5 minutes after the close: LATE': (
         z('2026-10-20T20:45:00Z'),
         OCT20_CLOSE + 5 * MINUTE,
-        FreshnessStatus.LATE,
+        DatasetHealthStatus.LATE,
     ),
     'written a tick before the close plus the margin: LATE': (
         z('2026-10-20T20:45:00Z'),
         OCT20_SETTLED - TICK,
-        FreshnessStatus.LATE,
+        DatasetHealthStatus.LATE,
     ),
-    'written at the close plus the margin: FRESH': (z('2026-10-20T20:45:00Z'), OCT20_SETTLED, FreshnessStatus.FRESH),
+    'written at the close plus the margin: FRESH': (
+        z('2026-10-20T20:45:00Z'),
+        OCT20_SETTLED,
+        DatasetHealthStatus.FRESH,
+    ),
     'written 31 minutes after the close: FRESH at once': (
         z('2026-10-20T20:45:00Z'),
         OCT20_CLOSE + 31 * MINUTE,
-        FreshnessStatus.FRESH,
+        DatasetHealthStatus.FRESH,
     ),
-    'unknown write time: FRESH': (z('2026-10-20T20:30:00Z'), None, FreshnessStatus.FRESH),
-    'repaired overnight: FRESH': (z('2026-10-21T01:00:00Z'), z('2026-10-21T00:30:00Z'), FreshnessStatus.FRESH),
+    'unknown write time: FRESH': (z('2026-10-20T20:30:00Z'), None, DatasetHealthStatus.FRESH),
+    'repaired overnight: FRESH': (z('2026-10-21T01:00:00Z'), z('2026-10-21T00:30:00Z'), DatasetHealthStatus.FRESH),
     'repaired during the next session: FRESH again': (
         z('2026-10-21T17:00:00Z'),
         z('2026-10-21T16:00:00Z'),
-        FreshnessStatus.FRESH,
+        DatasetHealthStatus.FRESH,
     ),
 }
 
@@ -418,12 +434,26 @@ def test_the_seed_scenario(now, written, status):
     assert daily(SUB_START, now, SEED_BAR, DAY, written) == DatasetHealth(status, d('2026-10-20'), SEED_BAR)
 
 
+def test_the_seed_s_provisional_bar_reads_fresh_until_the_close_plus_the_margin():
+    """A provisional bar must not read LATE before the trigger (the 2026-11-10 ruling).
+
+    Between the close and close plus SETTLE the 20th is not owed, so its provisional bar is newer than the expected
+    period (the 19th) and reads FRESH; from 20:30Z it is the expected period and LATE.
+    """
+    fresh = DatasetHealth(DatasetHealthStatus.FRESH, d('2026-10-19'), m(d('2026-10-19')))
+    for now in (OCT20_CLOSE, z('2026-10-20T20:15:00Z'), OCT20_SETTLED - TICK):
+        assert daily(SUB_START, now, SEED_BAR, DAY, SEED_WRITTEN) == fresh, now
+    assert daily(SUB_START, OCT20_SETTLED, SEED_BAR, DAY, SEED_WRITTEN) == DatasetHealth(
+        DatasetHealthStatus.LATE, d('2026-10-20'), SEED_BAR
+    )
+
+
 def test_during_the_open_session_the_provisional_bar_of_that_session_reads_as_before():
     """At 16:30Z on the 20th the expected period is the 19th; the 20th's still-open bar is newer and owes nothing."""
     now = z('2026-10-20T16:30:00Z')
     got = daily(SUB_START, now, SEED_BAR, DAY, SEED_WRITTEN)
     assert got == daily(SUB_START, now, SEED_BAR, DAY, None)
-    assert got == DatasetHealth(FreshnessStatus.FRESH, d('2026-10-19'), m(d('2026-10-19')))
+    assert got == DatasetHealth(DatasetHealthStatus.FRESH, d('2026-10-19'), m(d('2026-10-19')))
 
 
 def test_a_missed_pass_reads_as_before_the_change():
@@ -431,17 +461,24 @@ def test_a_missed_pass_reads_as_before_the_change():
     now = z('2026-10-22T21:00:00Z')  # after the 22nd's close; the 21st was never stored
     got = daily(SUB_START, now, SEED_BAR, DAY, SEED_WRITTEN)
     assert got == daily(SUB_START, now, SEED_BAR, DAY, None) == _old_daily(SUB_START, OPEN_ENDED, SEED_BAR, XNYS, now)
-    assert got.status is FreshnessStatus.OVERDUE
+    assert got.status is DatasetHealthStatus.OVERDUE
 
 
 def test_the_provisional_deadline_is_the_next_open_after_an_early_close_and_a_holiday():
-    """Fri 27 Nov closes 18:00Z; the next session is Mon 30 Nov, opening 14:30Z (EST)."""
+    """Fri 27 Nov closes 18:00Z; the next session is Mon 30 Nov, opening 14:30Z (EST).
+
+    Since the 2026-11-10 ruling the half-day is owed from ITS close plus SETTLE, 18:30Z: at the bare close the bar is
+    newer than the expected period (Wed 25 Nov) and reads FRESH. The deadline did not move.
+    """
     friday = m(d('2026-11-27'))
     written = z('2026-11-27T17:00:00Z')
-    expected = DatasetHealth(FreshnessStatus.LATE, d('2026-11-27'), friday)
-    assert daily(SUB_START, z('2026-11-27T18:00:00Z'), friday, DAY, written) == expected
+    expected = DatasetHealth(DatasetHealthStatus.LATE, d('2026-11-27'), friday)
+    wednesday = DatasetHealth(DatasetHealthStatus.FRESH, d('2026-11-25'), m(d('2026-11-25')))
+    assert daily(SUB_START, z('2026-11-27T18:00:00Z'), friday, DAY, written) == wednesday
+    assert daily(SUB_START, z('2026-11-27T18:30:00Z') - TICK, friday, DAY, written) == wednesday
+    assert daily(SUB_START, z('2026-11-27T18:30:00Z'), friday, DAY, written) == expected
     assert daily(SUB_START, z('2026-11-30T14:30:00Z') - TICK, friday, DAY, written) == expected
-    assert daily(SUB_START, z('2026-11-30T14:30:00Z'), friday, DAY, written).status is FreshnessStatus.OVERDUE
+    assert daily(SUB_START, z('2026-11-30T14:30:00Z'), friday, DAY, written).status is DatasetHealthStatus.OVERDUE
 
 
 @pytest.mark.parametrize('granularity', INTRADAY, ids=str)
@@ -451,11 +488,11 @@ def test_an_intraday_subscription_s_session_last_bar_is_final_only_after_the_clo
     now = z('2026-10-20T21:00:00Z')
     for written in (OCT20_CLOSE - TICK, OCT20_CLOSE, OCT20_CLOSE + 5 * MINUTE, OCT20_SETTLED - TICK):
         assert daily(SUB_START, now, last, granularity, written) == DatasetHealth(
-            FreshnessStatus.LATE, d('2026-10-20'), SEED_BAR
+            DatasetHealthStatus.LATE, d('2026-10-20'), SEED_BAR
         ), written
     for written in (OCT20_SETTLED, OCT20_CLOSE + 31 * MINUTE):
-        assert daily(SUB_START, now, last, granularity, written).status is FreshnessStatus.FRESH, written
-    assert daily(SUB_START, OCT21_OPEN, last, granularity, OCT20_CLOSE).status is FreshnessStatus.OVERDUE
+        assert daily(SUB_START, now, last, granularity, written).status is DatasetHealthStatus.FRESH, written
+    assert daily(SUB_START, OCT21_OPEN, last, granularity, OCT20_CLOSE).status is DatasetHealthStatus.OVERDUE
 
 
 def test_fixed_a_30min_daily_dataset_fetched_mid_session_reads_late_then_overdue_and_is_re_fetched_from_its_bar():
@@ -469,13 +506,18 @@ def test_fixed_a_30min_daily_dataset_fetched_mid_session_reads_late_then_overdue
     written = SEED_WRITTEN
     assert bar_period_close(last, XNYS, THIRTY) == OCT20_CLOSE
     assert last_bar_is_provisional(last, written, XNYS, THIRTY)
-    late = DatasetHealth(FreshnessStatus.LATE, d('2026-10-20'), SEED_BAR)
+    late = DatasetHealth(DatasetHealthStatus.LATE, d('2026-10-20'), SEED_BAR)
     # While the session is open the expected period is the 19th; the 20th's bars are newer and owe nothing yet.
-    assert daily(SUB_START, z('2026-10-20T16:30:00Z'), last, THIRTY, written).status is FreshnessStatus.FRESH
-    assert daily(SUB_START, OCT20_CLOSE, last, THIRTY, written) == late
+    assert daily(SUB_START, z('2026-10-20T16:30:00Z'), last, THIRTY, written).status is DatasetHealthStatus.FRESH
+    # 2026-11-10 ruling: the 20th is owed only from its close plus SETTLE, so at the bare close the bars are still
+    # newer than the expected period (the 19th) and read FRESH; LATE starts at 20:30Z, when the refresh fires.
+    assert daily(SUB_START, OCT20_CLOSE, last, THIRTY, written) == DatasetHealth(
+        DatasetHealthStatus.FRESH, d('2026-10-19'), m(d('2026-10-19'))
+    )
+    assert daily(SUB_START, OCT20_SETTLED - TICK, last, THIRTY, written).status is DatasetHealthStatus.FRESH
     assert daily(SUB_START, OCT20_SETTLED, last, THIRTY, written) == late
     assert daily(SUB_START, OCT21_OPEN - TICK, last, THIRTY, written) == late
-    assert daily(SUB_START, OCT21_OPEN, last, THIRTY, written).status is FreshnessStatus.OVERDUE
+    assert daily(SUB_START, OCT21_OPEN, last, THIRTY, written).status is DatasetHealthStatus.OVERDUE
 
     row = _row(last, written, THIRTY)
     assert _fetch_start(row, XNYS) == last
@@ -488,7 +530,7 @@ def test_fixed_a_30min_daily_dataset_fetched_mid_session_reads_late_then_overdue
     # The re-fetch after the close plus the margin brings the session's last bar, final: FRESH, and the tail moves on.
     repaired = _row(z('2026-10-20T19:30:00Z'), z('2026-10-20T20:31:00Z'), THIRTY)
     assert daily(SUB_START, z('2026-10-20T20:45:00Z'), repaired.last_bar, THIRTY, repaired.last_bar_written_at) == (
-        DatasetHealth(FreshnessStatus.FRESH, d('2026-10-20'), SEED_BAR)
+        DatasetHealth(DatasetHealthStatus.FRESH, d('2026-10-20'), SEED_BAR)
     )
     assert _fetch_start(repaired, XNYS) == OCT20_CLOSE
     assert DailyRefresher._behind([repaired], frozenset(), XNYS, z('2026-10-20T20:45:00Z')) == []
@@ -500,7 +542,7 @@ def test_every_intraday_granularity_fetched_mid_session_reads_late_after_the_clo
     last = z('2026-10-20T16:00:00Z') - granularity.offset
     assert last_bar_is_provisional(last, SEED_WRITTEN, XNYS, granularity)
     got = daily(SUB_START, OCT20_SETTLED, last, granularity, SEED_WRITTEN)
-    assert got == DatasetHealth(FreshnessStatus.LATE, d('2026-10-20'), SEED_BAR)
+    assert got == DatasetHealth(DatasetHealthStatus.LATE, d('2026-10-20'), SEED_BAR)
     assert _fetch_start(_row(last, SEED_WRITTEN, granularity), XNYS) == last
 
 
@@ -517,7 +559,7 @@ PERIODIC_CASES = {
         WEEK_BAR,
         z('2026-10-16T15:00:00Z'),
         z('2026-10-17T12:00:00Z'),
-        FreshnessStatus.LATE,
+        DatasetHealthStatus.LATE,
     ),
     'week, a tick before Monday open: LATE': (
         WEEK,
@@ -525,7 +567,7 @@ PERIODIC_CASES = {
         WEEK_BAR,
         z('2026-10-16T15:00:00Z'),
         z('2026-10-19T13:30:00Z') - TICK,
-        FreshnessStatus.LATE,
+        DatasetHealthStatus.LATE,
     ),
     'week, at Monday open: OVERDUE': (
         WEEK,
@@ -533,7 +575,7 @@ PERIODIC_CASES = {
         WEEK_BAR,
         z('2026-10-16T15:00:00Z'),
         z('2026-10-19T13:30:00Z'),
-        FreshnessStatus.OVERDUE,
+        DatasetHealthStatus.OVERDUE,
     ),
     'week, written Tuesday, Saturday: LATE': (
         WEEK,
@@ -541,7 +583,7 @@ PERIODIC_CASES = {
         WEEK_BAR,
         z('2026-10-13T15:00:00Z'),
         z('2026-10-17T12:00:00Z'),
-        FreshnessStatus.LATE,
+        DatasetHealthStatus.LATE,
     ),
     'week, written at the Friday close, inside the margin: LATE': (
         WEEK,
@@ -549,7 +591,7 @@ PERIODIC_CASES = {
         WEEK_BAR,
         z('2026-10-16T20:00:00Z'),
         z('2026-10-17T12:00:00Z'),
-        FreshnessStatus.LATE,
+        DatasetHealthStatus.LATE,
     ),
     'week, written Friday 20:29Z: LATE': (
         WEEK,
@@ -557,7 +599,7 @@ PERIODIC_CASES = {
         WEEK_BAR,
         z('2026-10-16T20:29:00Z'),
         z('2026-10-17T12:00:00Z'),
-        FreshnessStatus.LATE,
+        DatasetHealthStatus.LATE,
     ),
     'week, written at the Friday close plus the margin: FRESH': (
         WEEK,
@@ -565,7 +607,7 @@ PERIODIC_CASES = {
         WEEK_BAR,
         z('2026-10-16T20:30:00Z'),
         z('2026-10-17T12:00:00Z'),
-        FreshnessStatus.FRESH,
+        DatasetHealthStatus.FRESH,
     ),
     'week, unknown write time: FRESH': (
         WEEK,
@@ -573,7 +615,7 @@ PERIODIC_CASES = {
         WEEK_BAR,
         None,
         z('2026-10-17T12:00:00Z'),
-        FreshnessStatus.FRESH,
+        DatasetHealthStatus.FRESH,
     ),
     'Good Friday week, written Thu 19:00Z, on Good Friday: LATE': (
         WEEK,
@@ -581,7 +623,7 @@ PERIODIC_CASES = {
         m(d('2026-03-30')),
         z('2026-04-02T19:00:00Z'),
         z('2026-04-03T15:00:00Z'),
-        FreshnessStatus.LATE,
+        DatasetHealthStatus.LATE,
     ),
     'Good Friday week, written Thu 20:00Z (its last close): LATE': (
         WEEK,
@@ -589,7 +631,7 @@ PERIODIC_CASES = {
         m(d('2026-03-30')),
         z('2026-04-02T20:00:00Z'),
         z('2026-04-03T15:00:00Z'),
-        FreshnessStatus.LATE,
+        DatasetHealthStatus.LATE,
     ),
     'Good Friday week, written Thu 20:30Z (its last close plus the margin): FRESH': (
         WEEK,
@@ -597,7 +639,7 @@ PERIODIC_CASES = {
         m(d('2026-03-30')),
         z('2026-04-02T20:30:00Z'),
         z('2026-04-03T15:00:00Z'),
-        FreshnessStatus.FRESH,
+        DatasetHealthStatus.FRESH,
     ),
     'Good Friday week, at Mon 6 Apr open: OVERDUE': (
         WEEK,
@@ -605,7 +647,7 @@ PERIODIC_CASES = {
         m(d('2026-03-30')),
         z('2026-04-02T19:00:00Z'),
         z('2026-04-06T13:30:00Z'),
-        FreshnessStatus.OVERDUE,
+        DatasetHealthStatus.OVERDUE,
     ),
     'month, written a minute before the 30th close: LATE': (
         MONTH,
@@ -613,7 +655,7 @@ PERIODIC_CASES = {
         MONTH_BAR,
         z('2026-09-30T19:59:00Z'),
         z('2026-10-01T01:00:00Z'),
-        FreshnessStatus.LATE,
+        DatasetHealthStatus.LATE,
     ),
     'month, at the 1 Oct open: OVERDUE': (
         MONTH,
@@ -621,7 +663,7 @@ PERIODIC_CASES = {
         MONTH_BAR,
         z('2026-09-30T19:59:00Z'),
         z('2026-10-01T13:30:00Z'),
-        FreshnessStatus.OVERDUE,
+        DatasetHealthStatus.OVERDUE,
     ),
     'month, written at the 30th close, inside the margin: LATE': (
         MONTH,
@@ -629,7 +671,7 @@ PERIODIC_CASES = {
         MONTH_BAR,
         z('2026-09-30T20:00:00Z'),
         z('2026-10-01T01:00:00Z'),
-        FreshnessStatus.LATE,
+        DatasetHealthStatus.LATE,
     ),
     'month, written at the 30th close plus the margin: FRESH': (
         MONTH,
@@ -637,7 +679,7 @@ PERIODIC_CASES = {
         MONTH_BAR,
         z('2026-09-30T20:30:00Z'),
         z('2026-10-01T01:00:00Z'),
-        FreshnessStatus.FRESH,
+        DatasetHealthStatus.FRESH,
     ),
 }
 
@@ -665,17 +707,17 @@ PERIODIC_MARGIN_CASES = {
     ('granularity', 'start', 'last_bar', 'close'), PERIODIC_MARGIN_CASES.values(), ids=PERIODIC_MARGIN_CASES
 )
 def test_weekly_and_monthly_take_the_configured_margin_on_the_period_s_last_close(granularity, start, last_bar, close):
-    config = FreshnessConfig(settle_margin=timedelta(hours=2))
+    config = HealthConfig(settle_margin=timedelta(hours=2))
     now = close + timedelta(hours=3)
-    assert daily(start, now, last_bar, granularity, close + SETTLE, config=config).status is FreshnessStatus.LATE
+    assert daily(start, now, last_bar, granularity, close + SETTLE, config=config).status is DatasetHealthStatus.LATE
     assert daily(start, now, last_bar, granularity, close + timedelta(hours=2) - TICK, config=config).status is (
-        FreshnessStatus.LATE
+        DatasetHealthStatus.LATE
     )
     assert daily(start, now, last_bar, granularity, close + timedelta(hours=2), config=config).status is (
-        FreshnessStatus.FRESH
+        DatasetHealthStatus.FRESH
     )
     # And the same write time under the default margin is already final.
-    assert daily(start, now, last_bar, granularity, close + SETTLE).status is FreshnessStatus.FRESH
+    assert daily(start, now, last_bar, granularity, close + SETTLE).status is DatasetHealthStatus.FRESH
 
 
 def test_a_still_open_week_holding_a_provisional_bar_reads_as_before():
@@ -684,7 +726,7 @@ def test_a_still_open_week_holding_a_provisional_bar_reads_as_before():
     bar_at = m(d('2026-10-19'))
     got = daily(WEEKLY_SUB_START, now, bar_at, WEEK, z('2026-10-20T15:00:00Z'))
     assert got == daily(WEEKLY_SUB_START, now, bar_at, WEEK, None)
-    assert got.status is FreshnessStatus.FRESH
+    assert got.status is DatasetHealthStatus.FRESH
 
 
 @pytest.mark.parametrize('update_type', [UpdateType.DAILY, UpdateType.STREAM], ids=str)
@@ -703,7 +745,7 @@ def test_a_retired_dataset_is_retired_whatever_its_last_bar_s_write_time(update_
             now=z('2026-10-20T20:30:00Z'),
             last_bar_written_at=written,
         )
-        assert got == DatasetHealth(FreshnessStatus.RETIRED)
+        assert got == DatasetHealth(DatasetHealthStatus.RETIRED)
 
 
 @pytest.mark.parametrize('update_type', [UpdateType.STATIC, UpdateType.STREAM], ids=str)
@@ -732,7 +774,7 @@ def test_static_and_stream_ignore_the_write_time(update_type, granularity):
 
 # ------------------------------------------------------------------------------------------------- equivalence grid
 #
-# Over the grid of test_freshness_periods.py (a weekend, the DST change, Thanksgiving and its half-day, boundary ranges,
+# Over the grid of test_health_periods.py (a weekend, the DST change, Thanksgiving and its half-day, boundary ranges,
 # every open and close a tick either side): a FINAL or unknown write time gives exactly the pre-change result for
 # 1min..1day, and a provisional one changes only a FRESH whose last bar is of the expected period, into LATE before the
 # next open and OVERDUE from it, with the same expected period. FINAL is now written at or after the SESSION's close
@@ -745,7 +787,9 @@ def test_a_completed_bar_gives_exactly_the_pre_change_result(granularity):
     for start, end in GRID_RANGES:
         for now in GRID_NOWS:
             for last_bar in GRID_LAST_BARS:
-                old = _old_daily(start, end, last_bar, XNYS, now)
+                # The oracle owes a session from its close plus SETTLE (2026-11-10 ruling, 8ecbb33a); the deadline is
+                # the real now's. Before that ruling the oracle judged both at now.
+                old = _old_daily(start, end, last_bar, XNYS, now, owed_now=now - SETTLE)
                 close = None if last_bar is None else bar_period_close(last_bar, XNYS, granularity)
                 settled = None if close is None else close + SETTLE
                 long_after = None if close is None else close + timedelta(days=3)
@@ -758,8 +802,9 @@ def test_a_completed_bar_gives_exactly_the_pre_change_result(granularity):
     assert judged_at_settle, 'the grid never wrote a bar exactly at its close plus the margin'
 
 
+# A write BEFORE the bar's own stamp is judged at the write time instead (decision tj-7zjov1.120 ruling 6), pinned by
+# test_a_bar_written_before_its_stamp_is_judged_at_its_write_time below; this own-period rule does not cover it.
 WITHHOLDING_WRITES = {
-    'a day before its own timestamp': lambda last_bar, close: last_bar - timedelta(days=1),
     'at its session close': lambda last_bar, close: close,
     'inside the margin': lambda last_bar, close: close + 5 * MINUTE,
     'a tick before the margin ends': lambda last_bar, close: close + SETTLE - TICK,
@@ -775,22 +820,185 @@ def test_a_provisional_bar_only_ever_withholds_fresh_for_its_own_expected_period
             for last_bar in GRID_LAST_BARS:
                 if last_bar is None:
                     continue
-                old = _old_daily(start, end, last_bar, XNYS, now)
+                # Owed from the close plus SETTLE (2026-11-10 ruling, 8ecbb33a); the deadline at the real now.
+                old = _old_daily(start, end, last_bar, XNYS, now, owed_now=now - SETTLE)
                 written = write(last_bar, bar_period_close(last_bar, XNYS, granularity))
                 assert last_bar_is_provisional(last_bar, written, XNYS, granularity), (last_bar, written)
                 got = daily(start, now, last_bar, granularity, written, end)
                 own_period = old.expected_last_session == session_of(last_bar, XNYS)
                 provisional = last_bar_is_provisional(last_bar, written, XNYS, granularity)
-                if old.status is FreshnessStatus.FRESH and own_period and provisional:
+                if old.status is DatasetHealthStatus.FRESH and own_period and provisional:
                     flipped += 1
                     deadline = XNYS.session_open(XNYS.next_session(old.expected_last_session))
-                    want = FreshnessStatus.LATE if now < deadline else FreshnessStatus.OVERDUE
+                    want = DatasetHealthStatus.LATE if now < deadline else DatasetHealthStatus.OVERDUE
                     if got != DatasetHealth(want, old.expected_last_session, old.expected_last_bar):
                         differ.append(('flip', start, end, now, last_bar, got, old))
                 elif got != old:
                     differ.append(('same', start, end, now, last_bar, got, old))
     assert not differ, differ[:5]
     assert flipped, 'the grid never reached a provisional bar of the expected period'
+
+
+# ------------------------------------------------------------------------------------------------- written early
+# Decision tj-7zjov1.120 rulings 5 and 6 (b41354d): a newest real bar written strictly BEFORE its own stamp is judged
+# AT ITS WRITE TIME, by the ordinary rule. Equality is not before.
+
+BEFORE_STAMP_WRITES = {
+    'a day before its own timestamp': lambda last_bar: last_bar - timedelta(days=1),
+    'a tick before its own timestamp': lambda last_bar: last_bar - TICK,
+    'an hour before its own timestamp': lambda last_bar: last_bar - timedelta(hours=1),
+}
+
+
+@pytest.mark.parametrize('write', BEFORE_STAMP_WRITES.values(), ids=BEFORE_STAMP_WRITES)
+@pytest.mark.parametrize('granularity', SESSION_GRANULARITIES, ids=str)
+def test_a_bar_written_before_its_stamp_is_judged_at_its_write_time(granularity, write):
+    """Over the whole grid: the same health as a bar STAMPED at its write time (and written then)."""
+    differ, early = [], 0
+    for start, end in GRID_RANGES:
+        for now in GRID_NOWS:
+            for last_bar in GRID_LAST_BARS:
+                if last_bar is None:
+                    continue
+                written = write(last_bar)
+                got = daily(start, now, last_bar, granularity, written, end)
+                if written < start:
+                    continue  # a write before the declared start is no bar of the range to judge by
+                want = daily(start, now, written, granularity, written, end)
+                early += 1
+                if got != want:
+                    differ.append((start, end, now, last_bar, written, got, want))
+    assert early, 'the grid never judged an early bar'
+    assert not differ, differ[:5]
+
+
+# (granularity, newest real bar, its write time, now, status): the architect's table on tj-7zjov1.114, by hand.
+WRITTEN_EARLY_TABLE = {
+    # D1: Mon 2 Nov never stored, the newest bar Fri 30 Oct written early: a missed session is a failure.
+    'D1 a day before its stamp, 2 Nov missed: OVERDUE': (
+        DAY,
+        z('2026-10-30T04:00:00Z'),
+        z('2026-10-29T04:00:00Z'),
+        z('2026-11-03T21:00:00Z'),
+        DatasetHealthStatus.OVERDUE,
+    ),
+    'D1 a tick before its stamp, 2 Nov missed: OVERDUE': (
+        DAY,
+        z('2026-10-30T04:00:00Z'),
+        z('2026-10-30T04:00:00Z') - TICK,
+        z('2026-11-03T21:00:00Z'),
+        DatasetHealthStatus.OVERDUE,
+    ),
+    'D1 control, written after its stamp: OVERDUE': (
+        DAY,
+        z('2026-10-30T04:00:00Z'),
+        z('2026-10-30T21:00:00Z'),
+        z('2026-11-03T21:00:00Z'),
+        DatasetHealthStatus.OVERDUE,
+    ),
+    # D2: a mid-session 1min fetch whose last bar is stamped 30 s after the transaction start.
+    'D2 1min written 30 s before its stamp, 15:00Z: FRESH': (
+        Granularity.ONE_MINUTE,
+        z('2026-10-20T14:37:00Z'),
+        z('2026-10-20T14:36:30Z'),
+        z('2026-10-20T15:00:00Z'),
+        DatasetHealthStatus.FRESH,
+    ),
+    # F7: a 1min fetch at the 20:30Z pass, last bar 20:31Z, written 20:30:10Z.
+    'F7 at 20 Oct 21:00Z: FRESH': (
+        Granularity.ONE_MINUTE,
+        z('2026-10-20T20:31:00Z'),
+        z('2026-10-20T20:30:10Z'),
+        z('2026-10-20T21:00:00Z'),
+        DatasetHealthStatus.FRESH,
+    ),
+    'F7 at 21 Oct 15:00Z: FRESH': (
+        Granularity.ONE_MINUTE,
+        z('2026-10-20T20:31:00Z'),
+        z('2026-10-20T20:30:10Z'),
+        z('2026-10-21T15:00:00Z'),
+        DatasetHealthStatus.FRESH,
+    ),
+    'F7 at 21 Oct 20:31Z: LATE': (
+        Granularity.ONE_MINUTE,
+        z('2026-10-20T20:31:00Z'),
+        z('2026-10-20T20:30:10Z'),
+        z('2026-10-21T20:31:00Z'),
+        DatasetHealthStatus.LATE,
+    ),
+    # A 1day bar stamped a week ahead (27 Oct), written 20 Oct 15:00Z: owed at the first close after its write.
+    'a week ahead, at 20 Oct 21:00Z: LATE': (
+        DAY,
+        z('2026-10-27T04:00:00Z'),
+        z('2026-10-20T15:00:00Z'),
+        z('2026-10-20T21:00:00Z'),
+        DatasetHealthStatus.LATE,
+    ),
+    'a week ahead, at 21 Oct 00:00Z: LATE': (
+        DAY,
+        z('2026-10-27T04:00:00Z'),
+        z('2026-10-20T15:00:00Z'),
+        z('2026-10-21T00:00:00Z'),
+        DatasetHealthStatus.LATE,
+    ),
+    'a week ahead, at 21 Oct 15:00Z: OVERDUE': (
+        DAY,
+        z('2026-10-27T04:00:00Z'),
+        z('2026-10-20T15:00:00Z'),
+        z('2026-10-21T15:00:00Z'),
+        DatasetHealthStatus.OVERDUE,
+    ),
+    # Ruling 5: written exactly AT its stamp is not early (and judging at it changes nothing: the same instant).
+    'written at its stamp, mid-session: FRESH': (
+        Granularity.ONE_MINUTE,
+        z('2026-10-20T14:37:00Z'),
+        z('2026-10-20T14:37:00Z'),
+        z('2026-10-20T15:00:00Z'),
+        DatasetHealthStatus.FRESH,
+    ),
+    'unknown write time: final, FRESH': (
+        Granularity.ONE_MINUTE,
+        z('2026-10-20T14:37:00Z'),
+        None,
+        z('2026-10-20T15:00:00Z'),
+        DatasetHealthStatus.FRESH,
+    ),
+}
+
+
+@pytest.mark.parametrize(
+    ('granularity', 'last_bar', 'written', 'now', 'status'), WRITTEN_EARLY_TABLE.values(), ids=WRITTEN_EARLY_TABLE
+)
+def test_the_written_early_table(granularity, last_bar, written, now, status):
+    assert daily(SUB_START, now, last_bar, granularity, written).status is status
+
+
+def test_written_before_its_stamp_is_strict_and_unknown_is_not_before():
+    stamp = z('2026-10-20T14:37:00Z')
+    assert written_before_its_stamp(stamp, stamp - TICK) is True
+    assert written_before_its_stamp(stamp, stamp) is False
+    assert written_before_its_stamp(stamp, stamp + TICK) is False
+    assert written_before_its_stamp(stamp, None) is False
+    assert written_before_its_stamp(None, stamp) is False
+
+
+def test_the_refresh_and_health_share_the_one_predicate():
+    """Ruling 5: one comparison, in health, used by both. A second copy in the refresh would drift (F9)."""
+    assert refresh_module.written_before_its_stamp is health.written_before_its_stamp
+    calls: list[tuple] = []
+
+    def spy(bar, written_at):
+        calls.append((bar, written_at))
+        return health.written_before_its_stamp(bar, written_at)
+
+    row = _row(z('2026-10-09T04:00:00Z'), z('2026-10-09T04:00:00Z'))
+    original = refresh_module.written_before_its_stamp
+    refresh_module.written_before_its_stamp = spy
+    try:
+        _fetch_start(row, XNYS, [], z('2026-10-14T22:00:00Z'))
+    finally:
+        refresh_module.written_before_its_stamp = original
+    assert (z('2026-10-09T04:00:00Z'), z('2026-10-09T04:00:00Z')) in calls, 'the refresh did not ask the predicate'
 
 
 # ------------------------------------------------------------------------------------------------- the fetch start
@@ -873,7 +1081,14 @@ FETCH_CASES = {
         _row(MONTH_BAR, z('2026-09-30T20:30:00Z'), MONTH, MONTHLY_SUB_START),
         MONTH_BAR + MONTH.offset,
     ),
-    'a bar on a non-session day: one bar on': (_row(m(d('2026-10-24')), z('2026-10-23T12:00:00Z')), m(d('2026-10-25'))),
+    # A real bar on a non-session day counts and the tail is one bar on. Its fixture was written BEFORE its stamp
+    # (23 Oct for a 24 Oct bar), which no longer counts (decision tj-7zjov1.120): written after its stamp here, and
+    # the early write pinned on its own next.
+    'a bar on a non-session day: one bar on': (_row(m(d('2026-10-24')), z('2026-10-24T12:00:00Z')), m(d('2026-10-25'))),
+    'a bar on a non-session day written before its stamp: the session of the write': (
+        _row(m(d('2026-10-24')), z('2026-10-23T12:00:00Z')),
+        m(d('2026-10-23')),
+    ),
 }
 
 
@@ -916,7 +1131,7 @@ def test_the_refresh_owes_a_provisional_seed_and_not_a_final_one():
 #
 # DAILY_REFRESH_SETTLE_MINUTES decides both when the refresh pass runs after a close and when a bar is final. It is
 # parsed in ONE place (health.settle_margin_from_env); the refresh reads it through that, the catalog through
-# FreshnessConfig.from_env, and the evaluation itself only ever sees the margin it is passed.
+# HealthConfig.from_env, and the evaluation itself only ever sees the margin it is passed.
 
 # (raw value or None for unset, minutes)
 SETTLE_PARSE_CASES = {
@@ -939,17 +1154,17 @@ SETTLE_PARSE_CASES = {
 def test_the_settle_margin_parser(raw, minutes):
     environ = {} if raw is None else {SETTLE_ENV: raw}
     assert settle_margin_from_env(environ) == timedelta(minutes=minutes)
-    assert FreshnessConfig.from_env(environ).settle_margin == timedelta(minutes=minutes)
+    assert HealthConfig.from_env(environ).settle_margin == timedelta(minutes=minutes)
 
 
 @pytest.mark.parametrize(('raw', 'minutes'), SETTLE_PARSE_CASES.values(), ids=SETTLE_PARSE_CASES)
-def test_the_refresh_s_settle_delay_and_the_freshness_margin_are_one_setting(monkeypatch, raw, minutes):
+def test_the_refresh_s_settle_delay_and_the_health_margin_are_one_setting(monkeypatch, raw, minutes):
     if raw is not None:
         monkeypatch.setenv(SETTLE_ENV, raw)
     want = timedelta(minutes=minutes)
     assert refresh_module.settle_delay() == want
     assert settle_margin_from_env() == want
-    assert FreshnessConfig.from_env().settle_margin == want
+    assert HealthConfig.from_env().settle_margin == want
 
 
 def test_the_settle_env_name_is_unchanged_and_re_exported_by_the_refresh():
@@ -958,7 +1173,7 @@ def test_the_settle_env_name_is_unchanged_and_re_exported_by_the_refresh():
     assert refresh_module.SETTLE_ENV is health.SETTLE_ENV
     assert refresh_module.DEFAULT_SETTLE_MINUTES is health.DEFAULT_SETTLE_MINUTES
     assert refresh_module.settle_margin_from_env is health.settle_margin_from_env
-    assert refresh_module.FreshnessConfig is health.FreshnessConfig
+    assert refresh_module.HealthConfig is health.HealthConfig
 
 
 def _server_sources():
@@ -997,20 +1212,25 @@ def test_the_evaluation_never_reads_the_environment(monkeypatch):
     at_close, settled = OCT20_CLOSE, OCT20_SETTLED
     monkeypatch.setenv(SETTLE_ENV, '0')
     assert last_bar_is_provisional(SEED_BAR, at_close, XNYS, DAY)
-    assert daily(SUB_START, now, SEED_BAR, DAY, at_close).status is FreshnessStatus.LATE
-    assert daily(SUB_START, now, z('2026-10-20T15:30:00Z'), THIRTY, at_close).status is FreshnessStatus.LATE
+    assert daily(SUB_START, now, SEED_BAR, DAY, at_close).status is DatasetHealthStatus.LATE
+    assert daily(SUB_START, now, z('2026-10-20T15:30:00Z'), THIRTY, at_close).status is DatasetHealthStatus.LATE
     # Through the config the caller builds, it does.
-    assert daily(SUB_START, now, SEED_BAR, DAY, at_close, config=FreshnessConfig.from_env()).status is (
-        FreshnessStatus.FRESH
+    assert daily(SUB_START, now, SEED_BAR, DAY, at_close, config=HealthConfig.from_env()).status is (
+        DatasetHealthStatus.FRESH
     )
     monkeypatch.setenv(SETTLE_ENV, '120')
     assert not last_bar_is_provisional(SEED_BAR, settled, XNYS, DAY)
-    assert daily(SUB_START, now, SEED_BAR, DAY, settled).status is FreshnessStatus.FRESH
+    assert daily(SUB_START, now, SEED_BAR, DAY, settled).status is DatasetHealthStatus.FRESH
     assert daily(WEEKLY_SUB_START, z('2026-10-17T12:00:00Z'), WEEK_BAR, WEEK, z('2026-10-16T20:30:00Z')).status is (
-        FreshnessStatus.FRESH
+        DatasetHealthStatus.FRESH
     )
-    assert daily(SUB_START, now, SEED_BAR, DAY, settled, config=FreshnessConfig.from_env()).status is (
-        FreshnessStatus.LATE
+    # Judged at the close plus the configured 120 minutes (22:00Z): since the 2026-11-10 ruling the 20th is owed only
+    # from then, so at 21:00Z it read FRESH against the 19th whatever the bar's write time. At 22:00Z the bar written
+    # at 20:30Z is provisional under the 120-minute margin taken from the config the caller built.
+    after_long_margin = z('2026-10-20T22:00:00Z')
+    assert daily(SUB_START, after_long_margin, SEED_BAR, DAY, settled).status is DatasetHealthStatus.FRESH
+    assert daily(SUB_START, after_long_margin, SEED_BAR, DAY, settled, config=HealthConfig.from_env()).status is (
+        DatasetHealthStatus.LATE
     )
 
 
@@ -1021,7 +1241,7 @@ def test_the_evaluation_calls_no_env_reader(monkeypatch):
         raise AssertionError('the evaluation read the environment')
 
     monkeypatch.setattr(health, 'settle_margin_from_env', refuse)
-    monkeypatch.setattr(health.FreshnessConfig, 'from_env', classmethod(refuse))
+    monkeypatch.setattr(health.HealthConfig, 'from_env', classmethod(refuse))
     # health's only route to the environment is its `os` import: without one, any access is an AttributeError.
     monkeypatch.setattr(health, 'os', SimpleNamespace())
     for granularity, start, last_bar in (
@@ -1087,6 +1307,11 @@ async def test_a_pass_re_fetches_a_provisional_newest_bar_inclusively_and_once(w
     (request,) = [r for r in client.requests if world.name_of(r.asset_symbol) == 'fresh']
     assert request.start == LAST_BAR['fresh'], 'the provisional bar itself is not in the tail'
     assert result == PassResult(behind=5, refreshed=5)
+    # The REQUEST ROW is the refresh's record since the push path (tj-7zjov1.28): the pass writes it and submits, and
+    # an attempt row exists only once ingest delivers (world.deliver), carrying the request's window.
+    stored = await world.request_of('fresh')
+    assert stored.requested_start == LAST_BAR['fresh']
+    await world.deliver('fresh')
     (run,) = [run for run in await world.runs() if run.dataset_id == world.rows['fresh'].id]
     assert run.requested_start == LAST_BAR['fresh']
 
@@ -1224,26 +1449,26 @@ async def test_list_detail_filter_and_facets_agree_on_a_provisional_daily_datase
     )
     late = {str(provisional.id), str(inside_margin.id), str(at_close.id)}
     fresh = {str(settled.id), str(final.id)}
-    want = {**dict.fromkeys(late, 'FRESHNESS_STATUS_LATE'), **dict.fromkeys(fresh, 'FRESHNESS_STATUS_FRESH')}
+    want = {**dict.fromkeys(late, 'DATASET_HEALTH_STATUS_LATE'), **dict.fromkeys(fresh, 'DATASET_HEALTH_STATUS_FRESH')}
 
     assert await _catalog_statuses(client) == want
     for dataset_id, status in want.items():
         body = (await client.get(f'/ui/v1/datasets/{dataset_id}')).json()
-        assert body['freshness']['status'] == status, dataset_id
+        assert body['health']['status'] == status, dataset_id
     assert {item['id'] for item in await list_all(client, status='late')} == late
     assert {item['id'] for item in await list_all(client, status='healthy')} == fresh
     facets = (await client.get('/ui/v1/datasets/facets')).json()
     counts = {facet['status']: int(facet.get('count', '0')) for facet in facets['statuses']}
-    assert (counts['FRESHNESS_STATUS_LATE'], counts['FRESHNESS_STATUS_FRESH']) == (3, 2)
+    assert (counts['DATASET_HEALTH_STATUS_LATE'], counts['DATASET_HEALTH_STATUS_FRESH']) == (3, 2)
     assert int(facets['needsAttention']) == 3
     # The detail's expected period is the 6th, the provisional bar's own session.
     body = (await client.get(f'/ui/v1/datasets/{provisional.id}')).json()
-    assert body['freshness']['expectedLastBar'] == '2026-10-06T04:00:00Z'
+    assert body['health']['expectedLastBar'] == '2026-10-06T04:00:00Z'
 
 
 @pytest.mark.asyncio
 async def test_the_catalog_routes_take_the_margin_from_the_settle_setting(client, engine, monkeypatch):
-    """dataset_catalog builds its FreshnessConfig from the environment per read: the routes follow the variable."""
+    """dataset_catalog builds its HealthConfig from the environment per read: the routes follow the variable."""
     at_close = entry('CLS', update_type=UpdateType.DAILY)
     inside = entry('MRG', update_type=UpdateType.DAILY)
     await store(
@@ -1266,11 +1491,11 @@ async def test_the_catalog_routes_take_the_margin_from_the_settle_setting(client
             monkeypatch.delenv(SETTLE_ENV, raising=False)
         else:
             monkeypatch.setenv(SETTLE_ENV, raw)
-        want = {i: f'FRESHNESS_STATUS_{s}' for i, s in zip(ids, statuses, strict=True)}
+        want = {i: f'DATASET_HEALTH_STATUS_{s}' for i, s in zip(ids, statuses, strict=True)}
         assert await _catalog_statuses(client) == want, raw
         for dataset_id, status in want.items():
             body = (await client.get(f'/ui/v1/datasets/{dataset_id}')).json()
-            assert body['freshness']['status'] == status, (raw, dataset_id)
+            assert body['health']['status'] == status, (raw, dataset_id)
 
 
 def test_the_fixture_clock_is_the_one_this_section_reasons_about():

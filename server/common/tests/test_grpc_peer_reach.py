@@ -55,9 +55,11 @@ import grpc
 import pytest
 from grpc_health.v1 import health, health_pb2, health_pb2_grpc
 
-from common.rpc.channel import DATA_INGEST_GRPC_TARGET_ENV
+from common.rpc.channel import DATA_INGEST_GRPC_TARGET_ENV, DATA_STORE_GRPC_TARGET_ENV
 from common.rpc.ping import ping_service
 from common.rpc.server import GRPC_HOST_ENV, GRPC_PORT_ENV, BindAddress, GrpcServerHost
+from common.rpc.store import SERVICE_NAME as STORE_SERVICE_NAME
+from common.rpc.store import store_service
 from common.tests import grpc_peer_docker_stub as stub
 from common.tests.compose_model import BASE_FILE, interpolate, load
 from common.tests.image_path import image_pythonpath
@@ -70,16 +72,27 @@ from common.tests.test_ci_invariants import (
     _system_step,
 )
 from common.tests.test_grpc_bind_network import (
+    API_NET,
     CONTAINER_ID,
     DATA_INGEST_LAUNCH_SETS,
+    DB_NET,
+    DS_API_V4,
+    DS_API_V6,
+    DS_DB_V4,
+    DS_INGEST_V4,
+    DS_INGEST_V6,
     EGRESS_NET,
     EGRESS_V4,
     EGRESS_V6,
     HOST,
     PORT,
+    STORE_CONTAINER_ID,
+    STORE_HOST,
     STORE_NET,
+    STORE_PORT,
     STORE_V4,
     STORE_V6,
+    UNSET_V6,
     _model,
     _net,
     _report,
@@ -210,6 +223,60 @@ async def _grpc_peer(host: str, state: str) -> AsyncIterator[int]:
     await server.start()
     try:
         await servicer.set('', health_pb2.HealthCheckResponse.ServingStatus.Value(state))
+        yield port
+    finally:
+        await server.stop(None)
+
+
+class _NoDelivery:
+    """A DeliveryHandler no health check reaches: StoreService is registered, and only its health is asked."""
+
+    async def deliver(self, attempt):
+        raise AssertionError('a health probe must never deliver an attempt')
+
+    async def register_instance(self, request):
+        raise AssertionError('a health probe must never register an instance')
+
+
+# data_store's gRPC listener in each state the store healthcheck and the peer step's reverse leg must tell apart.
+STORE_STATES = ('SERVING', 'STOPPED', 'STORE_NOT_SERVING', 'NO_STORE_SERVICE', 'OVERALL_NOT_SERVING')
+
+
+@contextlib.asynccontextmanager
+async def _store_peer(host: str, state: str) -> AsyncIterator[int]:
+    """data_store's gRPC listener on HOST in STATE; yields its port (tj-7zjov1.49).
+
+    SERVING is production's own host, GrpcServerHost serving StoreService: '' and the StoreService name
+    both read SERVING, as data_store's lifespan hosts it. STOPPED started and stopped, so nothing listens.
+    STORE_NOT_SERVING is that host with StoreService's named status set NOT_SERVING through production's
+    set_service_health. NO_STORE_SERVICE is a production host serving only PingService, so the StoreService
+    name is unregistered and answers NOT_FOUND. OVERALL_NOT_SERVING is the standard health servicer on a
+    plain grpc.aio server, '' NOT_SERVING and StoreService SERVING, the status production's '' reports
+    only while it stops.
+    """
+    assert state in STORE_STATES, state
+    if state != 'OVERALL_NOT_SERVING':
+        services = [ping_service()] if state == 'NO_STORE_SERVICE' else [store_service(_NoDelivery())]
+        server = GrpcServerHost(BindAddress(host, 0), services, stop_grace_s=0.1)
+        await server.start()
+        try:
+            if state == 'STORE_NOT_SERVING':
+                await server.set_service_health(STORE_SERVICE_NAME, False)
+            port = server.port
+            if state == 'STOPPED':
+                await server.stop()
+            yield port
+        finally:
+            await server.stop()
+        return
+    server = grpc.aio.server()
+    servicer = health.aio.HealthServicer()
+    health_pb2_grpc.add_HealthServicer_to_server(servicer, server)
+    port = server.add_insecure_port(f'{host}:0')
+    await server.start()
+    try:
+        await servicer.set('', health_pb2.HealthCheckResponse.NOT_SERVING)
+        await servicer.set(STORE_SERVICE_NAME, health_pb2.HealthCheckResponse.SERVING)
         yield port
     finally:
         await server.stop(None)
@@ -377,39 +444,59 @@ def _execs_into(docker: list[list[str]], service: str) -> list[list[str]]:
     return [call for call in docker if call[:6] == ['compose', '-f', 'docker-compose.yaml', 'exec', '-T', service]]
 
 
-# The two calls the step makes into data_store: reading its DATA_INGEST_GRPC_TARGET, then dialling it.
-STORE_CALLS = 2
+# The calls the step makes into data_store: reading its DATA_INGEST_GRPC_TARGET, then dialling it, then
+# (tj-7zjov1.49, the reverse leg) reading its own bind host and port. Re-pinned from 2 for that leg.
+STORE_CALLS = 4
+# And into data_ingest: its bind host and port, then (the reverse leg) its DATA_STORE_GRPC_TARGET and the dial.
+INGEST_CALLS = 4
 
 
-def _peer_scenario(port: int | str, **changes: object) -> dict:
-    """A healthy, correctly configured stack: the bind data_ingest names, the target data_store carries, one listener.
+def _peer_scenario(port: int | str, store_port: int | str = STORE_PORT, **changes: object) -> dict:
+    """A healthy, correctly configured stack: each side's bind, the target the other side carries, two listeners.
 
     container_env and store_env are each a whole container environment, so a scenario can set the
-    client's target apart from the server's bind -- the drift addendum 5 item 7 exists to catch.
+    client's target apart from the server's bind -- the drift addendum 5 item 7 exists to catch, in
+    either direction since tj-7zjov1.49.
     """
     scenario = {
-        'container_env': {GRPC_HOST_ENV: HOST, GRPC_PORT_ENV: str(port), 'PATH': CONTAINER_PATH},
-        'store_env': {DATA_INGEST_GRPC_TARGET_ENV: f'{HOST}:{port}', 'PATH': CONTAINER_PATH},
+        'container_env': {
+            GRPC_HOST_ENV: HOST,
+            GRPC_PORT_ENV: str(port),
+            DATA_STORE_GRPC_TARGET_ENV: f'{STORE_HOST}:{store_port}',
+            'PATH': CONTAINER_PATH,
+        },
+        'store_env': {
+            DATA_INGEST_GRPC_TARGET_ENV: f'{HOST}:{port}',
+            GRPC_HOST_ENV: STORE_HOST,
+            GRPC_PORT_ENV: str(store_port),
+            'PATH': CONTAINER_PATH,
+        },
         'store_dns': {HOST: OFF_LOOPBACK},
+        'ingest_dns': {STORE_HOST: OFF_LOOPBACK},
     }
     scenario.update(changes)
     return scenario
 
 
-def _env_without(name: str, port: int | str = PORT) -> dict[str, str]:
-    return {key: value for key, value in _peer_scenario(port)['container_env'].items() if key != name}
+def _dials(logs: dict, container: str) -> list[str]:
+    """The targets CONTAINER handed grpc.insecure_channel, in order."""
+    return [call['target'] for call in logs['grpc'] if call['container'] == container]
 
 
-def _env_with(name: str, value: str, port: int | str = PORT) -> dict[str, str]:
-    return {**_peer_scenario(port)['container_env'], name: value}
+def _env_without(name: str, port: int | str = PORT, store_port: int | str = STORE_PORT) -> dict[str, str]:
+    return {key: value for key, value in _peer_scenario(port, store_port)['container_env'].items() if key != name}
 
 
-def _store_without(name: str, port: int | str = PORT) -> dict[str, str]:
-    return {key: value for key, value in _peer_scenario(port)['store_env'].items() if key != name}
+def _env_with(name: str, value: str, port: int | str = PORT, store_port: int | str = STORE_PORT) -> dict[str, str]:
+    return {**_peer_scenario(port, store_port)['container_env'], name: value}
 
 
-def _store_with(name: str, value: str, port: int | str = PORT) -> dict[str, str]:
-    return {**_peer_scenario(port)['store_env'], name: value}
+def _store_without(name: str, port: int | str = PORT, store_port: int | str = STORE_PORT) -> dict[str, str]:
+    return {key: value for key, value in _peer_scenario(port, store_port)['store_env'].items() if key != name}
+
+
+def _store_with(name: str, value: str, port: int | str = PORT, store_port: int | str = STORE_PORT) -> dict[str, str]:
+    return {**_peer_scenario(port, store_port)['store_env'], name: value}
 
 
 def _annotations(result: subprocess.CompletedProcess) -> list[str]:
@@ -419,18 +506,31 @@ def _annotations(result: subprocess.CompletedProcess) -> list[str]:
 
 @pytest.mark.asyncio
 async def test_the_peer_check_passes_when_data_store_gets_serving(tmp_path: Path):
-    """From inside data_store, Health.Check '' on the target data_store carries, once."""
-    async with _grpc_peer(OFF_LOOPBACK, 'SERVING') as port:
-        result, logs = await _run_step(tmp_path, PEER_STEP, _peer_scenario(port))
+    """From inside data_store, Health.Check '' on the target data_store carries, once.
+
+    Re-pinned for tj-7zjov1.49: then from inside data_ingest, Health.Check '' and StoreService on the
+    target data_ingest carries, over one channel, dialled once; both legs must pass for exit 0.
+    """
+    async with _grpc_peer(OFF_LOOPBACK, 'SERVING') as port, _store_peer(OFF_LOOPBACK, 'SERVING') as store_port:
+        result, logs = await _run_step(tmp_path, PEER_STEP, _peer_scenario(port, store_port))
     assert result.returncode == 0, _report(result)
     assert not logs['unmodelled'], logs['unmodelled']
-    assert logs['grpc'] == [{'target': f'{HOST}:{port}'}], (
-        f'data_store must dial {HOST}:{port}, the host and port data_ingest names, once: {logs["grpc"]}'
+    assert logs['grpc'] == [
+        {'container': DATA_STORE, 'target': f'{HOST}:{port}'},
+        {'container': DATA_INGEST, 'target': f'{STORE_HOST}:{store_port}'},
+    ], (
+        f'data_store must dial {HOST}:{port}, the host and port data_ingest names, once; then data_ingest '
+        f'{STORE_HOST}:{store_port}, once: {logs["grpc"]}'
     )
     assert len(_execs_into(logs['docker'], DATA_STORE)) == STORE_CALLS, (
-        f'expected {STORE_CALLS} calls from data_store, its target read and the dial: {logs["docker"]}'
+        f'expected {STORE_CALLS} calls from data_store, its target read, the dial and its bind: {logs["docker"]}'
+    )
+    assert len(_execs_into(logs['docker'], DATA_INGEST)) == INGEST_CALLS, (
+        f'expected {INGEST_CALLS} calls from data_ingest, its bind, its target read and the dial: {logs["docker"]}'
     )
     assert f'{HOST}:{port}: SERVING' in result.stdout, _report(result)
+    for name in ('', STORE_SERVICE_NAME):
+        assert f'{STORE_HOST}:{store_port} service {name!r}: SERVING' in result.stdout, _report(result)
 
 
 # A target compose hands over intact, and the same value with the whitespace a value picks up on its way
@@ -448,13 +548,13 @@ async def test_the_peer_check_dials_the_target_data_store_itself_carries(tmp_pat
     common.rpc.channel's target_from_env, which has no default. The step reads it with its own call into
     data_store -- hence two calls, not one -- and hands that value to the channel.
     """
-    async with _grpc_peer(OFF_LOOPBACK, 'SERVING') as port:
+    async with _grpc_peer(OFF_LOOPBACK, 'SERVING') as port, _store_peer(OFF_LOOPBACK, 'SERVING') as store_port:
         target = f'{HOST}:{port}'
-        store_env = _store_with(DATA_INGEST_GRPC_TARGET_ENV, spelling.format(target=target))
-        result, logs = await _run_step(tmp_path, PEER_STEP, _peer_scenario(port, store_env=store_env))
+        store_env = _store_with(DATA_INGEST_GRPC_TARGET_ENV, spelling.format(target=target), port, store_port)
+        result, logs = await _run_step(tmp_path, PEER_STEP, _peer_scenario(port, store_port, store_env=store_env))
     assert result.returncode == 0, _report(result)
     assert not logs['unmodelled'], logs['unmodelled']
-    assert logs['grpc'] == [{'target': target}], f'data_store must dial its own target {target} once: {logs["grpc"]}'
+    assert _dials(logs, DATA_STORE) == [target], f'data_store must dial its own target {target} once: {logs["grpc"]}'
     assert len(_execs_into(logs['docker'], DATA_STORE)) == STORE_CALLS, (
         f'the target must be read from the data_store container, not the runner environment: {logs["docker"]}'
     )
@@ -537,7 +637,10 @@ async def test_the_peer_check_fails_on_anything_but_serving_and_prints_why(tmp_p
         result, logs = await _run_step(tmp_path, PEER_STEP, _peer_scenario(port))
     assert result.returncode == 1, _report(result)
     assert not logs['unmodelled'], logs['unmodelled']
-    assert logs['grpc'] == [{'target': f'{HOST}:{port}'}], f'data_store never dialled {HOST}:{port}: {logs["grpc"]}'
+    # Re-pinned for tj-7zjov1.49's container field: data_store dialled once, and the step stopped there.
+    assert logs['grpc'] == [{'container': DATA_STORE, 'target': f'{HOST}:{port}'}], (
+        f'data_store never dialled {HOST}:{port}, or the step went on: {logs["grpc"]}'
+    )
     assert printed in result.stdout, _report(result)
 
 
@@ -562,6 +665,134 @@ async def test_the_peer_check_fails_when_it_cannot_ask(tmp_path: Path, scenario:
     assert not logs['grpc'], f'the step dialled {logs["grpc"]} without an address from data_ingest'
 
 
+# --- tj-7zjov1.49: the peer step's reverse leg, data_ingest -> data_store's StoreService ----------------
+#
+# Every case below has data_ingest's listener SERVING and data_store's forward call succeeding, so the
+# forward leg holds and whatever fails is the reverse leg's own refusal.
+
+
+async def _reverse_leg(tmp_path: Path, store_state: str, **changes) -> tuple[subprocess.CompletedProcess, dict, int]:
+    """Run the peer step with both listeners up, CHANGES applied to the scenario; (result, logs, store port)."""
+    async with _grpc_peer(OFF_LOOPBACK, 'SERVING') as port, _store_peer(OFF_LOOPBACK, store_state) as store_port:
+        built = {key: value(port, store_port) if callable(value) else value for key, value in changes.items()}
+        result, logs = await _run_step(tmp_path, PEER_STEP, _peer_scenario(port, store_port, **built))
+    assert not logs['unmodelled'], logs['unmodelled']
+    assert _dials(logs, DATA_STORE) == [f'{HOST}:{port}'], f'the forward leg did not run first: {logs["grpc"]}'
+    assert 'gRPC peer reach holds: data_store' in result.stdout, f'the forward leg did not hold:\n{_report(result)}'
+    return result, logs, store_port
+
+
+_REVERSE_NO_TARGET = {
+    'target unset': lambda port, store_port: _env_without(DATA_STORE_GRPC_TARGET_ENV, port, store_port),
+    'target empty': lambda port, store_port: _env_with(DATA_STORE_GRPC_TARGET_ENV, '', port, store_port),
+    'target blank': lambda port, store_port: _env_with(DATA_STORE_GRPC_TARGET_ENV, '   ', port, store_port),
+}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('container_env', list(_REVERSE_NO_TARGET.values()), ids=list(_REVERSE_NO_TARGET))
+async def test_the_reverse_leg_fails_naming_the_variable_when_data_ingest_has_no_target(tmp_path: Path, container_env):
+    """No DATA_STORE_GRPC_TARGET in data_ingest: exit 1, one ::error:: naming it, and data_ingest dials nothing.
+
+    data_store's listener is up and its bind readable, so a step that rebuilt the address from the
+    server's side would pass here.
+    """
+    result, logs, _ = await _reverse_leg(tmp_path, 'SERVING', container_env=container_env)
+    assert result.returncode == 1, _report(result)
+    assert not _dials(logs, DATA_INGEST), f'data_ingest dialled {logs["grpc"]} with no target'
+    annotations = _annotations(result)
+    assert len(annotations) == 1, _report(result)
+    assert DATA_STORE_GRPC_TARGET_ENV in annotations[0], _report(result)
+
+
+# Each wrong target resolves, in data_ingest's dns, to the very same live store listener, so only the
+# equality check can make these red.
+_REVERSE_MISMATCH = {
+    "data_store's REST hostname": (DATA_STORE, '{store_port}'),
+    'a loopback address': (LOOPBACK, '{store_port}'),
+    "data_ingest's own alias": (HOST, '{store_port}'),
+    'a stale port': (STORE_HOST, '1'),
+}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(('host', 'port_spelling'), list(_REVERSE_MISMATCH.values()), ids=list(_REVERSE_MISMATCH))
+async def test_the_reverse_leg_fails_with_both_values_when_the_target_is_not_the_stores_bind(
+    tmp_path: Path, host: str, port_spelling: str
+):
+    """DATA_STORE_GRPC_TARGET differs from data_store's bind: exit 1, one ::error:: with BOTH values, no dial."""
+    targets = {}
+
+    def target_env(port, store_port):
+        targets['wrong'] = f'{host}:{port_spelling.format(store_port=store_port)}'
+        targets['bind'] = f'{STORE_HOST}:{store_port}'
+        return _env_with(DATA_STORE_GRPC_TARGET_ENV, targets['wrong'], port, store_port)
+
+    dns = {STORE_HOST: OFF_LOOPBACK, DATA_STORE: OFF_LOOPBACK, LOOPBACK: OFF_LOOPBACK, HOST: OFF_LOOPBACK}
+    result, logs, _ = await _reverse_leg(tmp_path, 'SERVING', container_env=target_env, ingest_dns=dns)
+    assert result.returncode == 1, _report(result)
+    assert not _dials(logs, DATA_INGEST), f'data_ingest dialled {logs["grpc"]} although the target is not the bind'
+    annotations = _annotations(result)
+    assert len(annotations) == 1, _report(result)
+    assert targets['wrong'] in annotations[0] and targets['bind'] in annotations[0], (
+        f'the mismatch must print both {targets}: {annotations}'
+    )
+
+
+_REVERSE_NO_BIND = {
+    'store host unset': lambda port, store_port: _store_without(GRPC_HOST_ENV, port, store_port),
+    'store host blank': lambda port, store_port: _store_with(GRPC_HOST_ENV, '  ', port, store_port),
+    'store port unset': lambda port, store_port: _store_without(GRPC_PORT_ENV, port, store_port),
+}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('store_env', list(_REVERSE_NO_BIND.values()), ids=list(_REVERSE_NO_BIND))
+async def test_the_reverse_leg_fails_when_data_stores_bind_is_missing(tmp_path: Path, store_env):
+    """Nothing to check data_ingest's target against: exit 1 naming the bind variables, and no dial."""
+    result, logs, _ = await _reverse_leg(tmp_path, 'SERVING', store_env=store_env)
+    assert result.returncode == 1, _report(result)
+    assert not _dials(logs, DATA_INGEST), logs['grpc']
+    annotations = _annotations(result)
+    assert len(annotations) == 1 and GRPC_HOST_ENV in annotations[0], _report(result)
+
+
+_REVERSE_NOT_SERVING = {
+    "'' NOT_SERVING": ('OVERALL_NOT_SERVING', "service '': NOT_SERVING"),
+    'StoreService NOT_SERVING': ('STORE_NOT_SERVING', f'service {STORE_SERVICE_NAME!r}: NOT_SERVING'),
+    'StoreService unregistered (NOT_FOUND)': ('NO_STORE_SERVICE', f'service {STORE_SERVICE_NAME!r}: NOT_FOUND'),
+    'listener stopped (an RPC error)': ('STOPPED', 'UNAVAILABLE'),
+}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(('state', 'printed'), list(_REVERSE_NOT_SERVING.values()), ids=list(_REVERSE_NOT_SERVING))
+async def test_the_reverse_leg_fails_unless_both_names_read_serving(tmp_path: Path, state: str, printed: str):
+    """data_ingest dialled data_store's own bind, once, and either name did not read SERVING: exit 1, why printed."""
+    result, logs, store_port = await _reverse_leg(tmp_path, state)
+    assert result.returncode == 1, _report(result)
+    assert _dials(logs, DATA_INGEST) == [f'{STORE_HOST}:{store_port}'], logs['grpc']
+    annotations = _annotations(result)
+    assert len(annotations) == 1, _report(result)
+    # In the step's output, not necessarily its ::error:: line: the probe prints one line per name and the
+    # annotation carries the first only (a non-blocking finding on tj-7zjov1.49's validator note).
+    assert printed in result.stdout, f'expected {printed!r} in the step output:\n{_report(result)}'
+    assert 'gRPC peer reach holds: data_ingest' not in result.stdout, _report(result)
+
+
+def test_the_reverse_leg_and_the_store_healthcheck_name_the_service_by_its_proto_name():
+    """The StoreService literal in the step and in the compose healthcheck is common.rpc.store.SERVICE_NAME.
+
+    Both probes import nothing of ours, so the name is written out; a renamed proto package would leave
+    them asking for a name nothing registers, which reads NOT_FOUND -- red, but for the wrong reason.
+    """
+    healthcheck = ((load(BASE_FILE).get('services') or {}).get(DATA_STORE) or {}).get('healthcheck') or {}
+    texts = {PEER_STEP: _system_step(PEER_STEP).get('run') or '', 'data_store healthcheck': str(healthcheck)}
+    pattern = re.compile(r'trader_joe\.proto\.[\w.]*StoreService\b')
+    for where, text in texts.items():
+        assert set(pattern.findall(text)) == {STORE_SERVICE_NAME}, f'{where} names {pattern.findall(text)}'
+
+
 def _public_target() -> str:
     """The lockdown step's literal egress target, as '<address> <port>' (the stub's reach key)."""
     script = _system_step(LOCKDOWN_STEP).get('run') or ''
@@ -571,21 +802,37 @@ def _public_target() -> str:
     return f'{address.group(1)} {port.group(1)}'
 
 
-CLIENT_SEES_STORE = '172.25.0.3'
+# data_store's store_api address: what test_client, which shares store_api, resolves data_store to.
+CLIENT_SEES_STORE = DS_API_V4
 
 
 def _lockdown_scenario(reach: dict[str, dict[str, int]] | None = None, **changes: object) -> dict:
-    """A locked-down prod stack: test_client sees data_store only; only data_store reaches the gRPC port."""
+    """A locked-down prod stack: test_client sees data_store only; each gRPC port is reached only by the peer.
+
+    Since tj-7zjov1.49 data_store's gRPC port too: data_ingest connects to it on data_store's ingest_store
+    address (the control), and test_client is refused on every data_store address -- unreachable on
+    ingest_store and store_db, which it never joins, and refused on store_api, which it shares but where
+    nothing listens on the gRPC port.
+    """
     public = _public_target()
     scenario = {
         'container_env': {GRPC_HOST_ENV: HOST, GRPC_PORT_ENV: PORT, 'PATH': CONTAINER_PATH},
+        'store_env': {GRPC_HOST_ENV: STORE_HOST, GRPC_PORT_ENV: STORE_PORT, 'PATH': CONTAINER_PATH},
         'ps_id': CONTAINER_ID,
         'networks': {STORE_NET: _net(STORE_V4), EGRESS_NET: _net(EGRESS_V4)},
+        'store_ps_id': STORE_CONTAINER_ID,
+        'store_networks': {STORE_NET: _net(DS_INGEST_V4), API_NET: _net(DS_API_V4), DB_NET: _net(DS_DB_V4)},
         'client_resolves': {DATA_STORE: [CLIENT_SEES_STORE]},
         'reach': {
             DATA_STORE: {public: errno.ENETUNREACH, f'{STORE_V4} {PORT}': 0},
+            DATA_INGEST: {f'{DS_INGEST_V4} {STORE_PORT}': 0},
             POSTGRES: {public: errno.ENETUNREACH},
-            TEST_CLIENT: {f'{STORE_V4} {PORT}': errno.ENETUNREACH},
+            TEST_CLIENT: {
+                f'{STORE_V4} {PORT}': errno.ENETUNREACH,
+                f'{DS_INGEST_V4} {STORE_PORT}': errno.ENETUNREACH,
+                f'{DS_API_V4} {STORE_PORT}': errno.ECONNREFUSED,
+                f'{DS_DB_V4} {STORE_PORT}': errno.ENETUNREACH,
+            },
         },
     }
     for container, answers in (reach or {}).items():
@@ -634,6 +881,12 @@ async def test_the_lockdown_passes_when_test_client_neither_resolves_nor_reaches
     assert grpc_connects == expected, f'the gRPC port was probed as {grpc_connects}, expected {expected}'
     looked_up = [call[-1] for call in logs['docker'] if 'getent' in call]
     assert HOST in looked_up, f'test_client never looked up {HOST}: {looked_up}'
+    # tj-7zjov1.49: data_store's gRPC port, the control from data_ingest on its ingest_store address,
+    # then test_client on EVERY data_store address, store_api's (the network test_client shares) included.
+    store_connects = [(call['container'], call['host']) for call in logs['connect'] if call['port'] == int(STORE_PORT)]
+    expected_store = [(DATA_INGEST, DS_INGEST_V4)] + [(TEST_CLIENT, a) for a in (DS_INGEST_V4, DS_API_V4, DS_DB_V4)]
+    assert store_connects == expected_store, f'the store gRPC port was probed as {store_connects}'
+    assert STORE_HOST in looked_up, f'test_client never looked up {STORE_HOST}: {looked_up}'
 
 
 # Each must exit 1 for its own reason (the fragment it prints), never a stub that met a call it does
@@ -687,6 +940,54 @@ _LOCKDOWN_FAILING = {
         'data_store connected to',
     ),
     'postgres has egress': (lambda: _lockdown_scenario({POSTGRES: {_public_target(): 0}}), 'postgres connected to'),
+    # tj-7zjov1.49: data_store's gRPC port and alias.
+    'test_client resolves the store gRPC alias': (
+        lambda: _lockdown_scenario(client_resolves={DATA_STORE: [CLIENT_SEES_STORE], STORE_HOST: [DS_INGEST_V4]}),
+        f'test_client resolved {STORE_HOST}',
+    ),
+    'test_client connects to the store gRPC port on store_api (a mis-bind onto the shared network)': (
+        lambda: _lockdown_scenario({TEST_CLIENT: {f'{DS_API_V4} {STORE_PORT}': 0}}),
+        f"test_client connected to data_store's gRPC port at {DS_API_V4}:{STORE_PORT}",
+    ),
+    'test_client connects to the store gRPC port on ingest_store': (
+        lambda: _lockdown_scenario({TEST_CLIENT: {f'{DS_INGEST_V4} {STORE_PORT}': 0}}),
+        f"test_client connected to data_store's gRPC port at {DS_INGEST_V4}:{STORE_PORT}",
+    ),
+    'test_client connects to the store gRPC port on store_db': (
+        lambda: _lockdown_scenario({TEST_CLIENT: {f'{DS_DB_V4} {STORE_PORT}': 0}}),
+        f"test_client connected to data_store's gRPC port at {DS_DB_V4}:{STORE_PORT}",
+    ),
+    'dual-stack, test_client connects to the store_api IPv6 address': (
+        lambda: _lockdown_scenario(
+            {TEST_CLIENT: {f'{DS_API_V6} {STORE_PORT}': 0}},
+            store_networks={STORE_NET: _net(DS_INGEST_V4), API_NET: _net(DS_API_V4, DS_API_V6), DB_NET: _net(DS_DB_V4)},
+        ),
+        f"test_client connected to data_store's gRPC port at {DS_API_V6}:{STORE_PORT}",
+    ),
+    'the store control: data_ingest cannot connect': (
+        lambda: _lockdown_scenario({DATA_INGEST: {f'{DS_INGEST_V4} {STORE_PORT}': errno.ECONNREFUSED}}),
+        "data_ingest could not connect to data_store's gRPC port",
+    ),
+    'the store probe did not run (exit 125)': (
+        lambda: _lockdown_scenario(client_python_exit_for={STORE_PORT: 125}),
+        'test_client data_store gRPC reach probe failed with exit 125',
+    ),
+    'the store probe crashed (exit 1)': (
+        lambda: _lockdown_scenario(client_python_exit_for={STORE_PORT: 1}),
+        'test_client data_store gRPC reach probe failed with exit 1,',
+    ),
+    'no gRPC port in data_store': (
+        lambda: _lockdown_scenario(store_env={GRPC_HOST_ENV: STORE_HOST, 'PATH': CONTAINER_PATH}),
+        'no data_store container or no APP_INTERNAL_GRPC_PORT',
+    ),
+    'no data_store container': (
+        lambda: _lockdown_scenario(store_ps_id=''),
+        'no data_store container or no APP_INTERNAL_GRPC_PORT',
+    ),
+    'data_store not on any *_ingest_store network': (
+        lambda: _lockdown_scenario(store_networks={API_NET: _net(DS_API_V4), DB_NET: _net(DS_DB_V4)}),
+        'reports no ingest_store address for data_store',
+    ),
 }
 
 
@@ -697,6 +998,142 @@ async def test_the_lockdown_fails_on_any_reach_or_any_missing_fact(tmp_path: Pat
     result, logs = await _run_step(tmp_path, LOCKDOWN_STEP, build())
     assert result.returncode == 1, _report(result)
     assert not logs['unmodelled'], logs['unmodelled']
+    assert printed in result.stdout, f'expected the step to say {printed!r}:\n{_report(result)}'
+
+
+# --- tj-7zjov1.378: an unset IPv6 address, however the engine renders it ----------------------------
+#
+# Both lockdown inspect sites -- data_ingest's ingest_store addresses (probed from data_store, then
+# test_client) and data_store's addresses (probed from data_ingest, then test_client on every one) --
+# keep only the fields that are addresses. The scenario carries the engine's rendering of the unset
+# IPv6 as the GlobalIPv6Address string, which the shared renderer prints verbatim (pinned in
+# test_grpc_bind_network.py). A junk word that reached a probe would be dialled: the stub routes no
+# such host, so the call goes UNMODELLED, and the connect log shows it.
+
+JUNK_HOSTS = frozenset({'invalid', 'IP', '<invalid', 'IP>', ''})
+EXPECTED_STORE_CONNECTS = [(DATA_INGEST, DS_INGEST_V4)] + [
+    (TEST_CLIENT, address) for address in (DS_INGEST_V4, DS_API_V4, DS_DB_V4)
+]
+
+
+def _ingest_unset(unset: str) -> dict:
+    return {'networks': {STORE_NET: _net(STORE_V4, unset), EGRESS_NET: _net(EGRESS_V4, unset)}}
+
+
+def _store_unset(unset: str) -> dict:
+    return {
+        'store_networks': {
+            STORE_NET: _net(DS_INGEST_V4, unset),
+            API_NET: _net(DS_API_V4, unset),
+            DB_NET: _net(DS_DB_V4, unset),
+        }
+    }
+
+
+def _probes(logs: dict, port: str) -> list[tuple[str, str]]:
+    return [(call['container'], call['host']) for call in logs['connect'] if call['port'] == int(port)]
+
+
+def _assert_no_junk_dialled(logs: dict, result: subprocess.CompletedProcess) -> None:
+    dialled = {call['host'] for call in logs['connect']}
+    assert not dialled & JUNK_HOSTS, f'a non-address was dialled: {sorted(dialled & JUNK_HOSTS)}\n{_report(result)}'
+    assert not logs['unmodelled'], logs['unmodelled']
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('unset', list(UNSET_V6.values()), ids=list(UNSET_V6))
+async def test_the_lockdown_probes_only_data_ingests_real_addresses_when_its_ipv6_is_unset(tmp_path: Path, unset: str):
+    """Site 2: data_ingest's ingest_store address set is its IPv4 address alone, probed control first."""
+    result, logs = await _run_step(tmp_path, LOCKDOWN_STEP, _lockdown_scenario(**_ingest_unset(unset)))
+    assert result.returncode == 0, _report(result)
+    _assert_no_junk_dialled(logs, result)
+    assert _probes(logs, PORT) == [(DATA_STORE, STORE_V4), (TEST_CLIENT, STORE_V4)], logs['connect']
+    assert _probes(logs, STORE_PORT) == EXPECTED_STORE_CONNECTS, logs['connect']
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('unset', list(UNSET_V6.values()), ids=list(UNSET_V6))
+async def test_the_lockdown_probes_only_data_stores_real_addresses_when_its_ipv6_is_unset(tmp_path: Path, unset: str):
+    """Site 3: the control dials data_store's ingest_store IPv4 alone, test_client its three IPv4 addresses."""
+    result, logs = await _run_step(tmp_path, LOCKDOWN_STEP, _lockdown_scenario(**_store_unset(unset)))
+    assert result.returncode == 0, _report(result)
+    _assert_no_junk_dialled(logs, result)
+    assert _probes(logs, PORT) == [(DATA_STORE, STORE_V4), (TEST_CLIENT, STORE_V4)], logs['connect']
+    assert _probes(logs, STORE_PORT) == EXPECTED_STORE_CONNECTS, logs['connect']
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('unset', list(UNSET_V6.values()), ids=list(UNSET_V6))
+async def test_the_lockdown_still_probes_a_real_ipv6_beside_an_unset_one(tmp_path: Path, unset: str):
+    """Dual-stack on ingest_store for both services, the other networks unset: each real IPv6 is dialled as one."""
+    reach = {
+        DATA_STORE: {f'{STORE_V6} {PORT}': 0},
+        DATA_INGEST: {f'{DS_INGEST_V6} {STORE_PORT}': 0},
+        TEST_CLIENT: {f'{STORE_V6} {PORT}': errno.ENETUNREACH, f'{DS_INGEST_V6} {STORE_PORT}': errno.ENETUNREACH},
+    }
+    scenario = _lockdown_scenario(
+        reach,
+        networks={STORE_NET: _net(STORE_V4, STORE_V6), EGRESS_NET: _net(EGRESS_V4, unset)},
+        store_networks={
+            STORE_NET: _net(DS_INGEST_V4, DS_INGEST_V6),
+            API_NET: _net(DS_API_V4, unset),
+            DB_NET: _net(DS_DB_V4, unset),
+        },
+    )
+    result, logs = await _run_step(tmp_path, LOCKDOWN_STEP, scenario)
+    assert result.returncode == 0, _report(result)
+    _assert_no_junk_dialled(logs, result)
+    assert _probes(logs, PORT) == [
+        (DATA_STORE, STORE_V4),
+        (TEST_CLIENT, STORE_V4),
+        (DATA_STORE, STORE_V6),
+        (TEST_CLIENT, STORE_V6),
+    ], logs['connect']
+    assert _probes(logs, STORE_PORT) == [
+        (DATA_INGEST, DS_INGEST_V4),
+        (DATA_INGEST, DS_INGEST_V6),
+        (TEST_CLIENT, DS_INGEST_V4),
+        (TEST_CLIENT, DS_INGEST_V6),
+        (TEST_CLIENT, DS_API_V4),
+        (TEST_CLIENT, DS_DB_V4),
+    ], logs['connect']
+    v6_families = {call['family'] for call in logs['connect'] if call['host'] in (STORE_V6, DS_INGEST_V6)}
+    assert v6_families == {int(socket.AF_INET6)}, logs['connect']
+
+
+# (scenario builder taking the rendering, the fragment the step prints)
+_LOCKDOWN_UNSET_FAILING = {
+    'site 2: test_client connects to the gRPC port': (
+        lambda unset: _lockdown_scenario({TEST_CLIENT: {f'{STORE_V4} {PORT}': 0}}, **_ingest_unset(unset)),
+        f"test_client connected to data_ingest's gRPC port at {STORE_V4}:{PORT}",
+    ),
+    'site 2: inspect reports no ingest_store address': (
+        lambda unset: _lockdown_scenario(networks={STORE_NET: _net('', unset), EGRESS_NET: _net(EGRESS_V4, unset)}),
+        'docker inspect reports no ingest_store address for data_ingest',
+    ),
+    'site 3: test_client connects to the store gRPC port on store_api': (
+        lambda unset: _lockdown_scenario({TEST_CLIENT: {f'{DS_API_V4} {STORE_PORT}': 0}}, **_store_unset(unset)),
+        f"test_client connected to data_store's gRPC port at {DS_API_V4}:{STORE_PORT}",
+    ),
+    'site 3: inspect reports no ingest_store address for data_store': (
+        lambda unset: _lockdown_scenario(
+            store_networks={STORE_NET: _net('', unset), API_NET: _net(DS_API_V4, unset), DB_NET: _net(DS_DB_V4, unset)}
+        ),
+        'docker inspect reports no ingest_store address for data_store',
+    ),
+}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('unset', list(UNSET_V6.values()), ids=list(UNSET_V6))
+@pytest.mark.parametrize(
+    ('build', 'printed'), list(_LOCKDOWN_UNSET_FAILING.values()), ids=list(_LOCKDOWN_UNSET_FAILING)
+)
+async def test_the_lockdown_keeps_its_meaning_with_an_unset_ipv6(tmp_path: Path, unset: str, build, printed: str):
+    """A reach from test_client, or no ingest_store address, still fails with the same message; no junk is dialled."""
+    result, logs = await _run_step(tmp_path, LOCKDOWN_STEP, build(unset))
+    assert result.returncode == 1, _report(result)
+    _assert_no_junk_dialled(logs, result)
     assert printed in result.stdout, f'expected the step to say {printed!r}:\n{_report(result)}'
 
 

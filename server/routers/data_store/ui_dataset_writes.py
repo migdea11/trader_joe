@@ -80,7 +80,7 @@ async def set_dataset_expiry(
         db: The request's session.
         dataset_id: The dataset's id.
         body: The new expiry (unset clears it) and the override.
-        now: The instant freshness is computed at.
+        now: The instant health is computed at.
 
     Returns:
         ProtoJSONResponse: The DatasetSummary after the write.
@@ -118,7 +118,7 @@ async def set_dataset_collecting(
         db: The request's session.
         dataset_id: The dataset's id.
         body: The collect intent (required) and the override.
-        now: The instant freshness is computed at.
+        now: The instant health is computed at.
 
     Returns:
         ProtoJSONResponse: The DatasetSummary after the write.

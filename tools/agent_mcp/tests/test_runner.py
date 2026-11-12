@@ -31,13 +31,14 @@ from tools.agent_mcp.tests.harness import (
     VERB_SAMPLES,
     WORKTREE_NAME,
     FakeDocker,
-    budget_spent,
+    assert_no_call_counter,
     client_tail,
     default_response,
     is_base_step,
     is_client_step,
     is_seed_producer,
     make_rig,
+    response_for,
     system_suite_response,
     tree_digest,
 )
@@ -154,7 +155,7 @@ def test_a_test_path_symlinked_out_of_tests_system_is_refused_before_the_client(
     """Body bullet 2: a symlink out of tests/system is refused -- by the snapshot, which copies no link.
 
     Re-pinned by tj-iee6sn.20: the rails' docker reads now run before the snapshot, so what is pinned is
-    that no client step (and no base step) ran, and that the budget was not charged.
+    that no client step (and no base step) ran, and that no call counter exists (ADR tj-4rr0la addendum 33).
     """
     rig = _suite_rig(tmp_path, monkeypatch)
     (rig.layout.worktree / 'tests' / 'system' / 'out').symlink_to(rig.layout.repo / 'common', target_is_directory=True)
@@ -162,7 +163,7 @@ def test_a_test_path_symlinked_out_of_tests_system_is_refused_before_the_client(
     assert result['status'] == 'refused' and 'symlink' in result['message'], result
     assert rig.docker.steps, 'the rails ran no docker read, so the refusal shows nothing about their order'
     assert not [step for step in rig.docker.steps if is_client_step(step) or is_base_step(step)]
-    assert budget_spent(rig) == 0
+    assert_no_call_counter(rig)
 
 
 def test_a_test_path_missing_from_the_snapshot_is_refused_before_the_client(
@@ -172,7 +173,7 @@ def test_a_test_path_missing_from_the_snapshot_is_refused_before_the_client(
     result = rig.call('run_system_tests', {'worktree': WORKTREE_NAME, 'paths': ['tests/system/missing.py']})
     assert result['status'] == 'refused' and 'does not resolve' in result['message'], result
     assert not [step for step in rig.docker.steps if is_client_step(step) or is_base_step(step)]
-    assert budget_spent(rig) == 0
+    assert_no_call_counter(rig)
 
 
 def test_valid_test_paths_are_normalised_and_an_empty_list_runs_the_suite(
@@ -418,7 +419,9 @@ def test_every_call_writes_exactly_one_audit_line_with_no_secret_in_it(tmp_path:
     assert [line['known'] for line in lines] == [False, True, True, True, True, True, True]
     assert lines[3]['arguments'] == {'service': 'postgres', 'tail': 200}
     assert all(line['arguments'] is None for index, line in enumerate(lines) if statuses[index] == 'refused')
-    assert set(lines[0]) == {'time', 'verb', 'known', 'arguments', 'status', 'exit_status', 'duration_s'}
+    # 'grant' since addendum 34: the grant the call was made under, or null (no grant is open for these reads).
+    assert set(lines[0]) == {'time', 'verb', 'known', 'arguments', 'status', 'exit_status', 'duration_s', 'grant'}
+    assert [line['grant'] for line in lines if line['verb'] != 'seed_dump'] == [None] * 6
     text = (rig.layout.stack_dir / stack.AUDIT_LOG_NAME).read_text()
     # The MCP holds no secret of its own since the agent stack's generated env went (tj-iee6sn.21): the
     # sentinel stands for an argument value and for command output, both of which must stay out.
@@ -506,6 +509,7 @@ def test_verbs_that_build_nothing_read_no_worktree_and_need_no_snapshot(
 ):
     """S6: never a copy from any worktree, no git call, and no snapshot directory made at all."""
     rig = make_rig(tmp_path, monkeypatch)
+    rig.docker.respond = response_for(verb, rig.layout)
 
     def no_copy(*args: Any, **kwargs: Any) -> None:
         raise AssertionError(f'{verb} copied a worktree')

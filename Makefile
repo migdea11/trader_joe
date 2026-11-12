@@ -453,9 +453,10 @@ prod-down:  ## Stop the production stack
 # definition, even when the dev stack is up" -- see tj-slxynv, tj-x3ig38 addendum 2026-10-12.)
 #
 # The code that runs is the IMAGE of the chosen definition: :dev after `make dev-build`, :latest
-# after `make prod-build`. The revisions applied come from this checkout in both cases. On the
-# production definition the two can disagree silently. On the dev definition they cannot: the
-# override bind-mounts the code as well, so there is no image/revision split in dev.
+# after `make prod-build`. The revisions applied are the ones INSIDE that image (Dockerfile COPYs
+# alembic.ini and migrations/; nothing is bind-mounted, bead tj-7zjov1.10), so make migrate needs no host copy
+# of them and a new revision reaches a stack with a rebuild. Every upgrade first takes a verified dump
+# (MIGRATE_BACKUP_DIR, default the data directory's backups folder), on every stack including CI's.
 #
 # Deliberately not a prerequisite of any launch target, and that reasoning still applies to
 # production: the accepted direction (tj-x3ig38) is that migrations are a deploy-script step,
@@ -545,6 +546,28 @@ migrate-status:  ## Report the applied revision and the revision history (read-o
 .PHONY: migrate-check
 migrate-check:  ## Compare the models with the live schema (writes alembic_version if absent). REFUSES unless the data_store image's source stamp matches this checkout's digest; an unstamped image (CI's, or one compose built implicitly) is the ordinary case, not a fault -- the stack's own build fixes it: make dev-build (dev), make test-build (test), make prod-build (prod). What the stamp does and does not cover: see the comment above. Escape hatch: MIGRATE_CHECK_ALLOW_STALE_IMAGE=1
 	./server/data/store/run_migrations.sh check
+
+# RESTORE AND REHEARSE (migration-safety gate m4/m5, epic tj-7zjov1, bead tj-7zjov1.10). Thin spellings of
+# server/data/store/restore_dump.sh and rehearse_migration.sh, which hold the whole logic and the
+# refusals; this file spells no dump or restore command of its own. DUMP is a dump file make migrate
+# took (MIGRATE_BACKUP_DIR, default the data directory's backups folder) or one copied from another host.
+#
+# THESE DESTROY THE TEST STACK'S DATABASE and so set SYSTEM_TEST_DISPOSABLE_DB=1 themselves: invoking
+# the target IS the attestation, which is why it is not a make argument as test-system's is. The scripts
+# still refuse unless the running postgres belongs to the trader_joe_dev test stack (make system-launch),
+# so neither can reach the dev or production data whatever is typed here.
+#
+# NO BACKUP TARGET, deliberately: make migrate takes the verified pre-migration dump itself, and a second
+# spelling of that dump here would drift from run_migrations.sh's. Scheduled backup is tj-oxwlda.
+.PHONY: migrate-restore
+migrate-restore:  ## Restore DUMP=<file> into the TEST stack's database, replacing its contents (needs make system-launch; sets SYSTEM_TEST_DISPOSABLE_DB itself)
+	@[ -n "$(DUMP)" ] || { echo "make migrate-restore: set DUMP=<dump file>" >&2; exit 2; }
+	SYSTEM_TEST_DISPOSABLE_DB=1 ./server/data/store/restore_dump.sh "$(DUMP)"
+
+.PHONY: migrate-rehearse
+migrate-rehearse:  ## Restore DUMP=<file> into the TEST stack, apply the running test image's migrations to it (the checkout's only after make test-build) and report health (needs make system-launch; sets SYSTEM_TEST_DISPOSABLE_DB itself)
+	@[ -n "$(DUMP)" ] || { echo "make migrate-rehearse: set DUMP=<dump file>" >&2; exit 2; }
+	SYSTEM_TEST_DISPOSABLE_DB=1 ./server/data/store/rehearse_migration.sh "$(DUMP)"
 
 .PHONY: dev-build
 dev-build: $(VENV_MARKER) proto gen-proto-ts  ## Build the development images (:dev), web included, stamped with the source digest
@@ -1112,12 +1135,23 @@ SHELLCHECK_PATHSPEC = $(or $(strip $(PATHS)),.) ':(exclude).claude/worktrees'
 # while the target still exits 0; last means its banner is the last thing on the screen rather than
 # scrolled off by another language's output.
 .PHONY: lint
-lint: lint-python lint-shell lint-ts lint-proto  ## Lint every language PATHS covers (Python: ruff; shell: shellcheck, for *.sh under PATHS; web: eslint and vue-tsc, when PATHS is . or under web/; proto: buf, when PATHS is . or under proto/)
+lint: lint-python lint-migrations lint-shell lint-ts lint-proto  ## Lint every language PATHS covers (Python: ruff, plus the migration additivity gate; shell: shellcheck, for *.sh under PATHS; web: eslint and vue-tsc, when PATHS is . or under web/; proto: buf, when PATHS is . or under proto/)
 
 .PHONY: lint-python
 lint-python: $(VENV_MARKER)  ## Lint and format-check Python with ruff (scope with PATHS=)
 	uv run ruff check $(PATHS)
 	uv run ruff format --check $(PATHS)
+
+# THE MIGRATION GATE (tj-aw0tuk, tj-7zjov1.8). Rollback moves code back and never schema, so every store
+# revision must be additive unless it carries the '# additive-exception: <bead-id>' line (tools/
+# migration_lint). The alpha baseline only creates, so it passes unmarked and the tree holds no marker
+# (ADR tj-kg521d); the rule binds the revisions after it. It reads the whole revisions directory whatever
+# PATHS says: a revision is a property of the chain, not of a path selection, and the check is a few
+# milliseconds of ast parsing with no database.
+# Part of `lint`, so CI's Run Linters step runs it with no workflow change.
+.PHONY: lint-migrations
+lint-migrations: $(VENV_MARKER)  ## Refuse a store revision that drops, renames, narrows, adds NOT NULL without a default or runs raw SQL outside the additive forms (judged per ALTER TABLE clause; CREATE OR REPLACE refused), removes a NOT NULL column's server default, unless marked
+	uv run python -m tools.migration_lint
 
 # THE SELECTION IS MADE IN THE RECIPE, not at parse time with $(shell ...), because make expands a
 # parse-time $(shell) on EVERY invocation of EVERY target -- `make test` would run git ls-files too.
@@ -1793,8 +1827,8 @@ system-launch:  ## Start the stack from the prod images with data_ingest on the 
 # THE HOST WRITER is data.store.seeds.bundle in the host venv, the ONE host-side no-follow writer
 # (S11): stdout is piped to `python -m data.store.seeds.bundle --out $(SEED_OUT)`, which writes
 # <revision>.sql and <revision>.json there. SEED_OUT defaults to output/seeds, git-ignored, inside
-# the repository and never under tests/ (the writer refuses tests/ itself); a person copies a
-# reviewed seed into tests/system/seeds/ (tj-vhboky.56). A SEED_OUT OUTSIDE the repository reached
+# the repository and never under tests/ (the writer refuses tests/ itself); no seed is committed
+# per revision (ADR tj-kg521d), so the dump is an end-to-end exercise of the push path. A SEED_OUT OUTSIDE the repository reached
 # through a symlinked parent (macOS /tmp, a symlinked checkout path) is refused, exit 3, by design:
 # the writer's no-follow walk starts at / for such a path (S11.2). DATE, when given, is forwarded as
 # --date; the producer refuses one that is not a real YYYY-MM-DD date.

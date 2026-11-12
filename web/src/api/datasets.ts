@@ -28,7 +28,7 @@ import type { CoverageStrip, ReadsPerDay } from '@generated/trader_joe/proto/ui/
 import { API_BASE, deleteRequest, getMessage, patchMessage } from './client'
 import { buildQuery } from './query'
 
-/** The status words the server filters by (a grouping of FreshnessStatus). */
+/** The status words the server filters by (a grouping of DatasetHealthStatus). */
 export type StatusGroup = 'healthy' | 'late' | 'failed' | 'retired'
 export type DatasetSort = 'symbol' | 'expires' | 'last_read'
 
@@ -138,7 +138,7 @@ export function clientQuery(client: ClientSelection = {}) {
   }
 }
 
-/** GET /ui/v1/datasets/{id}: one dataset with its siblings, freshness and usage under `client`. */
+/** GET /ui/v1/datasets/{id}: one dataset with its siblings, health and usage under `client`. */
 export function getDataset(id: string, signal?: AbortSignal, client: ClientSelection = {}): Promise<DatasetSummary> {
   return getMessage(DatasetSummarySchema, `/ui/v1/datasets/${encodeURIComponent(id)}`, {
     query: clientQuery(client),

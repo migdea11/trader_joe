@@ -84,6 +84,7 @@ class Reason(StrEnum):
     PEER_PROTOCOL_ERROR = 'PEER_PROTOCOL_ERROR'
     DATABASE_UNAVAILABLE = 'DATABASE_UNAVAILABLE'
     DATABASE_CONFLICT = 'DATABASE_CONFLICT'
+    RANGE_TOO_RECENT = 'RANGE_TOO_RECENT'
 
 
 # Names that records have already fixed for later PRs. They are NOT members, so nothing can raise them
@@ -503,7 +504,7 @@ def _checked_reset_at(reason: Reason, spec: ReasonSpec, reset_at: datetime | Non
 
 # THE ONE TABLE (D4): one row per Reason, reviewable in a diff. The comment above each row names what
 # raises it and the task that wires the raise. A grpc_code of None is never rendered as a gRPC status:
-# FEED_NOT_AVAILABLE travels in-band on the FetchDataset ack (tj-3mk3u5.22 Q5), the PEER_* reasons and
+# FEED_NOT_AVAILABLE travels in-band on the Submit ack (tj-3mk3u5.22 Q5), the PEER_* reasons and
 # DEADLINE are produced on the client side of a hop, and the DATABASE_* reasons arise in data_store, which
 # answers over HTTP. No row is UNAVAILABLE (tj-8konfu D6.4).
 REASONS: Final[Mapping[Reason, ReasonSpec]] = MappingProxyType(
@@ -536,7 +537,7 @@ REASONS: Final[Mapping[Reason, ReasonSpec]] = MappingProxyType(
             http_status=422,
             summary='The broker cannot serve the instrument as specified, such as its currency or exchange; change the instrument and ask again.',
         ),
-        # The reader refusing a named feed (TE-4). In-band on the FetchDataset ack, never a status (tj-3mk3u5.22 Q5).
+        # The reader refusing a named feed (TE-4). In-band on the Submit ack, never a status (tj-3mk3u5.22 Q5).
         Reason.FEED_NOT_AVAILABLE: ReasonSpec(
             branch=InvalidRequestError,
             outcome=Outcome.REFUSED,
@@ -739,6 +740,16 @@ REASONS: Final[Mapping[Reason, ReasonSpec]] = MappingProxyType(
             grpc_code=None,
             http_status=503,
             summary='The write collided with a concurrent transaction and was rolled back; retry it.',
+        ),
+        # Raised by the Alpaca read's SIP edge pre-check, before any vendor call or token (tj-7zjov1.306 addendum 1, tj-7zjov1.308).
+        Reason.RANGE_TOO_RECENT: ReasonSpec(
+            branch=ExogenousError,
+            outcome=Outcome.NOT_READY,
+            disposition=Disposition.RECORD,
+            grpc_code='FAILED_PRECONDITION',
+            http_status=503,
+            summary="The range reaches into data too recent for this deployment's market-data entitlement; retry once reset_at has passed, or end the range earlier.",
+            requires_reset_at=True,
         ),
     }
 )

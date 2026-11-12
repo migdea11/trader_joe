@@ -1,6 +1,6 @@
 """The /ui/v1 dataset reads and GET /store/{id}, driven over real rows in SQLite (validator, gating tj-grna9p.20).
 
-WHAT TIER THIS IS. The real app, the real handlers, the real repository SQL and the real freshness rules, over
+WHAT TIER THIS IS. The real app, the real handlers, the real repository SQL and the real health rules, over
 two real tables in an in-memory SQLite database (aiosqlite, the testing group's Docker-free async pool). The
 clock is pinned through the routes' own utc_now dependency, never by patching a module. Requests go through
 httpx's ASGI transport in the test's own event loop, so the async engine is never shared across loops, and the
@@ -8,10 +8,11 @@ app's lifespan never runs (no Postgres, no data_ingest).
 
 WHAT SQLITE CANNOT SAY, AND THEREFORE WHAT THIS FILE DOES NOT CLAIM. Each is named so a Postgres-tier test
 (follow-up, see the bead's verdict note) knows exactly what is left:
-  * INSTANTS. SQLite stores a DateTime's wall clock and drops the offset; every instant here is UTC, so
-    comparisons are between equal-offset strings. The fixture below hands timestamps back UTC-aware, which is
-    what asyncpg does for timestamptz. That a [start, end) given in another offset compares as an instant is
-    Postgres's to show.
+  * INSTANTS. SQLite stores a DateTime's wall clock and drops the offset. The fixture below binds an aware
+    value as its UTC instant and hands it back UTC-aware, which is what Postgres and asyncpg do for timestamptz,
+    so a value written in another offset (the DAILY refresh's local-midnight tail, tj-grna9p.154) is stored as
+    the right instant. Comparisons IN SQL are still between UTC strings; that a [start, end) given in another
+    offset compares as an instant inside a query is Postgres's to show.
   * covered_dates. Its SQL calls Postgres's timezone(zone, timestamptz). SQLite has no such function, so the
     fixture registers a stand-in that does the same conversion, purely so the statement prepares. Its date()
     then comes back as TEXT rather than a date, so a STATIC dataset WITH bars would be judged wrongly here.
@@ -55,6 +56,7 @@ from data.store.app.completeness import gap_intervals
 from data.store.app.database.crud.stock import dataset_catalog as catalog_repo
 from data.store.app.database.crud.stock.dataset_catalog import CatalogFilter
 from data.store.app.database.database import async_db
+from data.store.app.database.models.ingest_request import IngestRequest, IngestRequestKind, IngestRequestState
 from data.store.app.database.models.ingest_run import IngestRun, IngestRunState, IngestRunTrigger
 from data.store.app.database.models.stock_market_activity import StockMarketActivity
 from data.store.app.database.models.store_dataset_entry import StoreDatasetEntry
@@ -64,7 +66,7 @@ from data.store.app.dataset_catalog import (
     MAX_COVERAGE_GAPS,
     evaluate_views,
 )
-from data.store.app.health import DatasetHealth, FreshnessStatus
+from data.store.app.health import DatasetHealth, DatasetHealthStatus
 from data.store.app.main import app
 from data.store.app.trading_calendar import (
     NaiveDatetimeError,
@@ -75,6 +77,7 @@ from data.store.app.trading_calendar import (
     session_of,
 )
 from data.store.tests.problem_body import problem, validation_errors
+from data.store.tests.request_tables import create_request_tables
 from data.store.tests.test_coverage_buckets import XTKS
 from routers.data_store.ui_datasets import utc_now
 from routers.data_store.ui_mapping import BarPageIndexMessage
@@ -115,8 +118,25 @@ def _sqlite_timezone(zone: str, stamp: str | None) -> str | None:
 
 @pytest.fixture
 def aware_sqlite_datetimes(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Read a timezone=True column back UTC-aware, as asyncpg reads timestamptz. Undone after the test."""
+    """Store and read a timezone=True column as a UTC instant, as Postgres does timestamptz. Undone after the test.
+
+    Without the bind half, SQLite would store an aware value's WALL CLOCK: 2026-10-01 00:00-04:00 written as
+    2026-10-01 00:00 and read back as 00:00Z, four hours early, an error Postgres can never make.
+    """
     original = DATETIME.result_processor
+    original_bind = DATETIME.bind_processor
+
+    def bind_processor(self, dialect):
+        process = original_bind(self, dialect)
+        if not self.timezone:
+            return process
+
+        def as_utc(value):
+            if isinstance(value, datetime) and value.utcoffset() is not None:
+                value = value.astimezone(UTC)
+            return process(value) if process else value
+
+        return as_utc
 
     def result_processor(self, dialect, coltype):
         process = original(self, dialect, coltype)
@@ -130,6 +150,7 @@ def aware_sqlite_datetimes(monkeypatch: pytest.MonkeyPatch) -> None:
         return aware
 
     monkeypatch.setattr(DATETIME, 'result_processor', result_processor)
+    monkeypatch.setattr(DATETIME, 'bind_processor', bind_processor)
 
 
 @pytest_asyncio.fixture
@@ -152,6 +173,8 @@ async def engine(aware_sqlite_datetimes) -> AsyncIterator[AsyncEngine]:
                 tables=[StoreDatasetEntry.__table__, StockMarketActivity.__table__, IngestRun.__table__],
             )
         )
+        # And ingest_request since P35 (tj-7zjov1.28): the Running filter and facet read open requests as well.
+        await connection.run_sync(create_request_tables)
     try:
         yield engine
     finally:
@@ -360,7 +383,7 @@ async def list_all(client: httpx.AsyncClient, **params: Any) -> list[dict]:
 
 
 def status_of(item: dict) -> str | None:
-    return item.get('freshness', {}).get('status')
+    return item.get('health', {}).get('status')
 
 
 def encode(payload: Any) -> str:
@@ -374,30 +397,41 @@ def encode(payload: Any) -> str:
 async def test_each_dataset_gets_the_status_the_pinned_clock_gives_it(client, catalog):
     statuses = {item['id']: status_of(item) for item in await list_all(client)}
     assert statuses == {
-        str(catalog.aaa_day.id): 'FRESHNESS_STATUS_FRESH',
-        str(catalog.aaa_min.id): 'FRESHNESS_STATUS_COMPLETE',
-        str(catalog.aaa_day2.id): 'FRESHNESS_STATUS_COMPLETE',
-        str(catalog.aaa_sip.id): 'FRESHNESS_STATUS_COMPLETE',
-        str(catalog.a_under.id): 'FRESHNESS_STATUS_COMPLETE',
-        str(catalog.a_pct.id): 'FRESHNESS_STATUS_COMPLETE',
-        str(catalog.abx.id): 'FRESHNESS_STATUS_COMPLETE',
-        str(catalog.bbb.id): 'FRESHNESS_STATUS_LATE',
-        str(catalog.ccc.id): 'FRESHNESS_STATUS_OVERDUE',
-        str(catalog.ddd.id): 'FRESHNESS_STATUS_GAPS',
-        str(catalog.eee.id): 'FRESHNESS_STATUS_RETIRED',
+        str(catalog.aaa_day.id): 'DATASET_HEALTH_STATUS_FRESH',
+        str(catalog.aaa_min.id): 'DATASET_HEALTH_STATUS_COMPLETE',
+        str(catalog.aaa_day2.id): 'DATASET_HEALTH_STATUS_COMPLETE',
+        str(catalog.aaa_sip.id): 'DATASET_HEALTH_STATUS_COMPLETE',
+        str(catalog.a_under.id): 'DATASET_HEALTH_STATUS_COMPLETE',
+        str(catalog.a_pct.id): 'DATASET_HEALTH_STATUS_COMPLETE',
+        str(catalog.abx.id): 'DATASET_HEALTH_STATUS_COMPLETE',
+        str(catalog.bbb.id): 'DATASET_HEALTH_STATUS_LATE',
+        str(catalog.ccc.id): 'DATASET_HEALTH_STATUS_OVERDUE',
+        str(catalog.ddd.id): 'DATASET_HEALTH_STATUS_GAPS',
+        str(catalog.eee.id): 'DATASET_HEALTH_STATUS_RETIRED',
         # No calendar for IB: UNSPECIFIED, which canonical JSON omits.
         str(catalog.ggg.id): None,
     }
 
 
 @pytest.mark.asyncio
-async def test_the_list_carries_freshness_detail_extent_and_state(client, catalog):
+async def test_the_json_key_is_health_and_the_old_freshness_key_is_gone(client, catalog):
+    """tj-grna9p.168 NAME TABLE: DatasetSummary.health = 18 (JSON 'health'); no 'freshness' key on list or detail."""
     items = {item['id']: item for item in await list_all(client)}
-    gaps = items[str(catalog.ddd.id)]['freshness']
+    detail = (await client.get(f'/ui/v1/datasets/{catalog.ccc.id}')).json()
+    for body in (items[str(catalog.ccc.id)], detail):
+        assert 'freshness' not in body, sorted(body)
+        assert body['health']['status'] == 'DATASET_HEALTH_STATUS_OVERDUE', body['health']
+    assert all('freshness' not in item for item in items.values())
+
+
+@pytest.mark.asyncio
+async def test_the_list_carries_health_detail_extent_and_state(client, catalog):
+    items = {item['id']: item for item in await list_all(client)}
+    gaps = items[str(catalog.ddd.id)]['health']
     assert (gaps['gapCount'], gaps['asOf']) == (3, '2026-10-06T22:00:00Z')
     fresh = items[str(catalog.aaa_day.id)]
     # DAILY's expected_last_bar is the expected session's local midnight (Tue 6 Oct, 04:00Z).
-    assert fresh['freshness']['expectedLastBar'] == '2026-10-06T04:00:00Z'
+    assert fresh['health']['expectedLastBar'] == '2026-10-06T04:00:00Z'
     assert (fresh['barCount'], fresh['firstBar'], fresh['lastBar']) == (
         '2',
         '2026-10-05T04:00:00Z',
@@ -518,12 +552,12 @@ async def test_the_facets_name_every_value_and_count_zero_where_nothing_matches(
         'UPDATE_TYPE_STREAM': 1,
     }
     assert facet_counts(body, 'statuses', 'status') == {
-        'FRESHNESS_STATUS_FRESH': 1,
-        'FRESHNESS_STATUS_LATE': 1,
-        'FRESHNESS_STATUS_OVERDUE': 1,
-        'FRESHNESS_STATUS_COMPLETE': 6,
-        'FRESHNESS_STATUS_GAPS': 1,
-        'FRESHNESS_STATUS_RETIRED': 1,
+        'DATASET_HEALTH_STATUS_FRESH': 1,
+        'DATASET_HEALTH_STATUS_LATE': 1,
+        'DATASET_HEALTH_STATUS_OVERDUE': 1,
+        'DATASET_HEALTH_STATUS_COMPLETE': 6,
+        'DATASET_HEALTH_STATUS_GAPS': 1,
+        'DATASET_HEALTH_STATUS_RETIRED': 1,
     }
 
 
@@ -538,12 +572,12 @@ FACET_FILTERS = {
 }
 
 _STATUS_GROUP = {
-    'FRESHNESS_STATUS_FRESH': 'healthy',
-    'FRESHNESS_STATUS_COMPLETE': 'healthy',
-    'FRESHNESS_STATUS_LATE': 'late',
-    'FRESHNESS_STATUS_OVERDUE': 'failed',
-    'FRESHNESS_STATUS_GAPS': 'failed',
-    'FRESHNESS_STATUS_RETIRED': 'retired',
+    'DATASET_HEALTH_STATUS_FRESH': 'healthy',
+    'DATASET_HEALTH_STATUS_COMPLETE': 'healthy',
+    'DATASET_HEALTH_STATUS_LATE': 'late',
+    'DATASET_HEALTH_STATUS_OVERDUE': 'failed',
+    'DATASET_HEALTH_STATUS_GAPS': 'failed',
+    'DATASET_HEALTH_STATUS_RETIRED': 'retired',
 }
 
 
@@ -586,7 +620,7 @@ async def test_an_empty_store_lists_nothing_and_counts_zero_everywhere(client):
 async def test_detail_lists_the_other_widths_of_the_same_series_only(client, catalog):
     body = (await client.get(f'/ui/v1/datasets/{catalog.aaa_day.id}')).json()
     assert body['siblings'] == [{'id': str(catalog.aaa_min.id), 'granularity': 'GRANULARITY_ONE_MINUTE'}]
-    assert body['freshness']['status'] == 'FRESHNESS_STATUS_FRESH'
+    assert body['health']['status'] == 'DATASET_HEALTH_STATUS_FRESH'
     assert body['expiryType'] == 'EXPIRY_TYPE_ROLLING'
     # The 1min dataset sees the 1day one, and not the second 1day range twice.
     other = (await client.get(f'/ui/v1/datasets/{catalog.aaa_min.id}')).json()
@@ -621,7 +655,7 @@ async def test_get_store_by_id_answers_the_entry_with_its_bar_count(client, cata
 class Bars:
     """A 1min series of ten bars, 14:00Z to 14:09Z on Mon 5 Oct, in a dataset of its own.
 
-    Source IB, so no freshness is computed and nothing STATIC with bars meets SQLite's text dates.
+    Source IB, so no health is computed and nothing STATIC with bars meets SQLite's text dates.
     """
 
     def __init__(self) -> None:
@@ -984,12 +1018,12 @@ def judged_statuses(catalog: Catalog) -> dict[str, str | None]:
     """Each catalog dataset's status at NOW, as the first list test pins it: what a pre-1990 neighbour must keep."""
     complete = (catalog.aaa_min, catalog.aaa_day2, catalog.aaa_sip, catalog.a_under, catalog.a_pct, catalog.abx)
     return {
-        str(catalog.aaa_day.id): 'FRESHNESS_STATUS_FRESH',
-        **{str(row.id): 'FRESHNESS_STATUS_COMPLETE' for row in complete},
-        str(catalog.bbb.id): 'FRESHNESS_STATUS_LATE',
-        str(catalog.ccc.id): 'FRESHNESS_STATUS_OVERDUE',
-        str(catalog.ddd.id): 'FRESHNESS_STATUS_GAPS',
-        str(catalog.eee.id): 'FRESHNESS_STATUS_RETIRED',
+        str(catalog.aaa_day.id): 'DATASET_HEALTH_STATUS_FRESH',
+        **{str(row.id): 'DATASET_HEALTH_STATUS_COMPLETE' for row in complete},
+        str(catalog.bbb.id): 'DATASET_HEALTH_STATUS_LATE',
+        str(catalog.ccc.id): 'DATASET_HEALTH_STATUS_OVERDUE',
+        str(catalog.ddd.id): 'DATASET_HEALTH_STATUS_GAPS',
+        str(catalog.eee.id): 'DATASET_HEALTH_STATUS_RETIRED',
         str(catalog.ggg.id): None,
     }
 
@@ -1010,7 +1044,7 @@ async def views_by_id(engine: AsyncEngine, only: set[str] | None = None) -> dict
 
 
 def wire(health: Any) -> str | None:
-    return None if health is None else f'FRESHNESS_STATUS_{health.status.value}'
+    return None if health is None else f'DATASET_HEALTH_STATUS_{health.status.value}'
 
 
 @pytest.mark.asyncio
@@ -1020,7 +1054,7 @@ async def test_evaluate_views_leaves_pre_1990_static_and_daily_unjudged_and_judg
     assert views[str(early.daily.id)].health is None
     assert {key: wire(views[key].health) for key in judged_statuses(catalog)} == judged_statuses(catalog)
     # STREAM ignores its start, so a pre-1990 one is judged like any other: no bars, after Tuesday's close.
-    assert views[str(early.stream.id)].health.status is FreshnessStatus.OVERDUE
+    assert views[str(early.stream.id)].health.status is DatasetHealthStatus.OVERDUE
 
 
 @pytest.mark.asyncio
@@ -1030,7 +1064,7 @@ async def test_a_retired_pre_1990_subscription_still_reads_retired(engine, catal
     views = await views_by_id(engine, only=catalog.ids(early.daily_retired, early.stream_retired))
     assert len(views) == 2
     for row in (early.daily_retired, early.stream_retired):
-        assert views[str(row.id)].health == DatasetHealth(FreshnessStatus.RETIRED), row.asset_symbol
+        assert views[str(row.id)].health == DatasetHealth(DatasetHealthStatus.RETIRED), row.asset_symbol
 
 
 @pytest.mark.asyncio
@@ -1091,7 +1125,7 @@ async def test_the_detail_of_a_pre_1990_dataset_is_a_200_with_health_unset(clien
         assert response.status_code == 200, response.text
         body = response.json()
         assert body['id'] == str(row.id)
-        assert 'status' not in body.get('freshness', {}), body
+        assert 'status' not in body.get('health', {}), body
         assert body['start'] == '1985-06-03T04:00:00Z'
 
 
@@ -1111,12 +1145,12 @@ async def test_facets_count_a_pre_1990_dataset_everywhere_but_the_statuses(clien
     # The catalog's counts plus the judged STREAM and the two retired subscriptions. The unjudged rows are
     # UNSPECIFIED, which no status facet counts.
     assert facet_counts(body, 'statuses', 'status') == {
-        'FRESHNESS_STATUS_FRESH': 1,
-        'FRESHNESS_STATUS_LATE': 1,
-        'FRESHNESS_STATUS_OVERDUE': 2,
-        'FRESHNESS_STATUS_COMPLETE': 6,
-        'FRESHNESS_STATUS_GAPS': 1,
-        'FRESHNESS_STATUS_RETIRED': 3,
+        'DATASET_HEALTH_STATUS_FRESH': 1,
+        'DATASET_HEALTH_STATUS_LATE': 1,
+        'DATASET_HEALTH_STATUS_OVERDUE': 2,
+        'DATASET_HEALTH_STATUS_COMPLETE': 6,
+        'DATASET_HEALTH_STATUS_GAPS': 1,
+        'DATASET_HEALTH_STATUS_RETIRED': 3,
     }
 
 
@@ -1391,7 +1425,7 @@ async def test_the_running_facet_equals_the_running_filtered_total_under_every_o
 async def test_running_is_orthogonal_to_status_so_a_late_dataset_can_be_running(client, catalog, running):
     listed = await list_all(client, running='true', status='late')
     assert [item['id'] for item in listed] == [str(catalog.bbb.id)]
-    assert status_of(listed[0]) == 'FRESHNESS_STATUS_LATE'
+    assert status_of(listed[0]) == 'DATASET_HEALTH_STATUS_LATE'
 
 
 @pytest.mark.asyncio
@@ -1399,14 +1433,70 @@ async def test_with_running_true_the_other_facets_count_only_running_datasets(cl
     facets = (await client.get('/ui/v1/datasets/facets', params={'running': 'true'})).json()
     assert facets['all'] == '3'
     statuses = {facet['status']: int(facet.get('count', '0')) for facet in facets['statuses']}
-    assert statuses['FRESHNESS_STATUS_FRESH'] == 1 and statuses['FRESHNESS_STATUS_LATE'] == 1
-    assert statuses['FRESHNESS_STATUS_OVERDUE'] == 1 and statuses['FRESHNESS_STATUS_GAPS'] == 0
+    assert statuses['DATASET_HEALTH_STATUS_FRESH'] == 1 and statuses['DATASET_HEALTH_STATUS_LATE'] == 1
+    assert statuses['DATASET_HEALTH_STATUS_OVERDUE'] == 1 and statuses['DATASET_HEALTH_STATUS_GAPS'] == 0
 
 
 @pytest.mark.asyncio
 async def test_no_running_run_means_a_zero_facet_and_an_empty_running_list(client, catalog):
     assert 'running' not in (await client.get('/ui/v1/datasets/facets')).json()
     assert await list_all(client, running='true') == []
+
+
+async def _requests_naming(engine: AsyncEngine, *named: tuple[StoreDatasetEntry | None, IngestRequestState]) -> None:
+    """ingest_request rows, written directly: one per (dataset or None, state)."""
+    async with engine.begin() as connection:
+        for of, state in named:
+            await connection.execute(
+                insert(IngestRequest.__table__).values(
+                    id=uuid.uuid4(),
+                    kind=IngestRequestKind.BARS,
+                    source=DataSource.ALPACA_API,
+                    dataset_id=None if of is None else of.id,
+                    client_label=OWNER,
+                    state=state,
+                )
+            )
+
+
+@pytest.mark.asyncio
+async def test_the_running_filter_and_facet_read_open_requests(client, catalog, engine):
+    """The push path's Running (tj-7zjov1.28 acceptance: "the Running facet reads open requests").
+
+    Since P35 nothing writes a RUNNING ingest_run row: a dataset is collecting while a REQUEST naming it is open
+    (PENDING, QUEUED or NOT_DELIVERED). A finished request (SUCCEEDED, EMPTY, FAILED) is not Running, and an open
+    request with no dataset yet (a POST before its first delivered attempt) names none and is counted nowhere.
+    """
+    await _requests_naming(
+        engine,
+        (catalog.aaa_day, IngestRequestState.PENDING),
+        (catalog.bbb, IngestRequestState.QUEUED),
+        (catalog.bbb, IngestRequestState.QUEUED),
+        (catalog.ccc, IngestRequestState.NOT_DELIVERED),
+        (catalog.ddd, IngestRequestState.SUCCEEDED),
+        (catalog.ddd, IngestRequestState.FAILED),
+        (catalog.eee, IngestRequestState.EMPTY),
+        (None, IngestRequestState.QUEUED),
+    )
+    expected = catalog.ids(catalog.aaa_day, catalog.bbb, catalog.ccc)
+
+    assert {item['id'] for item in await list_all(client, running='true')} == expected
+    facets = (await client.get('/ui/v1/datasets/facets')).json()
+    assert int(facets.get('running', '0')) == len(expected)
+
+
+@pytest.mark.asyncio
+async def test_an_open_request_and_a_legacy_running_run_name_one_dataset_once(client, catalog, engine):
+    """The two records of Running are a UNION: a dataset named by both is counted once, a legacy run alone still counts."""
+    await store(
+        engine,
+        run_of(catalog.aaa_day, minutes_ago=1, state=IngestRunState.RUNNING),
+        run_of(catalog.bbb, minutes_ago=1, state=IngestRunState.RUNNING),
+    )
+    await _requests_naming(engine, (catalog.aaa_day, IngestRequestState.QUEUED))
+
+    assert {item['id'] for item in await list_all(client, running='true')} == catalog.ids(catalog.aaa_day, catalog.bbb)
+    assert (await client.get('/ui/v1/datasets/facets')).json()['running'] == '2'
 
 
 # ------------------------------------------------------------------------------------------------- coverage
@@ -1540,9 +1630,9 @@ async def test_a_known_three_session_gap_reads_as_one_local_midnight_window(clie
     assert strip.expected == len(SEPTEMBER) and strip.missing == len(missing)
     assert_tiles(strip)
     assert len(strip.buckets) == min(DEFAULT_COVERAGE_BUCKETS, len(SEPTEMBER))
-    # g: the same rule as freshness -- the GAPS count (missing SESSIONS) equals the sessions the gaps hold.
-    detail = (await client.get(f'/ui/v1/datasets/{dataset.id}')).json()['freshness']
-    assert (detail['status'], detail['gapCount']) == ('FRESHNESS_STATUS_GAPS', sum(g[2] for g in strip.gaps))
+    # g: the same rule as health -- the GAPS count (missing SESSIONS) equals the sessions the gaps hold.
+    detail = (await client.get(f'/ui/v1/datasets/{dataset.id}')).json()['health']
+    assert (detail['status'], detail['gapCount']) == ('DATASET_HEALTH_STATUS_GAPS', sum(g[2] for g in strip.gaps))
 
 
 @pytest.mark.asyncio
@@ -1831,7 +1921,7 @@ def minute(index: int) -> datetime:
 
 
 async def minute_series(engine: AsyncEngine, count: int, symbol: str = 'PAGES') -> StoreDatasetEntry:
-    """A 1min dataset of its own holding COUNT bars, one a minute from PAGE_EPOCH. Source IB: no freshness.
+    """A 1min dataset of its own holding COUNT bars, one a minute from PAGE_EPOCH. Source IB: no health.
 
     The entry goes through the ORM; the bars through one Core executemany, so a 180k- or 50k-bar series costs
     seconds, not the ORM's unit of work per row. The values are bar()'s, column for column.
@@ -2190,7 +2280,7 @@ async def test_the_index_fetches_one_row_per_page_never_one_per_bar(client, engi
 #
 # tj-grna9p.151 (decision tj-grna9p.8, addendum of 2026-10-20): a 1week or 1month dataset is judged BY PERIOD, and
 # the catalog callers pass row.granularity (dataset_catalog.py evaluate_views and dataset_coverage). The pure rules
-# are pinned in test_freshness_periods.py; this drives them end to end through the list, the detail and the coverage
+# are pinned in test_health_periods.py; this drives them end to end through the list, the detail and the coverage
 # strip. Under the per-session rule every case below reads otherwise (the weekly one as 35 missing sessions).
 #
 # NOW is Tue 6 Oct 2026 22:00Z: the week of 28 Sep has ended (Fri 2 Oct), the week of 5 Oct has not.
@@ -2214,10 +2304,10 @@ async def test_a_complete_weekly_dataset_reads_complete_with_no_gap_windows(clie
     dataset, bars = weekly_static(WEEKLY_BARS)
     await store(engine, dataset, *bars)
 
-    detail = (await client.get(f'/ui/v1/datasets/{dataset.id}')).json()['freshness']
-    assert detail['status'] == 'FRESHNESS_STATUS_COMPLETE' and 'gapCount' not in detail, detail
+    detail = (await client.get(f'/ui/v1/datasets/{dataset.id}')).json()['health']
+    assert detail['status'] == 'DATASET_HEALTH_STATUS_COMPLETE' and 'gapCount' not in detail, detail
     listed = {item['id']: item for item in await list_all(client)}
-    assert status_of(listed[str(dataset.id)]) == 'FRESHNESS_STATUS_COMPLETE'
+    assert status_of(listed[str(dataset.id)]) == 'DATASET_HEALTH_STATUS_COMPLETE'
     strip = await coverage(client, dataset)
     assert (strip.gaps, strip.gap_count, strip.missing) == ([], 0, 0), strip
     # Buckets still count SESSIONS: Mon 3 Aug to Fri 2 Oct, 44 of them (Labor Day is not one).
@@ -2232,8 +2322,8 @@ async def test_a_weekly_dataset_missing_a_week_reads_its_five_sessions_in_one_wi
     dataset, bars = weekly_static([day for day in WEEKLY_BARS if day != date(2026, 8, 31)])
     await store(engine, dataset, *bars)
 
-    detail = (await client.get(f'/ui/v1/datasets/{dataset.id}')).json()['freshness']
-    assert (detail['status'], detail['gapCount']) == ('FRESHNESS_STATUS_GAPS', 5)
+    detail = (await client.get(f'/ui/v1/datasets/{dataset.id}')).json()['health']
+    assert (detail['status'], detail['gapCount']) == ('DATASET_HEALTH_STATUS_GAPS', 5)
     strip = await coverage(client, dataset)
     assert strip.gaps == [window(date(2026, 8, 31), date(2026, 9, 4))] and strip.gaps[0][2] == 5, strip.gaps
     assert (strip.gap_count, strip.missing, strip.expected) == (1, 5, 44)
@@ -2245,8 +2335,8 @@ async def test_a_complete_monthly_dataset_reads_complete(client, engine, covered
     dataset = entry('MNTH', granularity=Granularity.ONE_MONTH, start=ny_midnight(1, 1), end=ny_midnight(1, 10))
     await store(engine, dataset, *daily_bars(dataset, [date(2026, month, 1) for month in range(1, 10)]))
 
-    detail = (await client.get(f'/ui/v1/datasets/{dataset.id}')).json()['freshness']
-    assert detail['status'] == 'FRESHNESS_STATUS_COMPLETE', detail
+    detail = (await client.get(f'/ui/v1/datasets/{dataset.id}')).json()['health']
+    assert detail['status'] == 'DATASET_HEALTH_STATUS_COMPLETE', detail
     strip = await coverage(client, dataset)
     assert (strip.gaps, strip.gap_count, strip.missing) == ([], 0, 0), strip
 
@@ -2254,7 +2344,7 @@ async def test_a_complete_monthly_dataset_reads_complete(client, engine, covered
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ('last', 'status'),
-    [(date(2026, 9, 28), 'FRESHNESS_STATUS_FRESH'), (date(2026, 9, 21), 'FRESHNESS_STATUS_OVERDUE')],
+    [(date(2026, 9, 28), 'DATASET_HEALTH_STATUS_FRESH'), (date(2026, 9, 21), 'DATASET_HEALTH_STATUS_OVERDUE')],
     ids=['last ended week stored', 'a week behind'],
 )
 async def test_a_weekly_subscription_reads_by_its_last_ended_week(client, engine, last, status):
@@ -2265,11 +2355,11 @@ async def test_a_weekly_subscription_reads_by_its_last_ended_week(client, engine
     dataset = entry('WSUB', granularity=Granularity.ONE_WEEK, update_type=UpdateType.DAILY, start=ny_midnight(7, 9))
     await store(engine, dataset, *daily_bars(dataset, [day for day in WEEKLY_BARS[5:] if day <= last]))
 
-    for freshness in (
-        (await client.get(f'/ui/v1/datasets/{dataset.id}')).json()['freshness'],
-        {item['id']: item for item in await list_all(client)}[str(dataset.id)]['freshness'],
+    for health in (
+        (await client.get(f'/ui/v1/datasets/{dataset.id}')).json()['health'],
+        {item['id']: item for item in await list_all(client)}[str(dataset.id)]['health'],
     ):
-        assert (freshness['status'], freshness['expectedLastBar']) == (status, '2026-09-28T04:00:00Z'), freshness
+        assert (health['status'], health['expectedLastBar']) == (status, '2026-09-28T04:00:00Z'), health
 
 
 # tj-grna9p.156 (the clarification on decision tj-grna9p.8 of 2026-10-20): over a range ending mid-period, the week that
@@ -2291,10 +2381,10 @@ async def test_a_weekly_dataset_ending_mid_week_reads_one_count_on_list_detail_a
     dataset = entry('WKMD', granularity=Granularity.ONE_WEEK, start=midnight(date(2026, 8, 3)), end=MID_WEEK_END)
     await store(engine, dataset, *daily_bars(dataset, [day for day in WEEKLY_BARS if day != dropped]))
 
-    detail = (await client.get(f'/ui/v1/datasets/{dataset.id}')).json()['freshness']
-    listed = {item['id']: item for item in await list_all(client)}[str(dataset.id)]['freshness']
-    for freshness in (detail, listed):
-        assert (freshness['status'], freshness['gapCount']) == ('FRESHNESS_STATUS_GAPS', count), freshness
+    detail = (await client.get(f'/ui/v1/datasets/{dataset.id}')).json()['health']
+    listed = {item['id']: item for item in await list_all(client)}[str(dataset.id)]['health']
+    for health in (detail, listed):
+        assert (health['status'], health['gapCount']) == ('DATASET_HEALTH_STATUS_GAPS', count), health
     strip = await coverage(client, dataset)
     assert strip.gaps == [window(first, last)] and strip.gaps[0][2] == count, strip.gaps
     assert (strip.gap_count, strip.missing) == (1, count), strip
@@ -2310,9 +2400,9 @@ async def test_a_complete_weekly_dataset_ending_mid_week_reads_complete(client, 
     dataset = entry('WKMC', granularity=Granularity.ONE_WEEK, start=midnight(date(2026, 8, 3)), end=MID_WEEK_END)
     await store(engine, dataset, *daily_bars(dataset, WEEKLY_BARS))
 
-    detail = (await client.get(f'/ui/v1/datasets/{dataset.id}')).json()['freshness']
-    assert detail['status'] == 'FRESHNESS_STATUS_COMPLETE' and 'gapCount' not in detail, detail
+    detail = (await client.get(f'/ui/v1/datasets/{dataset.id}')).json()['health']
+    assert detail['status'] == 'DATASET_HEALTH_STATUS_COMPLETE' and 'gapCount' not in detail, detail
     listed = {item['id']: item for item in await list_all(client)}
-    assert status_of(listed[str(dataset.id)]) == 'FRESHNESS_STATUS_COMPLETE'
+    assert status_of(listed[str(dataset.id)]) == 'DATASET_HEALTH_STATUS_COMPLETE'
     strip = await coverage(client, dataset)
     assert (strip.gaps, strip.gap_count, strip.missing, strip.expected) == ([], 0, 0, 42), strip

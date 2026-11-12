@@ -1,0 +1,176 @@
+/* The Panels page's shared form and card styles (tj-7zjov1.37). Unscoped on purpose and prefixed pn-, so the
+   panel components share one set; PanelListView imports it. Tokens only: no colour is written here. */
+.pn-card {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  min-width: 0;
+  padding: var(--tj-card-padding);
+  background: var(--tj-surface);
+  border: 1px solid var(--tj-line);
+  border-radius: var(--tj-radius-card);
+}
+
+.pn-card__title {
+  margin: 0;
+  font-size: 15px;
+  font-weight: 600;
+}
+
+.pn-form {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  max-width: 640px;
+}
+
+.pn-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+  gap: 10px;
+}
+
+.pn-field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+}
+
+.pn-label {
+  font-size: 12px;
+  color: var(--tj-text2);
+}
+
+.pn-input {
+  min-width: 0;
+  height: var(--tj-control-height);
+  padding: 0 10px;
+  border: 1px solid var(--tj-line);
+  border-radius: var(--tj-radius-control);
+  background: var(--tj-surface);
+  color: var(--tj-text);
+  font: inherit;
+  font-size: 13px;
+}
+
+.pn-input[aria-invalid='true'] {
+  border-color: var(--tj-status-fail);
+}
+
+.pn-required {
+  color: var(--tj-text2);
+}
+
+.pn-required--marked,
+.pn-field-error {
+  color: var(--tj-status-fail);
+}
+
+.pn-field-error {
+  margin: 0;
+  font-size: 12px;
+}
+
+textarea.pn-input {
+  height: auto;
+  padding: 8px 10px;
+  resize: vertical;
+}
+
+.pn-check {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  color: var(--tj-text);
+}
+
+.pn-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+}
+
+.pn-btn {
+  height: var(--tj-control-height);
+  padding: 0 12px;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  border: 1px solid var(--tj-line);
+  border-radius: var(--tj-radius-control);
+  background: transparent;
+  color: var(--tj-text);
+  font: inherit;
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+}
+
+.pn-btn--primary {
+  border-color: transparent;
+  background: var(--tj-accent-fill);
+  color: var(--tj-on-accent);
+}
+
+.pn-btn:disabled {
+  border-color: var(--tj-line);
+  background: transparent;
+  color: var(--tj-text3);
+  cursor: not-allowed;
+}
+
+.pn-hint {
+  margin: 0;
+  font-size: 12px;
+  color: var(--tj-text3);
+}
+
+.pn-muted {
+  margin: 0;
+  font-size: 13px;
+  color: var(--tj-text2);
+}
+
+.pn-notice {
+  margin: 0;
+  padding: 8px 12px;
+  border: 1px solid var(--tj-line);
+  border-radius: var(--tj-radius-control);
+  background: var(--tj-raised);
+  font-size: 13px;
+  color: var(--tj-text);
+}
+
+.pn-notice--error {
+  border-color: var(--tj-status-fail);
+}
+
+.pn-error-id {
+  margin-left: 8px;
+  font-family: var(--tj-font-mono);
+  font-size: 12px;
+  color: var(--tj-text3);
+}
+
+.pn-facts {
+  margin: 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 28px;
+}
+
+.pn-facts dt {
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--tj-text3);
+}
+
+.pn-facts dd {
+  margin: 2px 0 0;
+  font-size: 13px;
+  font-family: var(--tj-font-mono);
+}

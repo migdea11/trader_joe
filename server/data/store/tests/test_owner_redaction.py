@@ -27,12 +27,8 @@ exactly as the asyncpg execution context would. Whether asyncpg STORES a Redacte
 value is tests/system/test_asyncpg_bind_spike.py's question (host run, tj-vhboky.14), not this file's.
 """
 
-import importlib.util
 import logging
 from datetime import UTC, datetime
-from pathlib import Path
-from typing import Any
-from unittest.mock import MagicMock, patch
 from uuid import UUID, uuid4
 
 import pytest
@@ -47,6 +43,7 @@ from common.errors.vocabulary import ExogenousError, Reason
 from common.sensitive import REDACTED, RedactedStr
 from data.store.app.database.crud.stock import store_dataset_entry as crud
 from data.store.app.database.models.store_dataset_entry import StoreDatasetEntry
+from data.store.tests.alpha_baseline import record_upgrade
 from schemas.data_store.asset_dataset_store import (
     AssetDatasetStoreCreate,
     AssetDatasetStoreUpdate,
@@ -436,44 +433,21 @@ async def test_the_upsert_request_log_never_contains_the_owner(caplog: pytest.Lo
 
 
 # ---------------------------------------------------------------------------------------------
-# DDL: the model's owner column is the one the head revision created, so no migration
+# DDL: the model's owner column is the one the alpha baseline creates (ADR tj-kg521d)
 # ---------------------------------------------------------------------------------------------
 
-_VERSIONS_DIR = Path(__file__).resolve().parents[1] / 'migrations' / 'versions'
-_HEAD_FILE = 'eec8f88a7443_per_dataset_identity_and_feed.py'
 
+def test_the_model_owner_ddl_is_the_baseline_revisions():
+    """Relationship, not constant: the model's column spec compiled beside the baseline's, on postgresql.
 
-def _revision_owner_column() -> sa.Column:
-    """The sa.Column the head revision's upgrade() passes to op.add_column for the entry's owner."""
-    spec = importlib.util.spec_from_file_location('revision_eec8f88a7443_owner', _VERSIONS_DIR / _HEAD_FILE)
-    module: Any = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    bind = MagicMock(name='bind')
-    bind.execute.return_value.scalar_one.side_effect = ['looked_up_entry_constraint']
-    recorder = MagicMock(name='op')
-    recorder.get_bind.return_value = bind
-    recorder.f.side_effect = lambda name: name
-    with patch.object(module, 'op', recorder), patch.object(module, 'FEED_TYPE', MagicMock(name='FEED_TYPE')):
-        module.upgrade()
-    (added,) = [
-        call.args[1]
-        for call in recorder.add_column.call_args_list
-        if call.args[0] == module.ENTRY_TABLE and call.args[1].name == 'owner'
-    ]
-    return added
-
-
-def test_the_model_owner_ddl_is_the_head_revisions():
-    """Relationship, not constant: the model's column spec compiled beside the revision's, on postgresql.
-
-    SensitiveString's impl is String, so the migrated column and the model agree and no revision is
-    needed. A length, a different impl or a changed default on the model would split them.
+    SensitiveString's impl is String, so the migrated column and the model agree. A length, a different impl or a
+    changed default on the model would split them. The baseline's column is the one its upgrade() hands to
+    op.create_table, recorded with no database (alpha_baseline.record_upgrade).
     """
     dialect = postgresql.dialect()
     model = str(CreateColumn(StoreDatasetEntry.__table__.c.owner).compile(dialect=dialect))
-    revision_column = _revision_owner_column()
-    sa.Table('store_dataset_entry_revision_probe', sa.MetaData(), revision_column)
-    revision = str(CreateColumn(revision_column).compile(dialect=dialect))
+    baseline_entry = record_upgrade().metadata.tables[StoreDatasetEntry.__tablename__]
+    revision = str(CreateColumn(baseline_entry.c.owner).compile(dialect=dialect))
 
     assert model == revision
     assert model == "owner VARCHAR DEFAULT 'unassigned' NOT NULL", 'the builder-reported DDL (tj-vhboky.46 notes)'

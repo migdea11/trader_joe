@@ -1,0 +1,421 @@
+// THE UI'S PANEL VOCABULARY (tj-7zjov1.35, ADR tj-26jt9w addendum 20): the panels the panel manager keeps
+// datasets for, their settings and settings versions, the boundary read for the history strip's markers,
+// membership counts and member rows, the aggregate asset-list history, corporate-action events, and the
+// writes. UI-ONLY: there is no client-facing panel API, so these messages are the /ui/v1 surface and
+// nothing else (canonical protobuf JSON). The name is PANEL; no message, field or enum here says world or
+// universe. Additive to every other ui/v1 file; imports data.proto, market/v1 and google protobuf only.
+//
+// UNITS ARE KEPT IN THE FIELD NAME (ramp_datasets_per_hour, request_cap_per_hour, *_days), as the store's
+// columns do: the per-hour unit is a reversible assumption, and a unit-free name would let a later switch
+// change meaning without changing the wire.
+//
+// HALF-OPEN RANGES. Every range here is [start, end): start included, end excluded.
+//
+// A DAY is a 'YYYY-MM-DD' string in the panel's source calendar. Every day string (day, appeared_on,
+// vanished_on) is the source-calendar date of the instant it derives from. A day D is included in a
+// half-open [start, end) range iff D's local midnight in the source calendar's timezone falls in
+// [start, end). No credential material crosses here; actor is the operator principal, a label.
+//
+// PANEL CREATE is RULED (owner, 2026-10-27): a UI write with an optional recorded reason, CreatePanelRequest, whose
+// response is the existing PanelDetail. There is still no client-facing panel API.
+syntax = "proto3";
+
+package trader_joe.proto.ui.v1;
+
+import "google/protobuf/timestamp.proto";
+import "trader_joe/proto/market/v1/enums.proto";
+import "trader_joe/proto/ui/v1/data.proto";
+
+// How often a panel's pass runs, judged on the panel's source calendar. Mirrors the store's
+// PanelCadence by member NAME. The zero value is never a real cadence and the store refuses it.
+enum PanelCadence {
+  PANEL_CADENCE_UNSPECIFIED = 0;
+  // The first close of the day.
+  PANEL_CADENCE_DAILY = 1;
+  // The ISO week.
+  PANEL_CADENCE_WEEKLY = 2;
+  PANEL_CADENCE_MONTHLY = 3;
+}
+
+// What a pass did to one member: the grain of the membership ledger. Mirrors the store's
+// PanelTransition by member NAME.
+enum PanelTransition {
+  PANEL_TRANSITION_UNSPECIFIED = 0;
+  // Selected by the filter for the first time (or again).
+  PANEL_TRANSITION_ENTERED = 1;
+  // The dataset was created for it.
+  PANEL_TRANSITION_CREATED = 2;
+  // Selected but held back by a rate window; see PanelMember.cause.
+  PANEL_TRANSITION_DEFERRED = 3;
+  // Selected but refused; see PanelMember.cause.
+  PANEL_TRANSITION_REFUSED = 4;
+  // No longer selected by the filter.
+  PANEL_TRANSITION_EXITED = 5;
+  // Delisted and still collecting until a fetch covers its last session.
+  PANEL_TRANSITION_DRAINING = 6;
+  // The drain finished.
+  PANEL_TRANSITION_DRAINED = 7;
+}
+
+// What a pass is, by what it may do. Mirrors the store's PanelPassKind by member NAME. A settings
+// version's effective pass may be of either kind.
+enum PanelPassKind {
+  PANEL_PASS_KIND_UNSPECIFIED = 0;
+  // Decides membership from the snapshots.
+  PANEL_PASS_KIND_MEMBERSHIP = 1;
+  // Only creates members the last membership pass DEFERRED.
+  PANEL_PASS_KIND_RELEASE = 2;
+}
+
+// How the asset-list history reads one expected day of a panel's source.
+enum AssetListDayState {
+  ASSET_LIST_DAY_STATE_UNSPECIFIED = 0;
+  // A non-empty snapshot was saved for the day.
+  ASSET_LIST_DAY_STATE_SAVED = 1;
+  // The day was due and no snapshot exists.
+  ASSET_LIST_DAY_STATE_MISSING = 2;
+  // A snapshot was saved and held no assets (a vendor glitch, never a base for events).
+  ASSET_LIST_DAY_STATE_EMPTY = 3;
+  // The day has not reached its collection time yet.
+  ASSET_LIST_DAY_STATE_NOT_DUE = 4;
+}
+
+// What a marker on the history strip marks.
+enum PanelMarkerKind {
+  PANEL_MARKER_KIND_UNSPECIFIED = 0;
+  // A new version of the panel's own settings (enable and disable included).
+  PANEL_MARKER_KIND_PANEL_SETTINGS = 1;
+  // A new version of the panel's source settings.
+  PANEL_MARKER_KIND_SOURCE_SETTINGS = 2;
+  // An operator collect stop on one of the panel's datasets.
+  PANEL_MARKER_KIND_COLLECT_STOP = 3;
+  // An operator collect resume on one of the panel's datasets.
+  PANEL_MARKER_KIND_COLLECT_RESUME = 4;
+}
+
+// One panel in the selector.
+message PanelListItem {
+  // The panel's UUID, as text.
+  string id = 1;
+  string name = 2;
+  // A panel's source is immutable: another source is another panel.
+  trader_joe.proto.market.v1.DataSource source = 3;
+  // From the panel's latest settings version.
+  bool enabled = 4;
+  // The panel's Bar Interval: immutable like source (another granularity is another panel).
+  trader_joe.proto.market.v1.Granularity granularity = 5;
+}
+
+message PanelList {
+  repeated PanelListItem items = 1;
+}
+
+// A panel's own settings: one settings version's content. enabled and cadence have no default. There is
+// no size: a panel's size property is removed (owner ruling, 2026-11-06).
+message PanelSettings {
+  // Field 3 was size, removed (owner ruling, 2026-11-06). Never reuse the number or the name.
+  reserved 3;
+  reserved "size";
+  bool enabled = 1;
+  PanelCadence cadence = 2;
+  // Empty restricts nothing.
+  repeated string allow_symbols = 4;
+  // Removes symbols from the selection.
+  repeated string deny_symbols = 5;
+  // The four below filter only when present; absent means no filter.
+  optional trader_joe.proto.market.v1.AssetType asset_class = 6;
+  optional string exchange = 7;
+  optional bool active = 8;
+  optional bool tradable = 9;
+  // Whether the panel selects assets whose exchange is OTC. Plain bool, no presence: an absent value is
+  // false, and false (the default) means OTC securities are not selected. The current market-data feed
+  // carries no bars for OTC securities.
+  bool include_otc = 10;
+}
+
+// A source's settings, shared by every panel on it. The two rates are optional: UNSET MEANS NO LIMIT, and
+// 0 never appears (a ramp is 1 or more, a cap 2 or more). The window day counts are not negative and have
+// the store's ruled default (90) when a create gives none.
+message PanelSourceSettings {
+  // The most NEW panel datasets created per source in any trailing 60 minutes, 1 or more. Unset: no limit.
+  optional int32 ramp_datasets_per_hour = 1;
+  // The most ingest requests the panel manager writes per source in any trailing 60 minutes, 2 or more
+  // (each new panel dataset costs two requests). Unset: no limit.
+  optional int32 request_cap_per_hour = 2;
+  // The days before a dataset's start and after its end that corporate actions are pulled for.
+  int32 corporate_action_window_pre_days = 3;
+  int32 corporate_action_window_post_days = 4;
+}
+
+// The pass that first ran under a settings version: its effective-from, derived and never stored.
+message EffectivePass {
+  // The pass's UUID, as text.
+  string pass_id = 1;
+  PanelPassKind kind = 2;
+  google.protobuf.Timestamp started_at = 3;
+}
+
+// One version of a panel's own settings.
+message PanelSettingsVersion {
+  // Numbered per panel, from 1.
+  int32 version_no = 1;
+  PanelSettings settings = 2;
+  google.protobuf.Timestamp saved_at = 3;
+  // The operator principal: a label, never a credential.
+  string actor = 4;
+  // Why it was saved; trimmed. Optional: empty means none was given.
+  string reason = 5;
+  // Unset when no pass has run under this version yet.
+  EffectivePass effective_pass = 6;
+}
+
+// One version of a source's settings.
+message PanelSourceSettingsVersion {
+  trader_joe.proto.market.v1.DataSource source = 1;
+  // Numbered per source, from 1.
+  int32 version_no = 2;
+  PanelSourceSettings settings = 3;
+  google.protobuf.Timestamp saved_at = 4;
+  string actor = 5;
+  // Why it was saved; trimmed. Optional: empty means none was given.
+  string reason = 6;
+  // Unset when no pass has run under this version yet.
+  EffectivePass effective_pass = 7;
+}
+
+// Membership counts from the ledger's latest state per member.
+message PanelMembershipCounts {
+  // Members now: selected and not EXITED or DRAINED.
+  int64 members = 1;
+  // Members whose dataset is collecting.
+  int64 collecting = 2;
+  // Members in DRAINING.
+  int64 draining = 3;
+  // Members whose dataset is behind its expected last bar (LATE or OVERDUE).
+  int64 lagging = 4;
+}
+
+// A panel with its current settings and its source's current settings.
+message PanelDetail {
+  string id = 1;
+  string name = 2;
+  trader_joe.proto.market.v1.DataSource source = 3;
+  google.protobuf.Timestamp created_at = 4;
+  // The latest panel settings version, with its marker.
+  PanelSettingsVersion current_version = 5;
+  // The latest settings version of the panel's source.
+  PanelSourceSettingsVersion current_source_version = 6;
+  PanelMembershipCounts counts = 7;
+  // The panel's Bar Interval: immutable like source (another granularity is another panel).
+  trader_joe.proto.market.v1.Granularity granularity = 8;
+}
+
+// One page of a panel's own settings versions, newest first. Keyset paging; the cursor is opaque.
+message PanelSettingsVersionPage {
+  repeated PanelSettingsVersion items = 1;
+  // Pass back to fetch the next page; empty on the last page.
+  string next_cursor = 2;
+}
+
+// One page of a source's settings versions, newest first. Keyset paging; the cursor is opaque.
+message PanelSourceSettingsVersionPage {
+  repeated PanelSourceSettingsVersion items = 1;
+  // Pass back to fetch the next page; empty on the last page.
+  string next_cursor = 2;
+}
+
+// One marker on the history strip.
+message PanelMarker {
+  PanelMarkerKind kind = 1;
+  // When it happened: saved_at for a settings version, the log's time for a collect stop or resume.
+  google.protobuf.Timestamp at = 2;
+  // The version number, for a settings marker; 0 for a collect marker.
+  int32 version_no = 3;
+  // The operator principal: a label.
+  string actor = 4;
+  // The reason given; trimmed. Optional: empty means none was given.
+  string reason = 5;
+  // The dataset's UUID, as text, for a collect marker; empty otherwise.
+  string dataset_id = 6;
+  // For a collect marker, the dataset's display label (symbol and granularity); empty otherwise.
+  string label = 7;
+}
+
+// The boundary read: every marker of a panel in the window [start, end), oldest first, so the strip can
+// draw them: the panel's and its source's settings versions, and the operator collect stops and resumes
+// on the panel's datasets (the override log's new_value).
+message PanelBoundaries {
+  // Half-open [start, end): start included, end excluded.
+  google.protobuf.Timestamp start = 1;
+  google.protobuf.Timestamp end = 2;
+  repeated PanelMarker markers = 3;
+}
+
+// One expected day of the panel's source in the asset-list history.
+message AssetListHistoryDay {
+  // 'YYYY-MM-DD' in the source's calendar.
+  string day = 1;
+  AssetListDayState state = 2;
+  // Distinct vendor asset ids with at least one asset-list event (APPEARED, VANISHED or STATUS_FLIP) from
+  // the source's snapshots dated that day, counted over the source's whole asset list, not the panel's
+  // filtered slice. 0 when the day is not SAVED.
+  int32 changed_count = 3;
+}
+
+// The asset-list history as an aggregate, one entry per expected day of the panel's source, ascending.
+// Never per-asset rows.
+message AssetListHistory {
+  // Half-open [start, end): start included, end excluded. A day string D is included iff D's local
+  // midnight in the source calendar's timezone falls in [start, end).
+  google.protobuf.Timestamp start = 1;
+  google.protobuf.Timestamp end = 2;
+  repeated AssetListHistoryDay days = 3;
+  google.protobuf.Timestamp as_of = 4;
+}
+
+// One member of a panel, from the ledger's latest transition for it. A member is named by the vendor
+// asset id and the symbol as last observed in the snapshot, never by a listing id.
+message PanelMember {
+  string vendor_asset_id = 1;
+  // As last observed in the snapshot.
+  string symbol = 2;
+  // The latest transition: the member's status.
+  PanelTransition status = 3;
+  // The cause of a DEFERRED or REFUSED status; empty otherwise.
+  string cause = 4;
+  // The dataset's UUID, as text. Empty until one is created.
+  string dataset_id = 5;
+  // The days ('YYYY-MM-DD', source calendar) the asset appeared in and vanished from the asset list.
+  // Empty when it has not.
+  string appeared_on = 6;
+  string vanished_on = 7;
+  // The dataset's last bar_start. Unset when it has none.
+  google.protobuf.Timestamp last_bar = 8;
+  // The dataset's computed health. UNSPECIFIED when the member has no dataset.
+  DatasetHealthStatus health = 9;
+  // The snapshot instant of the latest transition, and when the store wrote it.
+  google.protobuf.Timestamp as_of = 10;
+  google.protobuf.Timestamp recorded_at = 11;
+}
+
+// One page of members. Keyset paging over (symbol, vendor_asset_id); the cursor is opaque.
+message PanelMemberPage {
+  repeated PanelMember items = 1;
+  // Pass back to fetch the next page; empty on the last page.
+  string next_cursor = 2;
+}
+
+// One corporate-action observation for a dataset, as the vendor sent it. A vendor revision is another
+// observation with its own as_of.
+message CorporateActionEvent {
+  string vendor_action_id = 1;
+  // The vendor's wording, uninterpreted.
+  string action_type = 2;
+  // The five vendor dates; each unset when the vendor gave none.
+  google.protobuf.Timestamp ex_date = 3;
+  google.protobuf.Timestamp record_date = 4;
+  google.protobuf.Timestamp payable_date = 5;
+  google.protobuf.Timestamp process_date = 6;
+  google.protobuf.Timestamp effective_date = 7;
+  google.protobuf.Timestamp as_of = 8;
+}
+
+// One page of a dataset's corporate-action events. Keyset paging; the cursor is opaque.
+message CorporateActionEventPage {
+  repeated CorporateActionEvent items = 1;
+  // Pass back to fetch the next page; empty on the last page.
+  string next_cursor = 2;
+}
+
+// The body of a panel's settings write: a new settings version. The write replaces the settings as sent
+// (an absent optional filter clears it). Enable and disable is the same write with enabled changed. The
+// server stamps saved_at and actor.
+message SavePanelSettingsRequest {
+  // Field 3 was size, removed (owner ruling, 2026-11-06). Never reuse the number or the name.
+  reserved 3;
+  reserved "size";
+  // Presence is meaningful: an absent value is refused (422), never read as false.
+  optional bool enabled = 1;
+  // UNSPECIFIED is refused (422).
+  PanelCadence cadence = 2;
+  repeated string allow_symbols = 4;
+  repeated string deny_symbols = 5;
+  optional trader_joe.proto.market.v1.AssetType asset_class = 6;
+  optional string exchange = 7;
+  optional bool active = 8;
+  optional bool tradable = 9;
+  // Optional: trimmed; blank or absent means none was given (never refused).
+  string reason = 10;
+  // Whether the panel selects assets whose exchange is OTC. Plain bool, no presence: an absent value is
+  // false, and false (the default) means OTC securities are not selected. The current market-data feed
+  // carries no bars for OTC securities. A false value with exchange OTC is refused (422): it would select
+  // nothing.
+  bool include_otc = 11;
+}
+
+// The body of a source's settings write: a new source settings version.
+message SaveSourceSettingsRequest {
+  // 1-2, the rates: an absent rate means NO LIMIT (never refused, never read as zero). A present ramp under
+  // 1 or cap under 2 (so a present 0) is refused (422); a value above int32 max fails the parse (422).
+  // 3-4, the window day counts: both required (an absent one is refused (422)), not negative.
+  optional int32 ramp_datasets_per_hour = 1;
+  optional int32 request_cap_per_hour = 2;
+  optional int32 corporate_action_window_pre_days = 3;
+  optional int32 corporate_action_window_post_days = 4;
+  // Optional: trimmed; blank or absent means none was given (never refused).
+  string reason = 5;
+}
+
+// The body of a panel create: the new panel's first settings version (1) and, optionally, the first
+// settings of its source. FLAT, because a nested PanelSettings cannot carry presence. Fields 1-9 (3 is
+// reserved) are identical in name, number, type and presence to SavePanelSettingsRequest 1-9. include_otc is the one more shared panel setting (10 in PanelSettings, 11 in
+// SavePanelSettingsRequest, 17 here), identical in name, type and plain-bool presence. The server stamps
+// created_at, saved_at and actor; version 1 is written with the panel in one transaction. The RESPONSE is
+// the created PanelDetail: current_version is version 1 with effective_pass unset, counts all zero. The
+// FIRST PASS is not run by this write and is never in its response: the store's panel manager (one
+// Every(5 min) tick) finds an enabled panel with no non-dry-run MEMBERSHIP pass due at once, subject to
+// the active-snapshot wait; a panel created disabled gets its first pass on the first tick after it is
+// enabled. The UI shows 'first pass pending' from the unset effective_pass and re-reads the detail. Every
+// refusal is INVALID_REQUEST, 422, with the store's message.
+message CreatePanelRequest {
+  // Field 3 was size, removed (owner ruling, 2026-11-06). Never reuse the number or the name.
+  reserved 3;
+  reserved "size";
+  // Presence is meaningful: an absent value is refused (422), never read as false; there is no default.
+  optional bool enabled = 1;
+  // UNSPECIFIED means not named: the store applies its default, MONTHLY (DEFAULT_PANEL_CADENCE).
+  PanelCadence cadence = 2;
+  repeated string allow_symbols = 4;
+  repeated string deny_symbols = 5;
+  optional trader_joe.proto.market.v1.AssetType asset_class = 6;
+  optional string exchange = 7;
+  optional bool active = 8;
+  optional bool tradable = 9;
+  // Optional: trimmed; blank or absent means none was given (never refused).
+  string reason = 10;
+  // Required, trimmed, unique; blank or already used is refused (422).
+  string name = 11;
+  // Required; UNSPECIFIED is refused (422). Fixed for the panel's life.
+  trader_joe.proto.market.v1.DataSource source = 12;
+  // 13-16: the FIRST source settings. On a source with NO settings version, the create always writes that
+  // source's version 1 from whatever 13-16 carry: an absent rate is no limit, an absent window day count
+  // takes the store's ruled 90 (DEFAULT_CORPORATE_ACTION_WINDOW_DAYS); all four absent writes no limits and
+  // 90/90. A present ramp under 1, cap under 2 or negative window day count is refused (422). On a source
+  // that already has a version, any of 13-16 is refused (422) and nothing is written: a source's settings
+  // apply to every panel on that source, so they change only through their own write,
+  // POST /panel-sources/{source}/settings-versions (the UI reads
+  // GET /panel-sources/{source}/settings-versions first to see whether a version exists).
+  optional int32 ramp_datasets_per_hour = 13;
+  optional int32 request_cap_per_hour = 14;
+  optional int32 corporate_action_window_pre_days = 15;
+  optional int32 corporate_action_window_post_days = 16;
+  // Whether the panel selects assets whose exchange is OTC. Plain bool, no presence: an absent value is
+  // false, and false (the default) means OTC securities are not selected. The current market-data feed
+  // carries no bars for OTC securities. A false value with exchange OTC is refused (422): it would select
+  // nothing. It is a panel setting, so it is numbered after 13-16 but is not one of the source settings.
+  bool include_otc = 17;
+  // Required: the panel's Bar Interval, fixed for the panel's life (another granularity is another panel).
+  // The store accepts only ONE_MINUTE, ONE_HOUR and ONE_DAY; UNSPECIFIED and every other member is refused
+  // (422) and nothing is written. There is no default.
+  trader_joe.proto.market.v1.Granularity granularity = 18;
+}

@@ -2,10 +2,12 @@
 // Node, not the suite's jsdom: vite.config.ts is a Node module whose import.meta.url must be a file: URL.
 //
 // The dev proxy mirrors the prod edge (web/vite.config.ts, bead tj-grna9p.134; the prod edge is
-// deploy/web/Caddyfile, bead tj-grna9p.133). Under /api/store the dev server forwards exactly Caddy's four
-// rules (GET and HEAD under /api/store/ui/v1/, PATCH on one dataset's /expiry, PATCH on one dataset's
-// /collecting, DELETE on one dataset), answers a '..' path 400 and anything else 404 without reaching
-// data_store, and sets
+// deploy/web/Caddyfile, bead tj-grna9p.133). Under /api/store the dev server forwards exactly Caddy's
+// rules: the read rule (GET and HEAD under /api/store/ui/v1/) and the six writes (PATCH on one dataset's
+// /expiry, PATCH on one dataset's /collecting, DELETE on one dataset, and the three panel POSTs of
+// tj-7zjov1.169: POST .../panels, POST .../panels/<uuid>/settings-versions, POST
+// .../panel-sources/DATA_SOURCE_<NAME>/settings-versions), answers a '..' path 400 and anything else 404
+// without reaching data_store, and sets
 // X-Instance-Secret from its own process.env.INSTANCE_WRITE_SECRET, replacing any browser value.
 //
 // The allow-list table is the SAME cases as server/common/tests/test_web_edge.py (the Caddyfile's pins), so
@@ -71,6 +73,11 @@ afterEach(() => {
 const LOWER_UUID = '0f8fad5b-d9cb-469f-a165-70867728950e'
 const UPPER_UUID = '0F8FAD5B-D9CB-469F-A165-70867728950E'
 const DATASETS = '/api/store/ui/v1/datasets'
+const PANELS = '/api/store/ui/v1/panels'
+const PANEL_SOURCES = '/api/store/ui/v1/panel-sources'
+const SOURCE = 'DATA_SOURCE_ALPACA_API'
+const PANEL_SETTINGS_PATH = `${PANELS}/${LOWER_UUID}/settings-versions`
+const SOURCE_SETTINGS_PATH = `${PANEL_SOURCES}/${SOURCE}/settings-versions`
 
 // test_the_ui_requests_are_forwarded_by_exactly_their_rule
 const FORWARDED: [string, string, string][] = [
@@ -80,8 +87,17 @@ const FORWARDED: [string, string, string][] = [
   ['collecting-upper', 'PATCH', `${DATASETS}/${UPPER_UUID}/collecting`],
   ['delete-lower', 'DELETE', `${DATASETS}/${LOWER_UUID}`],
   ['delete-upper', 'DELETE', `${DATASETS}/${UPPER_UUID}`],
+  ['panel-create', 'POST', PANELS],
+  ['panel-settings-lower', 'POST', PANEL_SETTINGS_PATH],
+  ['panel-settings-upper', 'POST', `${PANELS}/${UPPER_UUID}/settings-versions`],
+  ['source-settings-alpaca', 'POST', SOURCE_SETTINGS_PATH],
+  ['source-settings-ib', 'POST', `${PANEL_SOURCES}/DATA_SOURCE_IB_API/settings-versions`],
   ['get-read', 'GET', `${DATASETS}/${LOWER_UUID}/bars`],
   ['head-read', 'HEAD', '/api/store/ui/v1/config'],
+  ['get-panels', 'GET', PANELS],
+  ['get-panel-settings', 'GET', PANEL_SETTINGS_PATH],
+  ['get-source-settings', 'GET', SOURCE_SETTINGS_PATH],
+  ['head-panel-settings', 'HEAD', PANEL_SETTINGS_PATH],
 ]
 
 // _REFUSED_WRITE_PATHS, each refused for PATCH and for DELETE
@@ -109,19 +125,105 @@ const REFUSED_WRITE_PATHS: Record<string, string> = {
   unprefixed: `/ui/v1/datasets/${LOWER_UUID}`,
   'prefix-in-front': `/x${DATASETS}/${LOWER_UUID}`,
   'other-version': `/api/store/ui/v2/datasets/${LOWER_UUID}`,
+  // The panel look-alikes (tj-7zjov1.169): near each of the three POST shapes, and none of them. The four
+  // spellings the dev bypass answers 400 (an encoded slash, an empty segment) are in REFUSED_WRITE_SPELLINGS.
+  'panels-slash': `${PANELS}/`,
+  'panels-uppercase': '/api/store/ui/v1/PANELS',
+  'panels-title': '/api/store/ui/v1/Panels',
+  'panels-singular': '/api/store/ui/v1/panel',
+  'panels-longer': `${PANELS}x`,
+  'panels-trailing-newline': `${PANELS}\n`,
+  'panels-sub-path': `${PANELS}/x`,
+  'panels-the-panel': `${PANELS}/${LOWER_UUID}`,
+  'panels-the-panel-slash': `${PANELS}/${LOWER_UUID}/`,
+  'panels-members': `${PANELS}/${LOWER_UUID}/members`,
+  'panels-unprefixed': '/ui/v1/panels',
+  'panels-other-version': '/api/store/ui/v2/panels',
+  'panels-prefix-in-front': `/x${PANELS}`,
+  'panels-store-route': '/api/store/store/panels',
+  'panel-settings-not-a-uuid': `${PANELS}/not-a-uuid/settings-versions`,
+  'panel-settings-uuid-no-dashes': `${PANELS}/${LOWER_UUID.replaceAll('-', '')}/settings-versions`,
+  'panel-settings-uuid-short': `${PANELS}/${LOWER_UUID.slice(0, -1)}/settings-versions`,
+  'panel-settings-uuid-long': `${PANELS}/${LOWER_UUID}0/settings-versions`,
+  'panel-settings-uuid-non-hex': `${PANELS}/${LOWER_UUID.slice(0, -1)}g/settings-versions`,
+  'panel-settings-a-source': `${PANELS}/${SOURCE}/settings-versions`,
+  'panel-settings-bare': `${PANELS}/settings-versions`,
+  'panel-settings-trailing-slash': `${PANEL_SETTINGS_PATH}/`,
+  'panel-settings-extra-segment': `${PANEL_SETTINGS_PATH}/x`,
+  'panel-settings-a-version': `${PANEL_SETTINGS_PATH}/1`,
+  'panel-settings-uppercase': `${PANELS}/${LOWER_UUID}/SETTINGS-VERSIONS`,
+  'panel-settings-underscore': `${PANELS}/${LOWER_UUID}/settings_versions`,
+  'panel-settings-singular': `${PANELS}/${LOWER_UUID}/settings-version`,
+  'panel-settings-trailing-newline': `${PANEL_SETTINGS_PATH}\n`,
+  'panel-settings-prefix-in-front': `/x${PANEL_SETTINGS_PATH}`,
+  'panel-settings-unprefixed': `/ui/v1/panels/${LOWER_UUID}/settings-versions`,
+  'panel-settings-under-sources': `${PANEL_SOURCES}/${LOWER_UUID}/settings-versions`,
+  'source-settings-not-a-source': `${PANEL_SOURCES}/NOT_A_SOURCE/settings-versions`,
+  'source-settings-lowercase': `${PANEL_SOURCES}/${SOURCE.toLowerCase()}/settings-versions`,
+  'source-settings-mixed-case': `${PANEL_SOURCES}/DATA_SOURCE_Alpaca_API/settings-versions`,
+  'source-settings-prefix-only': `${PANEL_SOURCES}/DATA_SOURCE_/settings-versions`,
+  'source-settings-no-prefix': `${PANEL_SOURCES}/ALPACA_API/settings-versions`,
+  'source-settings-prefix-in-name': `${PANEL_SOURCES}/X_${SOURCE}/settings-versions`,
+  'source-settings-dash': `${PANEL_SOURCES}/DATA_SOURCE_ALPACA-API/settings-versions`,
+  'source-settings-dot': `${PANEL_SOURCES}/DATA_SOURCE_ALPACA.API/settings-versions`,
+  'source-settings-space': `${PANEL_SOURCES}/DATA_SOURCE_ALPACA API/settings-versions`,
+  'source-settings-two-segments': `${PANEL_SOURCES}/${SOURCE}/${SOURCE}/settings-versions`,
+  'source-settings-bare': `${PANEL_SOURCES}/settings-versions`,
+  'source-settings-the-source': `${PANEL_SOURCES}/${SOURCE}`,
+  'source-settings-the-list': PANEL_SOURCES,
+  'source-settings-the-list-slash': `${PANEL_SOURCES}/`,
+  'source-settings-trailing-slash': `${SOURCE_SETTINGS_PATH}/`,
+  'source-settings-extra-segment': `${SOURCE_SETTINGS_PATH}/x`,
+  'source-settings-uppercase': `${PANEL_SOURCES}/${SOURCE}/SETTINGS-VERSIONS`,
+  'source-settings-trailing-newline': `${SOURCE_SETTINGS_PATH}\n`,
+  'source-settings-a-uuid': `${PANEL_SOURCES}/${LOWER_UUID}/settings-versions`,
+  'source-settings-singular-root': `/api/store/ui/v1/panel-source/${SOURCE}/settings-versions`,
+  'source-settings-under-panels': `${PANELS}/sources/${SOURCE}/settings-versions`,
+  'source-settings-prefix-in-front': `/x${SOURCE_SETTINGS_PATH}`,
+  'source-settings-unprefixed': `/ui/v1/panel-sources/${SOURCE}/settings-versions`,
+  'source-settings-other-version': `/api/store/ui/v2/panel-sources/${SOURCE}/settings-versions`,
 }
+// test_a_write_on_any_other_path_is_not_forwarded: every write method, POST included, on every path.
+const WRITE_METHODS = ['PATCH', 'DELETE', 'POST']
 const REFUSED_WRITES = Object.entries(REFUSED_WRITE_PATHS).flatMap(([id, path]) =>
-  ['PATCH', 'DELETE'].map((method) => [`${method.toLowerCase()}-${id}`, method, path] as [string, string, string]),
+  WRITE_METHODS.map((method) => [`${method.toLowerCase()}-${id}`, method, path] as [string, string, string]),
 )
 
-// _REFUSED_WRITE_PATHS's two collecting spellings that Caddy cleans or decodes: the allow-list refuses
-// them raw, as Caddy's regex does, and the dev bypass answers them 400 (stricter than prod), not 404.
+// _REFUSED_WRITE_PATHS's spellings that Caddy cleans or decodes: the allow-list refuses them raw, as
+// Caddy's regex does, and the dev bypass answers them 400 (stricter than prod), not 404.
 const REFUSED_WRITE_SPELLINGS: Record<string, string> = {
   'collecting-encoded-slash': `${DATASETS}/${LOWER_UUID}%2Fcollecting`,
   'collecting-dot-segment': `${DATASETS}/${LOWER_UUID}/../${LOWER_UUID}/collecting`,
+  'panel-settings-encoded-slash': `${PANELS}/${LOWER_UUID}%2Fsettings-versions`,
+  'panel-settings-no-panel': `${PANELS}//settings-versions`,
+  'source-settings-encoded-slash': `${PANEL_SOURCES}/${SOURCE}%2Fsettings-versions`,
+  'source-settings-no-source': `${PANEL_SOURCES}//settings-versions`,
 }
 const REFUSED_WRITE_SPELLING_CASES = Object.entries(REFUSED_WRITE_SPELLINGS).flatMap(([id, path]) =>
-  ['PATCH', 'DELETE'].map((method) => [`${method.toLowerCase()}-${id}`, method, path] as [string, string, string]),
+  WRITE_METHODS.map((method) => [`${method.toLowerCase()}-${id}`, method, path] as [string, string, string]),
+)
+
+// test_on_each_write_path_only_its_method_reaches_a_write_rule, for the three panel POST paths: POST is
+// the write; GET and HEAD are the read rule's; every other method is refused.
+const PANEL_WRITE_PATHS: [string, string][] = [
+  ['store_ui_panel_create', PANELS],
+  ['store_ui_panel_settings', PANEL_SETTINGS_PATH],
+  ['store_ui_source_settings', SOURCE_SETTINGS_PATH],
+]
+const PANEL_PATH_METHODS: [string, string, boolean][] = PANEL_WRITE_PATHS.flatMap(([, path]) =>
+  (
+    [
+      ['POST', true],
+      ['GET', true],
+      ['HEAD', true],
+      ['PATCH', false],
+      ['DELETE', false],
+      ['PUT', false],
+      ['OPTIONS', false],
+      ['CONNECT', false],
+      ['TRACE', false],
+    ] as [string, boolean][]
+  ).map(([method, forwarded]) => [method, path, forwarded] as [string, string, boolean]),
 )
 
 // THE COLLECTING RULE (tj-grna9p.177 here, tj-grna9p.184 in the Caddyfile): test_web_edge.py's
@@ -187,6 +289,24 @@ const REFUSED_OTHER: [string, string, string][] = [
   ['options', 'OPTIONS', `${DATASETS}/${LOWER_UUID}`],
   ['get-store', 'GET', `/api/store/store/datasets/${LOWER_UUID}`],
   ['get-internal', 'GET', '/api/store/internal/asset-data'],
+  ['post-dataset', 'POST', `${DATASETS}/${LOWER_UUID}`],
+  ['put-panels', 'PUT', PANELS],
+  ['patch-panels', 'PATCH', PANELS],
+  ['delete-panels', 'DELETE', PANELS],
+  ['put-panel-settings', 'PUT', PANEL_SETTINGS_PATH],
+  ['patch-panel-settings', 'PATCH', PANEL_SETTINGS_PATH],
+  ['delete-panel-settings', 'DELETE', PANEL_SETTINGS_PATH],
+  ['put-source-settings', 'PUT', SOURCE_SETTINGS_PATH],
+  ['patch-source-settings', 'PATCH', SOURCE_SETTINGS_PATH],
+  ['delete-source-settings', 'DELETE', SOURCE_SETTINGS_PATH],
+  ['patch-the-panel', 'PATCH', `${PANELS}/${LOWER_UUID}`],
+  ['delete-the-panel', 'DELETE', `${PANELS}/${LOWER_UUID}`],
+  ['put-the-panel', 'PUT', `${PANELS}/${LOWER_UUID}`],
+  ['options-panels', 'OPTIONS', PANELS],
+  // test_web_edge.py's lower-case-post-panels, title-case-post-panel-settings and
+  // lower-case-post-source-settings are NOT here: Caddy compares the method as sent, the dev edge
+  // upper-cases it (as for PATCH and DELETE, see DEV_FORWARDED), and Node's parser delivers only
+  // upper-case methods anyway (devProxyServer.spec.ts: a raw lower-case method is the server's own 400).
 ]
 
 // The dev edge's own additions, from the build brief: the events socket, the query string, the method's case.
@@ -203,6 +323,11 @@ const DEV_FORWARDED: [string, string, string][] = [
   ['lower-case-patch-collecting', 'patch', `${DATASETS}/${LOWER_UUID}/collecting`],
   ['patch-collecting-with-a-query', 'PATCH', `${DATASETS}/${UPPER_UUID}/collecting?x=1`],
   ['mixed-case-delete', 'Delete', `${DATASETS}/${LOWER_UUID}`],
+  ['lower-case-post-panels', 'post', PANELS],
+  ['title-case-post-panel-settings', 'Post', PANEL_SETTINGS_PATH],
+  ['lower-case-post-source-settings', 'post', SOURCE_SETTINGS_PATH],
+  ['post-panels-with-a-query', 'POST', `${PANELS}?x=/settings-versions`],
+  ['post-source-settings-with-a-query', 'POST', `${SOURCE_SETTINGS_PATH}?cursor=a`],
 ]
 const DEV_REFUSED: [string, string, string][] = [
   ['get-store-x', 'GET', '/api/store/store/x'],
@@ -219,6 +344,13 @@ const DEV_REFUSED: [string, string, string][] = [
   ['patch-on-the-list', 'PATCH', DATASETS],
   ['delete-on-the-list', 'DELETE', DATASETS],
   ['empty-method', '', '/api/store/ui/v1/config'],
+  ['post-panel-in-the-query-only', 'POST', `${PANELS}/${LOWER_UUID}?/settings-versions`],
+  ['post-the-panel-members', 'POST', `${PANELS}/${LOWER_UUID}/members`],
+  ['post-boundaries', 'POST', `${PANELS}/${LOWER_UUID}/boundaries`],
+  ['post-asset-list-history', 'POST', `${PANELS}/${LOWER_UUID}/asset-list-history`],
+  ['post-corporate-actions', 'POST', `${DATASETS}/${LOWER_UUID}/corporate-actions`],
+  ['lower-case-put-panels', 'put', PANELS],
+  ['lower-case-patch-panel-settings', 'patch', PANEL_SETTINGS_PATH],
 ]
 
 describe('isAllowedStoreRequest: the Caddyfile cases (test_web_edge.py)', () => {
@@ -245,6 +377,19 @@ describe('isAllowedStoreRequest: the Caddyfile cases (test_web_edge.py)', () => 
 
   it.each(COLLECTING_METHODS)('%s on one dataset /collecting is forwarded: %s', (method, forwarded) => {
     expect(mod.isAllowedStoreRequest(method, COLLECTING)).toBe(forwarded)
+  })
+
+  it.each(PANEL_PATH_METHODS)('%s on the panel write path %s is forwarded: %s', (method, path, forwarded) => {
+    expect(mod.isAllowedStoreRequest(method, path)).toBe(forwarded)
+  })
+
+  // POST is the panel writes' alone: every POST row of the tables that is forwarded is one of the three shapes.
+  it('POST forwards on exactly the three panel write shapes among every path of the tables', () => {
+    const all = [...FORWARDED, ...REFUSED_WRITES, ...REFUSED_WRITE_SPELLING_CASES, ...REFUSED_OTHER, ...DEV_FORWARDED, ...DEV_REFUSED]
+    const posted = [...new Set(all.map((c) => c[2].split('?')[0]!))].filter((p) => mod.isAllowedStoreRequest('POST', p))
+    expect(posted.sort()).toEqual(
+      [PANELS, PANEL_SETTINGS_PATH, `${PANELS}/${UPPER_UUID}/settings-versions`, SOURCE_SETTINGS_PATH, `${PANEL_SOURCES}/DATA_SOURCE_IB_API/settings-versions`].sort(),
+    )
   })
 })
 
@@ -286,17 +431,45 @@ describe('the write rules agree with the Caddyfile regexes, path by path', () =>
   ].map((p) => (p.includes('?') ? p.slice(0, p.indexOf('?')) : p))
 
   // A method's rules together decide it: PATCH is @store_ui_expiry or @store_ui_collecting.
+  const PANEL_MATCHERS = ['store_ui_panel_create', 'store_ui_panel_settings', 'store_ui_source_settings']
+
   it.each([
     ['PATCH', ['store_ui_expiry', 'store_ui_collecting']],
     ['DELETE', ['store_ui_delete']],
+    ['POST', PANEL_MATCHERS],
   ])('%s is decided by the Caddyfile regexes of %j exactly as isAllowedStoreRequest does', (method, matchers) => {
     const regexes = (matchers as string[]).map(regexOf)
     const disagreements = paths.filter((p) => regexes.some((r) => r.test(p)) !== mod.isAllowedStoreRequest(method as string, p))
     expect(disagreements).toEqual([])
   })
 
-  it.each(['store_ui_expiry', 'store_ui_collecting', 'store_ui_delete'])('@%s accepts at least two paths of the table', (matcher) => {
-    expect(paths.filter((p) => regexOf(matcher).test(p)).length).toBeGreaterThanOrEqual(2)
+  // The create shape is one literal path (its look-alikes are refused), so it accepts exactly one.
+  it.each([
+    ['store_ui_expiry', 2],
+    ['store_ui_collecting', 2],
+    ['store_ui_delete', 2],
+    ['store_ui_panel_create', 1],
+    ['store_ui_panel_settings', 2],
+    ['store_ui_source_settings', 2],
+  ])('@%s accepts at least %i paths of the table', (matcher, least) => {
+    expect(paths.filter((p) => regexOf(matcher).test(p)).length).toBeGreaterThanOrEqual(least as number)
+  })
+
+  it('no path is accepted by two POST rules, so none can stand in for another', () => {
+    const regexes = PANEL_MATCHERS.map(regexOf)
+    expect(paths.filter((p) => regexes.filter((r) => r.test(p)).length > 1)).toEqual([])
+  })
+
+  // The Caddyfile names POST in exactly the three panel matchers, each a POST-only rule; the dev edge's POST
+  // branch is checked against those three above, so a fourth POST rule on either side reds.
+  it('the Caddyfile names POST in exactly the three panel matchers, each with method POST alone', () => {
+    const lines = caddy.split('\n').map((l) => l.trim())
+    const posting = lines
+      .map((line, index) => ({ line, index }))
+      .filter(({ line }) => line.startsWith('method ') && line.split(/\s+/).includes('POST'))
+      .map(({ index }) => lines.slice(0, index).reverse().find((l) => /^@\S+ \{$/.test(l)))
+    expect(posting).toEqual(PANEL_MATCHERS.map((m) => `@${m} {`))
+    for (const matcher of PANEL_MATCHERS) expect(blockOf(matcher)[0]).toBe('method POST')
   })
 
   it('no path is accepted by both PATCH rules, so neither can stand in for the other', () => {
@@ -322,6 +495,7 @@ describe('the write rules agree with the Caddyfile regexes, path by path', () =>
     ['EXPIRY_PATH', 'store_ui_expiry'],
     ['COLLECTING_PATH', 'store_ui_collecting'],
     ['DELETE_PATH', 'store_ui_delete'],
+    ['PANEL_SETTINGS_PATH', 'store_ui_panel_settings'],
   ])('vite.config.ts %s, its UUID filled in, is the Caddyfile @%s path_regexp character for character', (name, matcher) => {
     const vite = readFileSync(`${WEB_ROOT}vite.config.ts`, 'utf-8')
     const uuid = vite.match(/^const UUID = '([^']+)'$/m)?.[1]
@@ -332,6 +506,42 @@ describe('the write rules agree with the Caddyfile regexes, path by path', () =>
       .find((l) => l.startsWith('path_regexp '))
       ?.slice('path_regexp '.length)
     expect((template as string).replaceAll('${UUID}', uuid as string)).toBe(caddySource)
+  })
+
+  // The two panel regexes vite.config.ts writes as regex literals: the literal's body, its escaped
+  // slashes unescaped (the only escape the literal is allowed), is the matcher's path_regexp as spelled.
+  it.each([
+    ['PANEL_CREATE_PATH', 'store_ui_panel_create'],
+    ['PANEL_SOURCE_SETTINGS_PATH', 'store_ui_source_settings'],
+  ])('vite.config.ts %s, a regex literal, is the Caddyfile @%s path_regexp character for character', (name, matcher) => {
+    const vite = readFileSync(`${WEB_ROOT}vite.config.ts`, 'utf-8')
+    const literal = vite.match(new RegExp(`^const ${name} = /(.+)/$`, 'm'))?.[1]
+    expect(literal, `no ${name} regex literal in vite.config.ts`).toBeDefined()
+    expect((literal as string).replaceAll('\\/', ''), 'an escape other than \\/').not.toContain('\\')
+    const caddySource = blockOf(matcher)
+      .find((l) => l.startsWith('path_regexp '))
+      ?.slice('path_regexp '.length)
+    expect((literal as string).replaceAll('\\/', '/')).toBe(caddySource)
+  })
+
+  it('vite.config.ts declares the six write regexes and its POST branch tests the three panel ones alone', () => {
+    const vite = readFileSync(`${WEB_ROOT}vite.config.ts`, 'utf-8')
+    const declared = [...vite.matchAll(/^const ([A-Z_]+_PATH) = /gm)].map((m) => m[1])
+    expect(declared).toEqual([
+      'EXPIRY_PATH',
+      'COLLECTING_PATH',
+      'DELETE_PATH',
+      'PANEL_CREATE_PATH',
+      'PANEL_SETTINGS_PATH',
+      'PANEL_SOURCE_SETTINGS_PATH',
+    ])
+    const post = vite.split('\n').filter((l) => /\bm === 'POST'/.test(l))
+    expect(post).toHaveLength(1)
+    expect([...post[0]!.matchAll(/([A-Z_]+_PATH)\.test\(p\)/g)].map((m) => m[1])).toEqual([
+      'PANEL_CREATE_PATH',
+      'PANEL_SETTINGS_PATH',
+      'PANEL_SOURCE_SETTINGS_PATH',
+    ])
   })
 
   it('the read rule is GET and HEAD on the prefix the dev edge uses', () => {

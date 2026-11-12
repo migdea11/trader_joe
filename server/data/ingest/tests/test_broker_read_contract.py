@@ -72,7 +72,6 @@ from common.enums.data_select import AssetType
 from common.enums.data_stock import Feed, Granularity
 from common.errors.vocabulary import REASONS, Disposition, Outcome, Reason, TraderJoeError
 from common.tests.roots import SERVER_ROOT, repo_relative, resolve_tree
-from data.ingest.app.brokers.alpaca import broker_api
 from data.ingest.app.brokers.alpaca.broker_codes import AlpacaGranularity
 from data.ingest.app.brokers.alpaca.read import AlpacaRead
 from data.ingest.app.brokers.interface import (
@@ -86,14 +85,8 @@ from data.ingest.app.brokers.interface import (
     ServedRange,
 )
 from data.ingest.app.brokers.rate_budget import RequestPriority
-from data.ingest.tests.alpaca_recorded import (
-    RecordedResponse,
-    always,
-    by_page_token,
-    load,
-    record_sdk_sleeps,
-    recorded_client,
-)
+from data.ingest.tests.alpaca_recorded import RecordedResponse, always, by_page_token, load, recorded_client
+from data.ingest.tests.scheduler_doubles import RecordingScheduler, alpaca_reader
 from tests.fakes.market_data import (
     EMPTY_PREFIX,
     FAIL_PREFIX,
@@ -176,26 +169,17 @@ class Unsupported:
 
 
 def bars_query(symbol: str, granularity: Granularity, start: datetime, end: datetime | None) -> BarsQuery:
+    # IEX named: the contract's served-range rules are those of a feed with no recent-data edge (the SIP edge is
+    # Alpaca's own, pinned in test_alpaca_sip_edge.py), and the recorded answers are IEX. SIP is the default since
+    # tj-7zjov1.342, so the tape is named rather than left to it.
     return BarsQuery(
         instrument=Instrument(symbol, AssetType.STOCK),
         granularity=granularity,
         start=start,
         end=end,
         priority=RequestPriority.BACKFILL,
+        feed=Feed.IEX,
     )
-
-
-class CountingBudget:
-    """Alpaca's rate budget, replaced by one that grants every token and counts what it was asked."""
-
-    # Read by the classifier only for a header-less 429.
-    full_refill_seconds = 1.0
-
-    def __init__(self) -> None:
-        self.acquires: list[tuple[RequestPriority, datetime | None]] = []
-
-    async def acquire(self, priority: RequestPriority = RequestPriority.INTERACTIVE, deadline=None) -> None:
-        self.acquires.append((priority, deadline))
 
 
 class Subject:
@@ -362,12 +346,14 @@ class AlpacaRecordedSubject(Subject):
 
     def __init__(self, executor: ThreadPoolExecutor, monkeypatch: pytest.MonkeyPatch) -> None:
         super().__init__(executor, monkeypatch)
-        self.budget = CountingBudget()
-        monkeypatch.setattr(broker_api, '__RATE_BUDGET', self.budget)
+        # The Alpaca handle's scheduler, replaced by one that grants every call and records each ask (P11,
+        # tj-7zjov1.20: it paces every vendor call; broker_api's own budget is gone). Its window declares Alpaca
+        # data's 60 s, read by the classifier only for a header-less 429.
+        self.budget = RecordingScheduler(declared_window_seconds=60.0)
 
     def arrangement(self, responder, query: BarsQuery) -> Arrangement:
         client, transport = recorded_client(responder)
-        reader = AlpacaRead(client=client, executor_provider=lambda: self.executor, clock=clock)
+        reader = alpaca_reader(client, self.executor, clock, scheduler=self.budget)
         return Arrangement(reader, query, lambda: len(transport.sent) + len(self.budget.acquires))
 
     def whole(self, recorded: RecordedResponse, granularity: Granularity) -> BarsQuery:
@@ -419,8 +405,8 @@ class AlpacaRecordedSubject(Subject):
         return self.arrangement(responder, query)
 
     def rate_limited(self) -> Arrangement:
-        # alpaca-py retries a 429 three times, 3 s apart; its clock is replaced so nothing really sleeps.
-        record_sdk_sleeps(self.monkeypatch)
+        # Since tj-7zjov1.56 a 429 is never retried: it surfaces on the first request, so nothing sleeps. The
+        # SDK clock this used to replace is no longer on the path (alpaca_recorded, record_sdk_sleeps retired).
         recorded = load('bars_1Day')
         return self.arrangement(always(load('error_429')), self.whole(recorded, Granularity.ONE_DAY))
 
@@ -451,9 +437,8 @@ def executor() -> Iterator[ThreadPoolExecutor]:
 
 
 @pytest.fixture(autouse=True)
-def iex_deployment(monkeypatch):
-    """Pin the deployment's tape, so the resolved feed is not read from the host: IEX for every subject."""
-    monkeypatch.delenv('ALPACA_SIP_ENABLED', raising=False)
+def no_deployment_feed(monkeypatch):
+    """Nothing to pin: no subject holds a feed or reads one from the host; each query names its own."""
 
 
 @pytest.fixture(params=SUBJECTS)
@@ -686,10 +671,11 @@ async def test_an_end_before_the_start_is_refused_as_the_callers_mistake(subject
 
 
 @pytest.mark.asyncio
-async def test_a_named_feed_the_deployment_cannot_serve_is_refused_before_any_vendor_work(subject):
+async def test_a_named_feed_the_broker_cannot_serve_is_refused_before_any_vendor_work(subject):
+    # RE-POINTED by tj-7zjov1.343: SIP and IEX are both served; NOT_APPLICABLE is the feed with no tape.
     arrangement = subject.watched()
 
-    error = await fail(arrangement, replace(arrangement.query, feed=Feed.SIP))
+    error = await fail(arrangement, replace(arrangement.query, feed=Feed.NOT_APPLICABLE))
 
     assert type(error) is BrokerUnsupportedError
     assert error.reason is Reason.FEED_NOT_AVAILABLE
@@ -698,7 +684,7 @@ async def test_a_named_feed_the_deployment_cannot_serve_is_refused_before_any_ve
 
 
 @pytest.mark.asyncio
-async def test_the_deployments_own_feed_named_is_served_after_vendor_work(subject):
+async def test_a_named_feed_the_broker_serves_is_served_after_vendor_work(subject):
     # The other side of the refusal above, on the same arrangement: so its zero is not vacuous.
     arrangement = subject.watched()
     query = replace(arrangement.query, feed=Feed.IEX)

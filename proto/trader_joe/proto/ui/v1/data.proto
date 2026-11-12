@@ -37,27 +37,27 @@ enum DatasetState {
 
 // The server's computed judgement of how current or complete a dataset is. Computed on read, never
 // stored (tj-grna9p.8). The UI words differ: OVERDUE is shown as Failed, LATE as Late, and so on.
-enum FreshnessStatus {
-  FRESHNESS_STATUS_UNSPECIFIED = 0;
+enum DatasetHealthStatus {
+  DATASET_HEALTH_STATUS_UNSPECIFIED = 0;
   // DAILY or STREAM: the last bar is at or after expected_last_bar.
-  FRESHNESS_STATUS_FRESH = 1;
+  DATASET_HEALTH_STATUS_FRESH = 1;
   // DAILY: awaiting the next session's collection deadline; not yet a failure.
-  FRESHNESS_STATUS_LATE = 2;
+  DATASET_HEALTH_STATUS_LATE = 2;
   // A missed collection deadline: a failure. Named OVERDUE, not STALE, because the UI uses Stale
   // for datasets nobody reads (usage), which is a different thing.
-  FRESHNESS_STATUS_OVERDUE = 3;
+  DATASET_HEALTH_STATUS_OVERDUE = 3;
   // STATIC: every session in [start, end) has at least one bar.
-  FRESHNESS_STATUS_COMPLETE = 4;
+  DATASET_HEALTH_STATUS_COMPLETE = 4;
   // STATIC: some sessions in [start, end) have no bar; see gap_count.
-  FRESHNESS_STATUS_GAPS = 5;
+  DATASET_HEALTH_STATUS_GAPS = 5;
   // A DAILY or STREAM subscription whose collect intent is false: it is not being scheduled, so it
-  // owes no freshness; deletion is its expiry, separately.
-  FRESHNESS_STATUS_RETIRED = 6;
+  // owes no recency; deletion is its expiry, separately.
+  DATASET_HEALTH_STATUS_RETIRED = 6;
 }
 
-// Freshness or completeness of one dataset, computed over its trading calendar at as_of.
-message Freshness {
-  FreshnessStatus status = 1;
+// Health (recency or completeness) of one dataset, computed over its trading calendar at as_of.
+message DatasetHealth {
+  DatasetHealthStatus status = 1;
   // DAILY and STREAM only, and not a session close. DAILY: the local midnight (calendar time zone)
   // of the expected period's first day, i.e. the timestamp its bar carries. For 1day that day is
   // the session that should be stored; for 1week and 1month it is the first calendar day of the
@@ -107,7 +107,7 @@ message DatasetSummary {
   google.protobuf.Timestamp last_bar = 16;
   int64 bar_count = 17;
 
-  Freshness freshness = 18;
+  DatasetHealth health = 18;
 
   // Other granularities held for the same symbol, source, feed and data type. Excludes this one.
   repeated DatasetSibling siblings = 19;
@@ -150,7 +150,7 @@ message UpdateTypeFacet {
 }
 
 message StatusFacet {
-  FreshnessStatus status = 1;
+  DatasetHealthStatus status = 1;
   int64 count = 2;
 }
 
@@ -159,7 +159,7 @@ message StatusFacet {
 message DatasetFacets {
   // The All Datasets view.
   int64 all = 1;
-  // The Needs Attention view: freshness LATE, OVERDUE or GAPS (the UI's Late or Failed, tj-grna9p.60).
+  // The Needs Attention view: health LATE, OVERDUE or GAPS (the UI's Late or Failed, tj-grna9p.60).
   int64 needs_attention = 2;
   repeated SourceFacet sources = 3;
   repeated UpdateTypeFacet update_types = 4;

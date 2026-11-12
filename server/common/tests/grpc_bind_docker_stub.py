@@ -11,7 +11,12 @@ this file with the docker arguments, and describes the stack through the environ
                           exec_fails     true: every exec fails, as on a container that is not running
                           networks       {network name: {"IPAddress": ..., "GlobalIPv6Address": ...}},
                                          data_ingest's NetworkSettings.Networks, which inspect reads
-  STUB_LOG              each call's arguments, appended as one JSON array per line
+                          data_store     the same five keys for data_store, whose gRPC bind the step
+                                         checks second (tj-7zjov1.49). Absent, every call into or about
+                                         data_store is UNMODELLED, so no scenario passes on a canned
+                                         store. Its ps_id must differ from data_ingest's, so inspect
+                                         answers each container with its own networks.
+  STUB_LOG             each call's arguments, appended as one JSON array per line
   STUB_GETADDRINFO_LOG  each getaddrinfo call the step's own code makes, normalised by
                         GETADDRINFO_FIELDS (the test compares it with refuse_wildcard's call)
 
@@ -41,6 +46,8 @@ from typing import Any
 
 UNMODELLED = 97
 DATA_INGEST = 'data_ingest'
+DATA_STORE = 'data_store'
+SERVICES = (DATA_INGEST, DATA_STORE)
 STACK_FILES = ['docker-compose.yaml']
 VENV_PYTHON = '/code/.venv/bin/python'
 GETADDRINFO_FIELDS = ('host', 'port', 'family', 'type', 'proto', 'flags')
@@ -172,17 +179,27 @@ def _options(words: list[str], flags: set[str], valued: set[str]) -> tuple[dict[
     return found, words[position:]
 
 
+def service_scenario(scenario: Mapping[str, Any], service: str) -> Mapping[str, Any]:
+    """SERVICE's own facts: the top-level keys for data_ingest, the data_store sub-scenario for data_store."""
+    if service == DATA_INGEST:
+        return scenario
+    if service == DATA_STORE and isinstance(scenario.get(DATA_STORE), Mapping):
+        return scenario[DATA_STORE]
+    raise Unmodelled(f'{service}, which the scenario does not describe')
+
+
 def _exec(words: list[str], scenario: Mapping[str, Any]) -> int:
     options, rest = _options(words, {'-T'}, set())
     if '-T' not in options:
         raise Unmodelled('exec without -T, which allocates a TTY a CI step does not have')
-    if rest[:1] != [DATA_INGEST]:
-        raise Unmodelled(f'exec into {rest[:1]}; the step reads and resolves inside {DATA_INGEST}')
-    command = rest[1:]
+    if rest[:1] not in ([service] for service in SERVICES):
+        raise Unmodelled(f'exec into {rest[:1]}; the step reads and resolves inside {list(SERVICES)}')
+    service, command = rest[0], rest[1:]
+    scenario = service_scenario(scenario, service)
     if command[:2] != [VENV_PYTHON, '-c'] or len(command) < 3:
         raise Unmodelled(f'exec of {command[:2]}; only the image interpreter running -c is modelled')
     if scenario.get('exec_fails'):
-        print(f'service "{DATA_INGEST}" is not running', file=sys.stderr)
+        print(f'service "{service}" is not running', file=sys.stderr)
         return 1
     code, arguments = command[2], command[3:]
     log_path = os.environ.get('STUB_GETADDRINFO_LOG')
@@ -201,13 +218,23 @@ def _compose(words: list[str], scenario: Mapping[str, Any]) -> int:
     files = options.get('-f', []) + options.get('--file', [])
     if files != STACK_FILES:
         raise Unmodelled(f'compose files {files}; the step reads the stack on its own spelling, {STACK_FILES}')
-    if rest == ['ps', '-q', DATA_INGEST]:
-        if scenario.get('ps_id'):
-            print(scenario['ps_id'])
+    if len(rest) == 3 and rest[:2] == ['ps', '-q'] and rest[2] in SERVICES:
+        facts = service_scenario(scenario, rest[2])
+        if facts.get('ps_id'):
+            print(facts['ps_id'])
         return 0
     if rest[:1] == ['exec']:
         return _exec(rest[1:], scenario)
     raise Unmodelled(f'compose {rest[:1]}')
+
+
+def _containers(scenario: Mapping[str, Any]) -> dict[str, Mapping[str, Any]]:
+    """{container id: that service's facts}, for every service the scenario describes with a container."""
+    described = [scenario] + ([scenario[DATA_STORE]] if isinstance(scenario.get(DATA_STORE), Mapping) else [])
+    ids = [facts.get('ps_id') for facts in described if facts.get('ps_id')]
+    if len(ids) != len(set(ids)):
+        raise Unmodelled(f'two services sharing the container id in {ids}')
+    return {facts['ps_id']: facts for facts in described if facts.get('ps_id')}
 
 
 def _inspect(words: list[str], scenario: Mapping[str, Any]) -> int:
@@ -215,11 +242,13 @@ def _inspect(words: list[str], scenario: Mapping[str, Any]) -> int:
     formats = options.get('--format', []) + options.get('-f', [])
     if len(formats) != 1 or not objects:
         raise Unmodelled(f'inspect with formats {formats} of {objects}')
-    data = {'Id': scenario.get('ps_id'), 'NetworkSettings': {'Networks': scenario.get('networks') or {}}}
+    containers = _containers(scenario)
     for name in objects:
-        if not scenario.get('ps_id') or name != scenario['ps_id']:
+        if name not in containers:
             print(f'Error: No such object: {name}', file=sys.stderr)
             return 1
+        facts = containers[name]
+        data = {'Id': name, 'NetworkSettings': {'Networks': facts.get('networks') or {}}}
         print(render_template(formats[0], data))
     return 0
 

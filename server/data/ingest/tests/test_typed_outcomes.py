@@ -55,8 +55,8 @@ from common.enums.data_select import AssetType, DataType
 from common.enums.data_stock import DataSource, Feed, Granularity
 from common.errors.vocabulary import REASONS, ExogenousError, InvalidRequestError, Outcome, Reason, TraderJoeError
 from data.ingest.app import main
-from data.ingest.app.brokers import rate_budget as rate_budget_module
 from data.ingest.app.brokers.alpaca import broker_api
+from data.ingest.app.brokers.alpaca.handle import ALPACA_DATA_SCOPE
 from data.ingest.app.brokers.alpaca.read import AlpacaRead
 from data.ingest.app.brokers.broker_errors import MissingCredentialsError
 from data.ingest.app.brokers.interface import (
@@ -68,7 +68,17 @@ from data.ingest.app.brokers.interface import (
     Instrument,
     ServedRange,
 )
-from data.ingest.app.brokers.rate_budget import RateBudget, RequestPriority
+from data.ingest.app.brokers.rate_budget import RequestPriority
+from data.ingest.app.scheduler import scheduler as scheduler_module
+from data.ingest.tests.alpaca_recorded import Answer, StubVendor, bars_answer, status_answer, stub_vendor, wire_bar
+from data.ingest.tests.scheduler_doubles import (
+    ONE_PER_MINUTE_OVER_AN_HOUR,
+    ONE_PER_SECOND,
+    Acquire,
+    RecordingScheduler,
+    alpaca_reader,
+    real_scheduler,
+)
 from routers.common.errors import PROBLEM_RESPONSES
 
 
@@ -90,75 +100,55 @@ UNSUPPORTED_REASONS = {Reason.UNSUPPORTED_INSTRUMENT, Reason.UNSUPPORTED_ASSET_T
 # ---------------------------------------------------------------------------------------------
 
 
-def vendor_bar(timestamp: datetime) -> SimpleNamespace:
-    """One alpaca-py bar, with every attribute AlpacaRead reads."""
-    return SimpleNamespace(
-        open=1.0, high=2.0, low=0.5, close=10.0, volume=10, trade_count=3, vwap=1.5, timestamp=timestamp
-    )
+# RE-PINNED ON tj-7zjov1.56. The doubles were a Mock whose get_stock_bars answered a StubBarSet or raised. The
+# reader now owns the bars page loop and calls the client's HTTP session itself (broker_api.request_page), so
+# they are the REAL alpaca-py client over a scripted transport (alpaca_recorded.stub_vendor): a status is an
+# HTTP answer the reader turns into its own APIError, and a transport failure is raised inside the session,
+# where requests raises it. "The vendor was not called" is now "no HTTP request reached the transport".
 
 
-class StubBarSet:
-    """The slice of alpaca-py's BarSet that AlpacaRead's conversion touches."""
-
-    def __init__(self, bars_by_symbol: dict[str, list[SimpleNamespace]]):
-        self.data = bars_by_symbol
-
-    def __getitem__(self, symbol: str) -> list[SimpleNamespace]:
-        return self.data[symbol]
+def stub_client(*timestamps: datetime, symbol: str = 'VFV') -> StubVendor:
+    return stub_vendor(bars_answer({symbol: [wire_bar(t) for t in timestamps]}))
 
 
-def stub_client(*timestamps: datetime, symbol: str = 'VFV') -> Mock:
-    client = Mock()
-    client.get_stock_bars.return_value = StubBarSet({symbol: [vendor_bar(t) for t in timestamps]})
-    return client
+def failing_client(answer: Answer) -> StubVendor:
+    return stub_vendor(answer)
 
 
-def failing_client(error: BaseException) -> Mock:
-    client = Mock()
-    client.get_stock_bars.side_effect = error
-    return client
-
-
-class CountingBudget:
-    """A rate budget that grants every token and records what each acquire was asked."""
-
-    full_refill_seconds = 1.0
-
-    def __init__(self) -> None:
-        self.acquires: list[tuple[RequestPriority, datetime | None]] = []
-
-    async def acquire(self, priority: RequestPriority = RequestPriority.INTERACTIVE, deadline=None) -> None:
-        self.acquires.append((priority, deadline))
-
-
-def api_error(status: int, message: str) -> APIError:
-    """An APIError as alpaca-py builds one: a real response, raise_for_status, APIError(text, http_error)."""
-    response = requests.Response()
-    response.status_code = status
-    response._content = f'{{"message": "{message}"}}'.encode()
-    response.encoding = 'utf-8'
-    try:
-        response.raise_for_status()
-    except requests.HTTPError as http_error:
-        return APIError(response.text, http_error)
-    raise AssertionError(f'{status} is not an error status')
+def assert_caused_by(error: TraderJoeError, answer: Answer) -> None:
+    """The caught exception is the cause: the very instance the session raised, or the APIError of the status."""
+    if isinstance(answer, BaseException):
+        assert error.__cause__ is answer
+    else:
+        assert isinstance(error.__cause__, APIError)
+        assert error.__cause__.status_code == answer.status
+        assert error.__cause__.response.status_code == answer.status
 
 
 @pytest.fixture(autouse=True)
-def iex_deployment_and_no_cached_client(monkeypatch):
-    """An IEX deployment unless a test says otherwise, and no client cached across tests."""
-    monkeypatch.delenv('ALPACA_SIP_ENABLED', raising=False)
+def no_cached_client(monkeypatch):
+    """No client cached and no reset remembered across tests."""
     broker_api.set_client(None)
+    broker_api.forget_resets()
     yield
     broker_api.set_client(None)
+    broker_api.forget_resets()
 
 
-@pytest.fixture
-def budget(monkeypatch) -> CountingBudget:
-    """Stand in for Alpaca's rate budget, so a token taken (or not) is observable."""
-    counting = CountingBudget()
-    monkeypatch.setattr(broker_api, '__RATE_BUDGET', counting)
-    return counting
+# The scheduler the reader() below paces through unless a test hands it another. Set per test by `budget`.
+PACING: dict[str, RecordingScheduler] = {}
+
+
+@pytest.fixture(autouse=True)
+def budget(monkeypatch) -> RecordingScheduler:
+    """Stand in for the Alpaca handle's scheduler, so a token taken (or not), and its scope, are observable.
+
+    Until P11 (tj-7zjov1.20) this replaced broker_api's own RateBudget; that budget is gone and every vendor
+    call is paced by the scheduler AlpacaRead is built with, so the stand-in is handed to the reader instead.
+    """
+    recording = RecordingScheduler()
+    monkeypatch.setitem(PACING, 'scheduler', recording)
+    return recording
 
 
 @pytest.fixture
@@ -167,8 +157,10 @@ def executor() -> Iterator[ThreadPoolExecutor]:
         yield pool
 
 
-def reader(client: Mock | None, executor: ThreadPoolExecutor, clock=lambda: NOW) -> AlpacaRead:
-    return AlpacaRead(client=client, executor_provider=lambda: executor, clock=clock)
+def reader(vendor: StubVendor | None, executor: ThreadPoolExecutor, clock=lambda: NOW, scheduler=None) -> AlpacaRead:
+    """A real AlpacaRead. It holds no feed: each query's feed is resolved per request (SIP when none is named)."""
+    client = vendor.client if vendor is not None else None
+    return alpaca_reader(client, executor, clock, scheduler=scheduler if scheduler is not None else PACING['scheduler'])
 
 
 def query(**overrides) -> BarsQuery:
@@ -188,24 +180,16 @@ def failure_of(outcome: BarsResponse | BarsFailure) -> TraderJoeError:
 
 
 # ---------------------------------------------------------------------------------------------
-# The named feed (TE-4 item 2): honoured when this deployment serves it, else refused before the vendor
+# The named feed (TE-4 item 2): served per request (SIP when none is named, IEX when named), refused before the vendor
+# only when Alpaca has no tape for it (owner ruling 2026-11-06, ADR tj-xn3qa6 addendum 3)
 # ---------------------------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ('sip_enabled', 'named'),
-    [
-        pytest.param('false', Feed.SIP, id='sip-on-an-iex-deployment'),
-        pytest.param('true', Feed.IEX, id='iex-on-a-sip-deployment'),
-        pytest.param('false', Feed.NOT_APPLICABLE, id='not-applicable'),
-    ],
-)
-async def test_a_named_feed_the_deployment_cannot_serve_is_refused_before_any_call_or_token(
-    monkeypatch, executor, budget, sip_enabled, named
-):
-    monkeypatch.setenv('ALPACA_SIP_ENABLED', sip_enabled)
+async def test_a_named_feed_alpaca_cannot_serve_is_refused_before_any_call_or_token(executor, budget):
+    """RE-POINTED by tj-7zjov1.343: SIP and IEX are both served now, so NOT_APPLICABLE is the one refusal left."""
     client = stub_client(START)
+    named = Feed.NOT_APPLICABLE
 
     error = failure_of(await reader(client, executor).get_bars(query(feed=named)))
 
@@ -213,36 +197,40 @@ async def test_a_named_feed_the_deployment_cannot_serve_is_refused_before_any_ca
     assert isinstance(error, InvalidRequestError)
     assert error.reason is Reason.FEED_NOT_AVAILABLE
     assert REASONS[error.reason].outcome is Outcome.REFUSED
-    assert named.value in error.detail
+    assert error.detail == 'This broker cannot serve the requested feed: feed=NOT_APPLICABLE'
     assert dict(error.metadata) == {'feed': named.value}
     assert error.__cause__ is None
-    assert client.mock_calls == [], 'the vendor was called before the feed refusal'
+    assert client.sent == [], 'the vendor was called before the feed refusal'
     assert budget.acquires == [], 'a rate token was spent before the feed refusal'
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ('sip_enabled', 'named'), [pytest.param('false', Feed.IEX, id='iex'), pytest.param('true', Feed.SIP, id='sip')]
+    ('named', 'expected'),
+    [
+        pytest.param(None, Feed.SIP, id='unnamed-sip'),
+        pytest.param(Feed.SIP, Feed.SIP, id='sip'),
+        pytest.param(Feed.IEX, Feed.IEX, id='iex'),
+    ],
 )
-async def test_a_named_feed_the_deployment_serves_is_honoured_up_to_the_vendors_feed_parameter(
-    monkeypatch, executor, budget, sip_enabled, named
-):
-    monkeypatch.setenv('ALPACA_SIP_ENABLED', sip_enabled)
+async def test_the_requests_feed_is_honoured_up_to_the_vendors_feed_parameter(executor, budget, named, expected):
+    """RE-POINTED by tj-7zjov1.343: one reader, any feed; each query is served on the feed it resolves to."""
     client = stub_client(START)
 
     response = await reader(client, executor).get_bars(query(feed=named))
 
     assert isinstance(response, BarsResponse)
-    assert response.feed is named
-    assert client.get_stock_bars.call_args.args[0].feed == DataFeed(named.value.lower())
+    assert response.feed is expected
+    [sent] = client.sent
+    assert sent.params['feed'] == DataFeed(expected.value.lower()).value
     assert len(budget.acquires) == 1
 
 
 @pytest.mark.asyncio
 async def test_a_feed_refusal_comes_before_the_credential_is_resolved(executor, budget):
     # No client injected and no credentials: the feed refusal still wins over VENDOR_AUTH.
-    with patch.dict(os.environ, {'ALPACA_SIP_ENABLED': 'false'}, clear=True):
-        error = failure_of(await reader(None, executor).get_bars(query(feed=Feed.SIP)))
+    with patch.dict(os.environ, {}, clear=True):
+        error = failure_of(await reader(None, executor).get_bars(query(feed=Feed.NOT_APPLICABLE)))
 
     assert error.reason is Reason.FEED_NOT_AVAILABLE
 
@@ -275,7 +263,7 @@ async def test_a_range_starting_at_or_after_the_readers_clock_is_refused_before_
     assert error.reset_at is None
     assert error.__cause__ is None
     assert dict(error.metadata) == {'range_start': start.isoformat()}
-    assert client.mock_calls == [], 'the vendor was called for a range in the future'
+    assert client.sent == [], 'the vendor was called for a range in the future'
     assert budget.acquires == [], 'a rate token was spent on a range in the future'
 
 
@@ -283,10 +271,10 @@ async def test_a_range_starting_at_or_after_the_readers_clock_is_refused_before_
 async def test_a_range_starting_just_before_the_clock_is_fetched_not_refused(executor, budget):
     client = stub_client()
 
-    response = await reader(client, executor).get_bars(query(start=NOW - MICROSECOND, end=None))
+    response = await reader(client, executor).get_bars(query(start=NOW - MICROSECOND, end=None, feed=Feed.IEX))
 
     assert isinstance(response, BarsResponse)
-    client.get_stock_bars.assert_called_once()
+    assert len(client.sent) == 1
 
 
 @pytest.mark.asyncio
@@ -331,7 +319,9 @@ async def test_a_missing_credential_is_returned_as_vendor_auth_before_any_token(
 
 @pytest.mark.asyncio
 async def test_a_past_range_is_served_as_asked_with_as_of_from_the_readers_clock(executor, budget):
-    response = await reader(stub_client(START), executor).get_bars(query())
+    # IEX named: these as_of and open-end pins are for a feed with no recent-data edge (SIP's is in
+    # test_alpaca_sip_edge.py); SIP is the default since tj-7zjov1.342.
+    response = await reader(stub_client(START), executor).get_bars(query(feed=Feed.IEX))
 
     assert response.served_range == ServedRange(START, END)
     assert type(response.served_range) is ServedRange
@@ -341,7 +331,7 @@ async def test_a_past_range_is_served_as_asked_with_as_of_from_the_readers_clock
 
 @pytest.mark.asyncio
 async def test_an_open_end_is_served_up_to_as_of(executor, budget):
-    response = await reader(stub_client(START), executor).get_bars(query(end=None))
+    response = await reader(stub_client(START), executor).get_bars(query(end=None, feed=Feed.IEX))
 
     assert response.served_range == ServedRange(START, NOW)
     assert response.as_of == NOW
@@ -353,16 +343,16 @@ async def test_a_range_that_starts_in_the_past_and_ends_in_the_future_is_served_
     future_end = NOW + timedelta(days=3)
     client = stub_client(START)
 
-    response = await reader(client, executor).get_bars(query(end=future_end))
+    response = await reader(client, executor).get_bars(query(end=future_end, feed=Feed.IEX))
 
     assert isinstance(response, BarsResponse)
     assert response.served_range == ServedRange(START, NOW)
-    client.get_stock_bars.assert_called_once()
+    assert len(client.sent) == 1
 
 
 @pytest.mark.asyncio
 async def test_an_end_exactly_at_the_clock_is_kept(executor, budget):
-    response = await reader(stub_client(START), executor).get_bars(query(end=NOW))
+    response = await reader(stub_client(START), executor).get_bars(query(end=NOW, feed=Feed.IEX))
 
     assert response.served_range == ServedRange(START, NOW)
 
@@ -370,7 +360,7 @@ async def test_an_end_exactly_at_the_clock_is_kept(executor, budget):
 @pytest.mark.asyncio
 async def test_as_of_is_utc_whatever_offset_the_clock_answers_in(executor, budget):
     response = await reader(stub_client(START), executor, clock=lambda: NOW.astimezone(PLUS_FIVE)).get_bars(
-        query(end=None)
+        query(end=None, feed=Feed.IEX)
     )
 
     assert response.as_of == NOW
@@ -383,7 +373,9 @@ async def test_as_of_is_read_after_the_vendor_answered(executor, budget):
     # Two reads of the clock: the pre-check before the call, as_of after it.
     readings = iter([NOW - timedelta(seconds=5), NOW])
 
-    response = await reader(stub_client(START), executor, clock=lambda: next(readings)).get_bars(query(end=None))
+    response = await reader(stub_client(START), executor, clock=lambda: next(readings)).get_bars(
+        query(end=None, feed=Feed.IEX)
+    )
 
     assert response.as_of == NOW
     assert response.served_range.end == NOW
@@ -398,10 +390,10 @@ async def test_as_of_is_read_after_the_vendor_answered(executor, budget):
 @pytest.mark.parametrize(
     ('raised', 'reason'),
     [
-        pytest.param(api_error(400, 'end should not be before start'), Reason.VENDOR_INVALID_REQUEST, id='400'),
-        pytest.param(api_error(403, 'forbidden'), Reason.VENDOR_AUTH, id='403'),
-        pytest.param(api_error(404, 'not found'), Reason.VENDOR_REJECTED, id='404'),
-        pytest.param(api_error(500, 'internal'), Reason.VENDOR_UNAVAILABLE, id='500'),
+        pytest.param(status_answer(400, 'end should not be before start'), Reason.VENDOR_INVALID_REQUEST, id='400'),
+        pytest.param(status_answer(403, 'forbidden'), Reason.VENDOR_AUTH, id='403'),
+        pytest.param(status_answer(404, 'not found'), Reason.VENDOR_REJECTED, id='404'),
+        pytest.param(status_answer(500, 'internal'), Reason.VENDOR_UNAVAILABLE, id='500'),
         pytest.param(requests.exceptions.ConnectionError('refused'), Reason.VENDOR_UNAVAILABLE, id='connection'),
         pytest.param(requests.exceptions.ReadTimeout('slow'), Reason.VENDOR_UNAVAILABLE, id='read-timeout'),
         # tj-3mk3u5.37.14: the connection cut while the body is read.
@@ -410,30 +402,44 @@ async def test_as_of_is_read_after_the_vendor_answered(executor, budget):
 )
 async def test_a_vendor_failure_is_returned_with_the_caught_exception_as_its_cause(executor, budget, raised, reason):
     """D8 via the 16:22 UTC addendum item 5: the returned form of 'raise ... from e'."""
-    response = await reader(failing_client(raised), executor).get_bars(query())
+    failing = failing_client(raised)
+    response = await reader(failing, executor).get_bars(query())
 
     error = failure_of(response)
     assert error.reason is reason
-    assert error.__cause__ is raised
-    # The call reached the vendor, so it spent its token.
+    assert_caused_by(error, raised)
+    # The call reached the vendor, once, so it spent one token: none of these is a retried status.
     assert len(budget.acquires) == 1
+    assert len(failing.sent) == 1
 
 
 @pytest.mark.asyncio
-async def test_a_vendor_429_is_returned_rate_limited_with_reset_at_on_the_readers_clock(executor, monkeypatch):
-    monkeypatch.setattr(broker_api, '__RATE_BUDGET', RateBudget('ALPACA', rate_per_sec=2.0, burst=4.0))
-    raised = api_error(429, 'rate limit exceeded')
+async def test_a_vendor_429_is_returned_rate_limited_with_reset_at_on_the_readers_clock(executor):
+    """No header on this response, so the fallback is the reader's OWN scope's declared window.
 
-    error = failure_of(await reader(failing_client(raised), executor).get_bars(query()))
+    Since P11 the window is Scheduler.window(scope), not broker_api's budget; since 18ff3f5 the fallback is its
+    declared window (the longest limit interval), not the bucket's refill. The reader's scope declares a minute
+    and refills in a second; a decoy scope declares an hour. A reader that asked the wrong scope, or read the
+    refill, is caught.
+    """
+    scheduler = real_scheduler({ALPACA_DATA_SCOPE: ONE_PER_SECOND, 'DECOY': ONE_PER_MINUTE_OVER_AN_HOUR})
+    assert scheduler.window(ALPACA_DATA_SCOPE).declared_window_seconds == 60.0
+    assert scheduler.window(ALPACA_DATA_SCOPE).full_refill_seconds == 1.0
+    assert scheduler.window('DECOY').declared_window_seconds == 3600.0
+    raised = status_answer(429, 'rate limit exceeded')
+
+    error = failure_of(await reader(failing_client(raised), executor, scheduler=scheduler).get_bars(query()))
 
     assert error.reason is Reason.VENDOR_RATE_LIMITED
-    # No header on this response, so the budget's refill from empty: 4 / 2 = 2 s after the reader's now.
-    assert error.reset_at == NOW + timedelta(seconds=2)
-    assert error.__cause__ is raised
+    # The scope's declared window: a minute after the reader's now.
+    assert error.reset_at == NOW + timedelta(seconds=60)
+    assert_caused_by(error, raised)
 
 
 @pytest.mark.asyncio
 async def test_an_api_error_with_no_status_is_re_raised_as_a_bug(executor, budget):
+    # Raised from inside the session: request_page never builds one without its HTTPError, so this is the
+    # only way left to put a status-less APIError in front of the classifier.
     raised = APIError('{"message": "no status"}')
 
     with pytest.raises(APIError) as caught:
@@ -483,20 +489,25 @@ async def test_the_rate_budgets_refusal_is_returned_with_no_cause_and_no_vendor_
         # moves, so the refusal is asserted by failing the sleep rather than by hanging the run.
         raise AssertionError(f'the rate budget slept {seconds}s instead of refusing at once')
 
-    monkeypatch.setattr(rate_budget_module, 'asyncio', SimpleNamespace(sleep=never_sleep))
-    rate_budget = RateBudget('ALPACA', rate_per_sec=1.0, burst=1.0, clock=Monotonic(), wall_clock=lambda: NOW)
-    assert rate_budget.try_acquire(RequestPriority.LIVE), 'the only token, spent before the query'
-    monkeypatch.setattr(broker_api, '__RATE_BUDGET', rate_budget)
+    # Since P11 the wait is the handle scheduler's (Scheduler.acquire sleeps through its own module).
+    monkeypatch.setattr(scheduler_module, 'asyncio', SimpleNamespace(sleep=never_sleep))
+    scheduler = real_scheduler({ALPACA_DATA_SCOPE: ONE_PER_SECOND}, clock=lambda: NOW, budget_clock=Monotonic())
+    await scheduler.acquire(ALPACA_DATA_SCOPE, RequestPriority.LIVE)  # the only token, spent before the query
     client = stub_client(START)
 
-    error = failure_of(await reader(client, executor).get_bars(query(deadline=NOW + timedelta(milliseconds=500))))
+    error = failure_of(
+        await reader(client, executor, scheduler=scheduler).get_bars(query(deadline=NOW + timedelta(milliseconds=500)))
+    )
 
     assert type(error) is ExogenousError
     assert error.reason is Reason.RATE_BUDGET
     assert REASONS[error.reason].outcome is Outcome.NOT_READY
     assert error.reset_at == NOW + timedelta(seconds=1)
     assert error.__cause__ is None
-    assert client.mock_calls == []
+    # The metadata key vendor carries the scope, which starts with the vendor's DataSource value (ADR tj-fa1rpu D8).
+    assert error.metadata['vendor'] == ALPACA_DATA_SCOPE
+    assert error.metadata['vendor'].startswith(DataSource.ALPACA_API.value)
+    assert client.sent == []
 
 
 @pytest.mark.asyncio
@@ -506,7 +517,7 @@ async def test_the_rate_budgets_refusal_is_returned_with_no_cause_and_no_vendor_
 async def test_the_querys_priority_and_deadline_reach_the_rate_budget(executor, budget, deadline):
     await reader(stub_client(START), executor).get_bars(query(priority=RequestPriority.BACKFILL, deadline=deadline))
 
-    assert budget.acquires == [(RequestPriority.BACKFILL, deadline)]
+    assert budget.acquires == [Acquire(ALPACA_DATA_SCOPE, RequestPriority.BACKFILL, deadline)]
 
 
 # ---------------------------------------------------------------------------------------------
@@ -601,10 +612,12 @@ def test_broker_read_get_bars_returns_the_typed_result():
 # stubs; there is no such caller left to satisfy.
 #
 # The UNSUPPORTED_ASSET_TYPE half survives on the gRPC path, where the refusal is the handler's
-# rather than a dispatch stub's: test_fetch_dataset_handler.py's crypto and option cases of
-# test_an_unservable_request_is_refused_before_the_ack_and_before_the_vendor_is_called, with
-# test_a_non_stock_asset_type_is_refused_even_by_a_reader_that_would_have_served_it proving the
-# refusal comes from the handler and not from whichever reader happens to be installed.
+# rather than a dispatch stub's. It was pinned through the FetchDataset handler in
+# test_fetch_dataset_handler.py until tj-7zjov1.275 deleted that handler (owner ruling 2026-11-02);
+# on the Submit path it is test_ack_gated_retry.py's
+# test_the_submit_handler_refuses_an_unservable_bars_request_before_queueing_it and
+# test_submit_refusals.py, and at the reader, test_read_seam.py's crypto and option cases of
+# test_alpaca_refuses_what_it_cannot_serve_before_any_vendor_call.
 
 
 # Every triple match_client_request maps, and what it maps each to: the six stock endpoints alpaca-py has.
@@ -669,7 +682,9 @@ def test_each_stock_triple_still_maps_to_its_sdk_method_and_request(
 
 
 def test_create_app_installs_the_problem_handlers_and_declares_their_responses():
-    app = main.create_app({DataSource.ALPACA_API: Mock()})
+    # No handles: the problem handlers are create_app's own, with or without Submit. It passed a readers mapping
+    # until tj-7zjov1.275 removed that parameter; handing the Mock on would now make it a handle.
+    app = main.create_app()
 
     async def refuse() -> None:
         raise InvalidRequestError(Reason.RANGE_IN_FUTURE, 'starts after now')

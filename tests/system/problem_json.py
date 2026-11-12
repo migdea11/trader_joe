@@ -2,7 +2,7 @@
 
 WHY THIS IS A MODULE AND NOT A CONFTEST FIXTURE. These are constants and a plain assertion
 helper, not per-test state, and the system tests already import shared code by its full dotted
-path (tests.fakes.market_data, data.store.tests.fetch_double). Putting them in conftest.py would
+path (tests.fakes.market_data, data.store.tests.post_path). Putting them in conftest.py would
 mean importing conftest by dotted path, which pytest loads a second time under its own name and
 is a known way to end up with two copies of a module's state.
 

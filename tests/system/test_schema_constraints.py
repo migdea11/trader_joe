@@ -70,7 +70,8 @@ BAR_TABLE = StockMarketActivity.__table__
 SQLSTATE_UNIQUE_VIOLATION = '23505'
 SQLSTATE_NOT_NULL_VIOLATION = '23502'
 
-# Columns revision eec8f88a7443 dropped from the bar. Named here because the point of the check
+# Columns the bar once had and the per-dataset identity removed (tj-1njw7c); the alpha baseline never creates them.
+# Named here because the point of the check
 # is that they are ABSENT, so there is no model attribute left to read them from.
 DROPPED_BAR_COLUMNS = ('expiry', 'split_factor', 'dividends_factor')
 
@@ -373,7 +374,7 @@ ENTRY_KEY_VARIANTS: dict[str, Callable[[dict[str, Any]], Any]] = {
     'owner': lambda base: f'{base["owner"]}-variant',
     'expiry_type': lambda base: _other_int_member(ExpiryType, base['expiry_type']),
     'update_type': lambda base: _other_int_member(UpdateType, base['update_type']),
-    # feed joined the entry's identity in c4a1f7b2e905 (tj-3mk3u5.31, closing tj-f2qz44), and this
+    # feed joined the entry's identity in tj-3mk3u5.31 (closing tj-f2qz44), and this
     # case is the live-database half of that bug's criterion: an IEX request and a SIP request over
     # the same window are two entries. The unit tier asserts the STATEMENT names eleven columns
     # (data/store/tests/test_dataset_entry_identity.py); only here does Postgres actually accept

@@ -17,7 +17,8 @@ Catch-up and replay remain the caller's job.
 Kinds:
     Once: one fire at an instant (or at once, if that instant is past and it has not run).
     AfterTradingEvent: a session's open or close plus an offset, from a calendar passed in as an argument.
-    Every: a fixed interval, with optional jitter; an overrun fires once, never a burst.
+    Every: a fixed interval, with optional jitter; an overrun fires once, never a burst. Read the long-interval
+        warning on `Every` before using it for anything longer than a few minutes.
 
 Every instant is an aware datetime and all arithmetic is on UTC. A naive datetime names no instant and is refused.
 
@@ -26,6 +27,7 @@ pandas, which only the data-store image carries. The store's own calendar adapte
 """
 
 import asyncio
+import calendar
 import random
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
@@ -51,6 +53,28 @@ def _require_aware(value: datetime, what: str) -> datetime:
 
 def _utc_now() -> datetime:
     return datetime.now(UTC)
+
+
+def add_calendar_months(instant: datetime, months: int) -> datetime:
+    """`instant` moved by whole calendar months, in UTC: the shared helper for row-derived long intervals.
+
+    The day is clamped to the end of the target month (31 Jan + 1 month is 28 or 29 Feb) and the time of day is kept
+    in UTC. A negative `months` moves back.
+
+    Args:
+        instant (datetime): An aware instant; a naive datetime is refused.
+        months (int): Whole months to add.
+
+    Returns:
+        datetime: An aware UTC instant.
+
+    Raises:
+        ValueError: If `instant` is naive.
+    """
+    base = _require_aware(instant, 'instant')
+    year, month0 = divmod(base.year * 12 + (base.month - 1) + months, 12)
+    day = min(base.day, calendar.monthrange(year, month0 + 1)[1])
+    return base.replace(year=year, month=month0 + 1, day=day)
 
 
 class Schedule(Protocol):
@@ -162,6 +186,15 @@ class Every:
 
     With no run yet it fires at `first`, or at once. A run that overran its interval fires once, at once.
     Jitter is added to every fire, the first and an overrun's included.
+
+    Do not use a long interval as a timer. The runner keeps no state, so after any restart `Every(timedelta(days=30))`
+    fires at once and then every 30 days from that restart: it fires on every restart, not once per interval. For
+    work that is due monthly, weekly or on any other long cadence, derive the due time from database state (for
+    monthly ones use `add_calendar_months` on the stored timestamp) and tick often with a short `Every` that checks
+    whether the work is due. `Every(interval, first=now + interval)` has the opposite problem: each restart pushes
+    the first fire out again, so the job never runs if restarts come more often than the interval; the fix is the
+    same (derive the due time from database state and tick often). Do not hand-roll a while/sleep polling loop: all
+    periodic work goes through `run_periodic`.
     """
 
     interval: timedelta
@@ -213,6 +246,14 @@ def run_periodic(
     ends that wait early. The loop never ends because a fire time could not be computed. During the retry wait after
     a failing schedule, a wake ends the wait and asks the schedule again; it does not force a run. Outside that wait,
     a wake runs the job.
+
+    Warning: the runner keeps no state, so a long interval written as a timer (for example
+    `Every(timedelta(days=30))`) fires on every restart, not once per interval. Derive a long interval's due time
+    from database state (`add_calendar_months` for monthly cadences) and tick often with a short schedule that checks
+    it. `Every(interval, first=now + interval)` has the opposite problem: each restart pushes the first fire out
+    again, so the job never runs if restarts come more often than the interval; the fix is the same (derive the due
+    time from database state and tick often). Do not hand-roll a while/sleep polling loop: always go through
+    `run_periodic`.
 
     Args:
         name (str): Names the job in the log and the task.

@@ -624,7 +624,7 @@ async def test_setting_or_clearing_an_expiry_never_retires_or_resumes_a_subscrip
     summary = dated.json()
     assert (summary['id'], summary['expiry'], summary['state']) == (str(row.id), FUTURE, state)
     assert summary.get('collecting', False) is collect, summary
-    assert (summary['freshness']['status'] == 'FRESHNESS_STATUS_RETIRED') is not collect, summary['freshness']
+    assert (summary['health']['status'] == 'DATASET_HEALTH_STATUS_RETIRED') is not collect, summary['health']
     assert (await world.entry(row.id)).collect is collect, 'setting an expiry changed collect'
 
     cleared = await patch(client, row.id, override)

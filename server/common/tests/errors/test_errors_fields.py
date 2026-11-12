@@ -24,8 +24,9 @@ ANY_REASON = Reason.VENDOR_UNAVAILABLE
 # Allowlisted, but set from the reset_at argument: retry_after is derived and never stored.
 DERIVED_KEYS = ('reset_at', 'retry_after')
 
-# The two reasons the bead says ALWAYS carry reset_at.
-RESET_AT_REQUIRED = frozenset({'RATE_BUDGET', 'VENDOR_RATE_LIMITED'})
+# The reasons whose rows say they ALWAYS carry reset_at: the two rate limits (TE-1), and RANGE_TOO_RECENT, which
+# always names the instant the same request becomes servable (decision tj-7zjov1.306 addendum 1 R2, tj-7zjov1.315).
+RESET_AT_REQUIRED = frozenset({'RATE_BUDGET', 'VENDOR_RATE_LIMITED', 'RANGE_TOO_RECENT'})
 
 NOT_READY_REASONS = [reason for reason in Reason if REASONS[reason].outcome is Outcome.NOT_READY]
 REFUSED_REASONS = [reason for reason in Reason if REASONS[reason].outcome is Outcome.REFUSED]
@@ -132,9 +133,18 @@ def test_an_aware_reset_at_is_stored_as_the_same_instant_in_utc(offset: timedelt
     assert error.reset_at.replace(tzinfo=None) == NOW.replace(tzinfo=None)
 
 
+def test_the_reasons_that_require_reset_at_are_exactly_the_planned_three():
+    """The table's requires_reset_at column names exactly these reasons, no more and no fewer.
+
+    Without this the two sweeps below would follow the table wherever it drifted: a row that dropped the flag would
+    move silently from one sweep to the other and both would stay green.
+    """
+    assert {reason.value for reason in Reason if REASONS[reason].requires_reset_at} == RESET_AT_REQUIRED
+
+
 @pytest.mark.parametrize('name', sorted(RESET_AT_REQUIRED))
 def test_a_rate_limit_without_reset_at_is_refused(name: str):
-    """The bead: RATE_BUDGET and VENDOR_RATE_LIMITED ALWAYS carry reset_at."""
+    """The bead: RATE_BUDGET and VENDOR_RATE_LIMITED ALWAYS carry reset_at, and so does RANGE_TOO_RECENT."""
     reason = Reason(name)
     with pytest.raises(ValueError):
         REASONS[reason].branch(reason, 'detail')

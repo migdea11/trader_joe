@@ -79,6 +79,10 @@ BUILDING_VERBS = {
     # (compose builds a missing image on up, so the bases come first although both images were found).
     'test_build',
     'test_up',
+    # tj-7zjov1.268 (addendum 32): test_start's and test_env's `up --no-deps` of one built service over the test
+    # set can build a missing image, so the bases come first. test_stop's label-only `stop` is base-free below.
+    'test_start',
+    'test_env',
 }
 # ps and logs are base-free by construction, not by choice: they hand compose no file, so
 # there is no service definition to build from (ADR tj-4rr0la addendum 18).
@@ -96,6 +100,10 @@ BASE_FREE_VERBS = {
     'logs',
     'db_tables',
     'migrate_status',
+    # test_reset (tj-w0rddi): the rails' plain reads and ONE `docker exec` into the postgres container.
+    'test_reset',
+    # test_stop (tj-7zjov1.268): the same rails and ONE label-only `compose stop <service>`, which loads no file.
+    'test_stop',
     # tools (tj-iee6sn.14): its `up` names pgadmin alone, and neither pgadmin nor postgres (its one
     # depends_on) has a build: key in any file tools loads, so the up has nothing to build from. Its
     # tail is the one `up` exempted from the literal rule below, and only after the files are checked.
@@ -119,6 +127,31 @@ DEV_TOOLS_STARTABLE = ('pgadmin', 'postgres')
 # --- the Dockerfile's external refs ----------------------------------------------------------------
 
 
+# `FROM scratch` is Docker's reserved empty base: nothing is pulled, so nothing can be pinned or ensured.
+SCRATCH = 'scratch'
+# The build args the services are built with (docker-compose.yaml's build.args), spelled out. A FROM or
+# `COPY --from=` operand that names a build arg is a stage only if it resolves to one for EVERY service
+# (bead tj-7zjov1.10's `migrations_${SERVICE_PATH}_${SERVICE_NAME}`, a FROM since tj-7zjov1.95); otherwise
+# it stays in the external list, where the digest pin below reds it rather than letting an unpinned image through as a stage.
+SERVICE_BUILD_ARGS = (
+    {'SERVICE_PATH': 'data', 'SERVICE_NAME': 'store'},
+    {'SERVICE_PATH': 'data', 'SERVICE_NAME': 'ingest'},
+)
+
+
+def _expansions(ref: str) -> list[str]:
+    """REF under each service's build args; REF alone when it names none."""
+    if '$' not in ref:
+        return [ref]
+    expanded = []
+    for args in SERVICE_BUILD_ARGS:
+        value = ref
+        for name, arg in args.items():
+            value = value.replace(f'${{{name}}}', arg).replace(f'${name}', arg)
+        expanded.append(value)
+    return expanded
+
+
 def _dockerfile_external_refs() -> list[str]:
     """Every FROM image and COPY --from image of the root Dockerfile that is not one of its own stages."""
     lines = ROOT_DOCKERFILE.read_text(encoding='utf-8').replace('\\\n', ' ').splitlines()
@@ -132,7 +165,33 @@ def _dockerfile_external_refs() -> list[str]:
             named.append(operands[0])
         elif words[:1] == ['COPY']:
             named += [word.split('=', 1)[1] for word in words[1:] if word.startswith('--from=')]
-    return [ref for ref in named if ref not in stages and not ref.isdigit()]
+    return [
+        ref
+        for ref in named
+        if ref != SCRATCH and not ref.isdigit() and not all(value in stages for value in _expansions(ref))
+    ]
+
+
+def test_the_external_ref_parser_reads_scratch_and_a_build_arg_stage_as_internal():
+    """Bead tj-7zjov1.10's two new forms: neither is a registry image, and the parser says so for the right reason."""
+    refs = _dockerfile_external_refs()
+    text = ROOT_DOCKERFILE.read_text(encoding='utf-8')
+    # Non-vacuous: the Dockerfile does use both forms, so their absence below is the parser's doing. The
+    # build-arg form is a FROM since tj-7zjov1.95 (Docker refuses a build arg in COPY --from), and the COPY
+    # names the fixed selector stage it defines.
+    assert re.search(r'^FROM scratch AS ', text, re.MULTILINE), 'no scratch stage left to exclude'
+    assert re.search(
+        r'^FROM migrations_\$\{SERVICE_PATH\}_\$\{SERVICE_NAME\} AS migrations_selected$', text, re.MULTILINE
+    ), 'no build-arg FROM left'
+    assert re.search(r'^COPY --from=migrations_selected ', text, re.MULTILINE), 'no COPY of the selector stage left'
+    assert SCRATCH not in refs and not [ref for ref in refs if '$' in ref], refs
+    assert 'migrations_selected' not in refs, refs
+    # The rule, not the spelling: a build-arg operand one service cannot resolve to a stage stays external.
+    assert _expansions('migrations_${SERVICE_PATH}_${SERVICE_NAME}') == [
+        'migrations_data_store',
+        'migrations_data_ingest',
+    ]
+    assert _expansions('ghcr.io/x/y:1') == ['ghcr.io/x/y:1']
 
 
 def test_every_external_ref_in_the_root_dockerfile_is_digest_pinned():
@@ -254,6 +313,7 @@ _DEV_EXEC_BUILDER_SAMPLES = {
     'dev_db_tables_steps': ('c0ffee000001',),
     'dev_migrate_status_steps': ('c0ffee000001',),
     'dev_http_get_steps': ('c0ffee000001', 'ping'),
+    'test_reset_steps': ('c0ffee000001',),
 }
 # build's digest builder (tj-iee6sn.8) runs the TRUSTED source_digest.sh under bash, not docker: it
 # hashes files and can build nothing. Its build step comes from dev_build_step (singular), pinned in
@@ -383,8 +443,10 @@ def test_every_step_that_can_build_is_preceded_by_the_ensure_bases_steps(
 
     dev_tools_prefix = tuple(stack.dev_tools_prefix(rig.layout.repo_host_path))
     # tj-iee6sn.24: the two TEST sets, the build set first (the up set is a word-prefix of it).
+    # tj-7zjov1.268: the test set with the generated overlay last (test_env), longer than the up set, so before it.
     test_prefixes = (
         tuple(stack.testmode_build_prefix(rig.layout.repo_host_path)),
+        tuple(stack.testmode_env_prefix(rig.layout.repo_host_path, rig.layout.stack_dir)),
         tuple(stack.testmode_prefix(rig.layout.repo_host_path)),
     )
     # tj-iee6sn.20: the system-test client's compose prefix (unwrapped since 5a38b7f).

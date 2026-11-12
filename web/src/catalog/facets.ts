@@ -2,7 +2,7 @@
 // datasets matching the OTHER active filters; the server returns zero counts too, and an option
 // with none is still listed. int64 counts decode as bigint and become numbers here.
 import { DataSource, UpdateType } from '@generated/trader_joe/proto/market/v1/enums_pb'
-import { FreshnessStatus } from '@generated/trader_joe/proto/ui/v1/data_pb'
+import { DatasetHealthStatus } from '@generated/trader_joe/proto/ui/v1/data_pb'
 import type { DatasetFacets } from '@generated/trader_joe/proto/ui/v1/data_pb'
 
 import { int64ToNumber } from '@/api'
@@ -41,14 +41,14 @@ export interface FacetCounts {
   expiresBefore: Date | undefined
 }
 
-// A status filter value covers these freshness states (the server's mapping, tj-grna9p.8).
-const STATUS_OF: Partial<Record<FreshnessStatus, StatusGroup>> = {
-  [FreshnessStatus.FRESH]: 'healthy',
-  [FreshnessStatus.COMPLETE]: 'healthy',
-  [FreshnessStatus.LATE]: 'late',
-  [FreshnessStatus.OVERDUE]: 'failed',
-  [FreshnessStatus.GAPS]: 'failed',
-  [FreshnessStatus.RETIRED]: 'retired',
+// A status filter value covers these health states (the server's mapping, tj-grna9p.8).
+const STATUS_OF: Partial<Record<DatasetHealthStatus, StatusGroup>> = {
+  [DatasetHealthStatus.FRESH]: 'healthy',
+  [DatasetHealthStatus.COMPLETE]: 'healthy',
+  [DatasetHealthStatus.LATE]: 'late',
+  [DatasetHealthStatus.OVERDUE]: 'failed',
+  [DatasetHealthStatus.GAPS]: 'failed',
+  [DatasetHealthStatus.RETIRED]: 'retired',
 }
 
 /** The count the server gives a Usage group (the sidebar option and the footer total). */

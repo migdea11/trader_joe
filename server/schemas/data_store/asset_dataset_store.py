@@ -90,7 +90,7 @@ class StoreAssetDatasetFields(InboundContract):
     transport work, and the reason was write order rather than taste: data/store upserted the entry
     FROM THIS BODY and only then called ingest, so at the moment the row was written nothing had
     resolved a feed -- and feed is identity, so a placeholder written then and corrected later would
-    MUTATE identity and silently merge two datasets that asked for different tapes. The FetchDataset
+    MUTATE identity and silently merge two datasets that asked for different tapes. The ack-first
     cutover (tj-3mk3u5.10) reversed that order: the acknowledgement arrives FIRST and carries the
     resolved feed, early enough to write it, so the entry is written with a tape that is already
     decided and never with a placeholder. The entry's own column, its migration and the crud that
@@ -152,7 +152,7 @@ class StoreAssetDatasetFields(InboundContract):
     # The earlier reason this was NOT optional no longer holds: it was that BaseGetDatasetRequest
     # .expiry (schemas/data_ingest/get_dataset_request.py) is required and the store splatted this
     # body into it. That path is gone (data/store/app/ingest/data_action_request.py builds a
-    # FetchDatasetRequest field by field, which carries no expiry), and the entry column is
+    # SubmitRequest from the stored request row, whose bars arm carries no expiry), and the entry column is
     # nullable (tj-vhboky.1 Amendment 1 item P). Nothing is written into a unique-key column by
     # this, because expiry is not identity.
     #
@@ -424,7 +424,7 @@ class ServedRange(BaseModel):
     the requested range answers for that part, so these bounds can be NARROWER than the request's
     start and end, and comparing the two field by field is how a caller learns what it did not get.
     The range is never widened and never recomputed here: data_store copies it unchanged from the
-    fetch's FetchDone (schemas/data_ingest/fetch_dataset.py, tj-3mk3u5.27).
+    attempt's delivery trailer (schemas/data_ingest/delivery.py).
 
     THE BOUNDS MEAN WHAT THE REQUEST'S OWN BOUNDS MEAN -- start inclusive, end exclusive -- so the
     two are comparable without a convention lookup (data/ingest/app/brokers/interface.py documents
@@ -461,7 +461,7 @@ class StoreAssetDatasetResponse(BaseModel):
     added member: D2 applied at the edge, additive. Every 200 from the route carries served_range,
     including the empty window where data_points is 0; a failure is problem+json and carries none.
 
-    A MODEL OF ITS OWN, NOT A RE-EXPORT of the internal FetchDone (tj-3mk3u5.27). This response is
+    A MODEL OF ITS OWN, NOT A RE-EXPORT of the internal ServedRange (tj-3mk3u5.27). This response is
     public and the gRPC hop it draws from is internal, so a re-export would let an internal change
     move the public contract silently. The semantics are kept in step by hand, deliberately.
 

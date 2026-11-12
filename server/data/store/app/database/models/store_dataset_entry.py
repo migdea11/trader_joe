@@ -1,3 +1,5 @@
+from enum import StrEnum
+
 from sqlalchemy import UUID, Boolean, CheckConstraint, Column, DateTime, Enum, String, UniqueConstraint, func
 
 from common.database.sql_alchemy_nullable_datetime import NullableDateTime as SqlNullableDateTime
@@ -8,6 +10,18 @@ from common.database.sql_alchemy_types import CustomColumn
 from common.enums.data_select import AssetType, DataType
 from common.enums.data_stock import DataSource, ExpiryType, Feed, Granularity, UpdateType
 from common.sensitive import REDACTED
+
+
+class DatasetStopCause(StrEnum):
+    """Why the STORE stopped a dataset (store_dataset_entry.stopped_cause, a plain string column).
+
+    An operator's Stop never sets one. A Resume (collect set true) clears it.
+    """
+
+    # A bars delivery named another vendor asset id than the dataset's last accepted delivery (P50).
+    VENDOR_ASSET_CHANGED = 'VENDOR_ASSET_CHANGED'
+    # The panel manager stopped a panel-owned dataset (filter exit, DRAINED or a late mint): re-entry restarts it.
+    PANEL_MEMBER_LEFT = 'PANEL_MEMBER_LEFT'
 
 
 class StoreDatasetEntry(AppBase.DATA_STORE_BASE, CustomTypeTable):
@@ -33,7 +47,7 @@ class StoreDatasetEntry(AppBase.DATA_STORE_BASE, CustomTypeTable):
     # the entry was upserted from the request body BEFORE ingest was called, so nothing had
     # resolved a tape at the moment the row was written, and feed is identity -- a placeholder
     # written then and corrected later would MUTATE identity and silently merge two datasets that
-    # asked for different tapes. The FetchDataset cutover (tj-3mk3u5.10) reversed that order: the
+    # asked for different tapes. The fetch-stream cutover (tj-3mk3u5.10, since replaced by Submit and delivery) reversed that order: the
     # acknowledgement arrives FIRST and carries the resolved feed, so
     # data/store/app/ingest/data_action_request.py now upserts the entry ON THE ACK with a tape
     # that is already decided. An IEX request and a SIP request over the same window are two
@@ -137,15 +151,20 @@ class StoreDatasetEntry(AppBase.DATA_STORE_BASE, CustomTypeTable):
 
     # Whether the operator wants this dataset collected (tj-hhy3dk section 1): expiry means deletion only. NULL
     # exactly for a STATIC dataset, which is never collected on a schedule; a DAILY or STREAM dataset is True or
-    # False. Not identity and in no unique key. The CHECK below mirrors migration e5c8b1d4f703; the stored
+    # False. Not identity and in no unique key. The CHECK below ties it to update_type; the stored
     # integers of update_type are STATIC = 1, DAILY = 2, STREAM = 3.
     collect = Column(Boolean, nullable=True)
+    # Why the STORE stopped this dataset (collect set false by a store rule, not by the operator). NULL means the store
+    # did not stop it, whatever collect says. Only a stopped subscription can hold one (the CHECK below).
+    # The stop rule (tj-7zjov1.144, DatasetStopCause) is its one writer, and a Resume clears it. Not identity.
+    stopped_cause = Column(String, nullable=True)
 
     # Dates used to manage split and dividends adjustments
     created_at = Column(DateTime(timezone=True), default=func.now(), nullable=False)
     updated_at = Column(DateTime(timezone=True), default=func.now(), onupdate=func.now(), nullable=False)
 
     COLLECT_BY_TYPE_CONSTRAINT = 'ck_store_dataset_entry_collect_by_type'
+    STOPPED_CAUSE_CONSTRAINT = 'ck_store_dataset_entry_stopped_cause_needs_stop'
 
     __table_args__ = (
         UniqueConstraint(*NATURAL_KEY, name=NATURAL_KEY_CONSTRAINT),
@@ -153,6 +172,8 @@ class StoreDatasetEntry(AppBase.DATA_STORE_BASE, CustomTypeTable):
             '(update_type = 1 AND collect IS NULL) OR (update_type IN (2, 3) AND collect IS NOT NULL)',
             name=COLLECT_BY_TYPE_CONSTRAINT,
         ),
+        # A cause only on a stopped subscription: collect true and a STATIC row (collect NULL) can never carry one.
+        CheckConstraint('stopped_cause IS NULL OR collect IS FALSE', name=STOPPED_CAUSE_CONSTRAINT),
     )
 
     def __repr__(self):

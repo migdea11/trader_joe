@@ -37,10 +37,12 @@ import shutil
 import stat
 import subprocess  # nosec B404 -- argument lists only, never a shell; see run_git
 import threading
-import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
+from decimal import Decimal
 from pathlib import Path
+
+import yaml
 
 from tools.agent_mcp.seeds import MAX_BUNDLE_BYTES
 
@@ -215,6 +217,9 @@ SNAPSHOT_SOURCES = (
     'tests/system',
     'tests/fakes',
     'pytest.ini',
+    # The test client mounts these two (the dev seed export round trip, tj-7zjov1.313).
+    'tools/__init__.py',
+    'tools/dev_datasets',
 )
 # The copy's caps: generous (the sources are a few MB today), there to stop a worktree that grew a
 # dataset or a runaway generator from filling the host disk.
@@ -933,9 +938,22 @@ def _trusted_file_prefix(repo_host_path: Path, names: Sequence[str]) -> list[str
     return words
 
 
-def testmode_prefix(repo_host_path: Path) -> list[str]:
-    """The FILE-BASED TEST prefix, for test_up: the trusted base file and docker-compose.fake.yaml, as make system-launch's up."""
-    return _trusted_file_prefix(repo_host_path, TEST_COMPOSE_FILES)
+def testmode_prefix(repo_host_path: Path, stack_dir: Path | None = None) -> list[str]:
+    """The FILE-BASED TEST prefix, for test_up: the trusted base file and docker-compose.fake.yaml, as make system-launch's up.
+
+    With STACK_DIR, the generated overlay (AGENT_ENV_FILE) is LAST in the set when, and only when, it exists
+    (test_start, test_env; ADR tj-4rr0la addendum 32 (3)). Without it the set is the two trusted files, and
+    that is what test_up, test_build's parent set and migrate run.
+    """
+    words = _trusted_file_prefix(repo_host_path, TEST_COMPOSE_FILES)
+    if stack_dir is not None and agent_env_exists(stack_dir):
+        words += ['-f', str(agent_env_path(stack_dir))]
+    return words
+
+
+def testmode_env_prefix(repo_host_path: Path, stack_dir: Path) -> list[str]:
+    """testmode_prefix with the generated overlay last, whether or not it exists now: the shape the argv check accepts."""
+    return [*_trusted_file_prefix(repo_host_path, TEST_COMPOSE_FILES), '-f', str(agent_env_path(stack_dir))]
 
 
 def testmode_build_prefix(repo_host_path: Path) -> list[str]:
@@ -1023,6 +1041,19 @@ DEV_TOOLS_TAIL = ('up', '-d', '--wait', 'pgadmin')
 # files define (postgres, data_store, data_ingest) -- the words are the Makefile's, nothing added.
 TEST_BUILD_TAIL = ('build', 'data_store', 'data_ingest')
 TEST_UP_TAIL = ('up', '-d', '--wait', '--wait-timeout', '300')
+# test_stop, test_start and test_env (ADR tj-4rr0la addendum 32 (1)): the services they name, in the order of
+# the two source digests (data_store, data_ingest), and their fixed commands. Stop is label-only, as restart.
+AGENT_ENV_SERVICES = ('data_store', 'data_ingest')
+TEST_START_TAILS = {
+    service: ('up', '-d', '--wait', '--wait-timeout', '300', '--no-deps', '--no-recreate', service)
+    for service in AGENT_ENV_SERVICES
+}
+TEST_ENV_TAILS = {
+    service: ('up', '-d', '--wait', '--wait-timeout', '300', '--no-deps', '--force-recreate', service)
+    for service in AGENT_ENV_SERVICES
+}
+TEST_STOP_TAILS = {service: ('stop', service) for service in AGENT_ENV_SERVICES}
+AGENT_ENV_FILE = 'docker-compose.agent-env.yaml'
 DEV_ALEMBIC_PROGRAM = '/code/.venv/bin/alembic'
 DEV_MIGRATE_TAIL = ('run', '--rm', '--no-deps', 'data_store', DEV_ALEMBIC_PROGRAM, 'upgrade', 'head')
 DEV_LIFECYCLE_COMMANDS: dict[tuple[str, ...], str] = {
@@ -1039,6 +1070,14 @@ DEV_LIFECYCLE_COMMANDS: dict[tuple[str, ...], str] = {
 # cannot be a second key of the table above (one kind per tail): it is its own row, accepted only under
 # testmode_prefix (the base file and docker-compose.fake.yaml, as run_migrations.sh's TEST definition).
 TEST_ONEOFF_COMMANDS: dict[tuple[str, ...], str] = {DEV_MIGRATE_TAIL: _TEST_FILE_BASED}
+# The three test-mode service verbs' rows, a table of their own so DEV_LIFECYCLE_COMMANDS stays the pinned dev
+# and test_up/test_build set: stop under the label-only prefix, start and env under the test set (with the
+# generated overlay last when it is there).
+TEST_SERVICE_COMMANDS: dict[tuple[str, ...], str] = {
+    **dict.fromkeys(TEST_STOP_TAILS.values(), _DEV_LABEL_ONLY),
+    **dict.fromkeys(TEST_START_TAILS.values(), _TEST_FILE_BASED),
+    **dict.fromkeys(TEST_ENV_TAILS.values(), _TEST_FILE_BASED),
+}
 # Data-losing words, refused wherever they appear after the prefix, on top of DEV_FORBIDDEN_OPTIONS
 # (file, project, directory, env file, profile). -V is `up`'s --renew-anon-volumes.
 DEV_LIFECYCLE_FORBIDDEN = DEV_FORBIDDEN_OPTIONS | frozenset(
@@ -1063,15 +1102,18 @@ def _forbidden_lifecycle_words(tail: Sequence[str]) -> list[str]:
     return found
 
 
-def check_dev_lifecycle_argv(argv: Sequence[str], repo_host_path: Path | None = None) -> None:
+def check_dev_lifecycle_argv(
+    argv: Sequence[str], repo_host_path: Path | None = None, stack_dir: Path | None = None
+) -> None:
     """Refuse any dev lifecycle argv but one row of DEV_LIFECYCLE_COMMANDS under its own prefix, whole.
 
     A label-only row runs under dev_compose_prefix() alone; a file-based row under
     dev_file_prefix(repo_host_path), so REPO_HOST_PATH is required to accept one; the tools row
     only under dev_tools_prefix (the tools file added), the test_build row only under testmode_build_prefix
     (the fake and test-overlay files, the only set that can build :test), the test_up row only under
-    testmode_prefix, and no other row under any of them. Checked on the
-    words that go to the daemon, not on the builders' intent. check_dev_argv stays as it is, for the
+    testmode_prefix, and no other row under any of them. With STACK_DIR, the test set may also carry
+    exactly one more `-f`, the absolute path of the generated overlay (AGENT_ENV_FILE) in that stack
+    directory, last. Checked on the words that go to the daemon, not on the builders' intent. check_dev_argv stays as it is, for the
     read-only ps and logs.
     """
     words = list(argv)
@@ -1085,12 +1127,15 @@ def check_dev_lifecycle_argv(argv: Sequence[str], repo_host_path: Path | None = 
             raise Refused('a file-based dev lifecycle command needs the repository host path to be checked')
         # Longest first: testmode_prefix is a word-prefix of testmode_build_prefix, so the build set must be
         # tried before the up set (the up set would otherwise read the overlay's -f as a forbidden tail word).
-        candidates = (
+        candidates = [
             (dev_tools_prefix(repo_host_path), _DEV_TOOLS_FILE_BASED),
             (testmode_build_prefix(repo_host_path), _TEST_BUILD_FILE_BASED),
             (testmode_prefix(repo_host_path), _TEST_FILE_BASED),
             (dev_file_prefix(repo_host_path), _DEV_FILE_BASED),
-        )
+        ]
+        if stack_dir is not None:
+            # The overlay-carrying set is longer than testmode_prefix, so it is tried first.
+            candidates.insert(0, (testmode_env_prefix(repo_host_path, stack_dir), _TEST_FILE_BASED))
         for candidate, candidate_kind in candidates:
             if words[: len(candidate)] == candidate:
                 prefix, kind_wanted = candidate, candidate_kind
@@ -1107,7 +1152,11 @@ def check_dev_lifecycle_argv(argv: Sequence[str], repo_host_path: Path | None = 
             f'or env file: {", ".join(forbidden)}'
         )
     kind = DEV_LIFECYCLE_COMMANDS.get(tuple(tail))
-    if kind != kind_wanted and TEST_ONEOFF_COMMANDS.get(tuple(tail)) != kind_wanted:
+    if (
+        kind != kind_wanted
+        and TEST_ONEOFF_COMMANDS.get(tuple(tail)) != kind_wanted
+        and TEST_SERVICE_COMMANDS.get(tuple(tail)) != kind_wanted
+    ):
         raise Refused('a dev lifecycle command is one of its fixed commands, with its fixed arguments, and no other')
 
 
@@ -1235,8 +1284,6 @@ DEV_BIND_SOURCES = (
     'server/routers',
     'server/schemas',
     'gen/proto/python',
-    'server/data/store/alembic.ini',
-    'server/data/store/migrations',
     'web/src',
     'gen/proto',
 )
@@ -1252,11 +1299,11 @@ def check_dev_bind_sources(repo_root: Path, sources: Sequence[str] = DEV_BIND_SO
         _lstat_below(repo_root, relative)
 
 
-# D6 for test mode: every in-repo bind source of the test set (docker-compose.yaml binds data_store's
-# alembic.ini and migrations; docker-compose.fake.yaml mounts tests/fakes read-only into data_ingest;
-# docker-compose.agent-test.yaml mounts nothing). The only other bind is postgres' data directory,
-# under ./volume_data/test, the residual DEV_BIND_SOURCES' comment records.
-TEST_BIND_SOURCES = ('server/data/store/alembic.ini', 'server/data/store/migrations', 'tests/fakes')
+# D6 for test mode: every in-repo bind source of the test set (docker-compose.fake.yaml mounts
+# tests/fakes read-only into data_ingest; docker-compose.yaml mounts no revisions, they ship in the
+# data_store image; docker-compose.agent-test.yaml mounts nothing). The only other bind is postgres'
+# data directory, under ./volume_data/test, the residual DEV_BIND_SOURCES' comment records.
+TEST_BIND_SOURCES = ('tests/fakes',)
 
 
 # D7 GENERALISED INTO THE MODE GUARD (ADR tj-4rr0la addenda 26-27, 29; tj-iee6sn.24, .31). Dev and test
@@ -1288,6 +1335,159 @@ MODES_DEV_OR_TEST = frozenset({MODE_DEV, MODE_TEST})
 # launch (./volume_data/test, the fake broker) makes that database disposable.
 MODES_TEST = frozenset({MODE_TEST})
 SYSTEM_SUITE_MODE_HINT = 'the system suite runs only in test mode: call test_up first; your dev data is not touched'
+TEST_SERVICE_MODE_HINT = 'test_stop, test_start and test_env act only in test mode: call test_up first'
+
+# THE SESSION GRANT (ADR tj-4rr0la addendum 34). One human approval per bead under test, covering a declared
+# scope, held in the server's memory: every state-changing verb needs an open, unexpired grant whose mode and
+# verb list cover it, checked at ADMISSION only (a verb already running finishes). The grant only adds a
+# condition to the verb's own rails; it never skips or relaxes one. Read verbs need none.
+GRANT_PRESET_TEST = 'test-campaign'
+# Each mode's closed verb set. A grant names a subset; down is in the TEST set but NOT in the preset.
+GRANT_VERBS_TEST = (
+    'test_build',
+    'test_up',
+    'test_stop',
+    'test_start',
+    'test_env',
+    'test_reset',
+    'run_system_tests',
+    'seed_dump',
+    'migrate',
+    'restart',
+    'down',
+)
+GRANT_PRESET_TEST_VERBS = tuple(verb for verb in GRANT_VERBS_TEST if verb != 'down')
+GRANT_VERBS_DEV = ('build', 'up', 'down', 'restart', 'migrate', 'tools')
+GRANT_VERBS = {MODE_TEST: GRANT_VERBS_TEST, MODE_DEV: GRANT_VERBS_DEV}
+# (default, maximum) minutes. Over the maximum refuses the open, never clipped: the prompt the owner
+# approved is the grant that exists.
+GRANT_MINUTES = {MODE_TEST: (240, 480), MODE_DEV: (60, 120)}
+GRANT_PURPOSE_MAX = 200
+GRANT_OPEN_TOOLS = {MODE_TEST: 'stack_session_open_test', MODE_DEV: 'stack_session_open_dev'}
+GRANT_CLOSE_TOOL = 'stack_session_close'
+# The state-changing verbs whose mode is fixed by their name; migrate, restart and down take the mode the
+# mode guard resolves, so only their verb list is checked at admission and their mode right after the guard.
+GRANT_FIXED_MODE = {
+    **{verb: MODE_TEST for verb in GRANT_VERBS_TEST if verb not in ('migrate', 'restart', 'down')},
+    **{verb: MODE_DEV for verb in GRANT_VERBS_DEV if verb not in ('migrate', 'restart', 'down')},
+}
+GRANT_MODE_DEPENDENT = ('migrate', 'restart', 'down')
+_GRANT_BEAD = re.compile(r'^[a-z][a-z0-9]*-[a-z0-9]+(\.[0-9]+)*$')
+GRANT_TIME_FORMAT = '%Y-%m-%d %H:%M UTC'
+
+
+@dataclass(frozen=True)
+class Grant:
+    """One open session grant. EXPIRES is on the monotonic clock; EXPIRES_AT is the same moment in UTC, for display."""
+
+    bead: str
+    mode: str
+    verbs: tuple[str, ...]
+    purpose: str
+    expires: float
+    expires_at: datetime.datetime
+
+    def summary(self) -> str:
+        """`<bead> <MODE> [verbs] expires <UTC>`, as refusals name the grant."""
+        return (
+            f'{self.bead} {self.mode} [{", ".join(self.verbs)}] expires {self.expires_at.strftime(GRANT_TIME_FORMAT)}'
+        )
+
+    def line(self) -> str:
+        """Ps's `session:` line."""
+        return f'session: {self.summary()} - {self.purpose}'
+
+    def record(self) -> dict[str, object]:
+        """The audit line's grant field."""
+        return {
+            'bead': self.bead,
+            'mode': self.mode,
+            'verbs': list(self.verbs),
+            'expires_at': self.expires_at.isoformat(timespec='seconds'),
+            'purpose': self.purpose,
+        }
+
+
+def check_grant_bead(value: object) -> str:
+    """The bead id under test: free-form (the server cannot read the task store), but the id grammar."""
+    if not isinstance(value, str) or not _GRANT_BEAD.fullmatch(value):
+        raise Refused('bead must be a task id such as tj-ab12cd or tj-ab12cd.4 (lower-case prefix, a dash, a suffix)')
+    return value
+
+
+def check_grant_purpose(value: object) -> str:
+    """One sentence, 1..GRANT_PURPOSE_MAX printable characters, no newline."""
+    if not isinstance(value, str) or not value.strip() or not value.isprintable():
+        raise Refused('purpose must be one printable line saying what is tested and what it will touch')
+    if len(value) > GRANT_PURPOSE_MAX:
+        raise Refused(f'purpose is {len(value)} characters; the limit is {GRANT_PURPOSE_MAX}')
+    return value
+
+
+def check_grant_minutes(mode: str, value: object) -> int:
+    """The duration in minutes; the mode's default when None; over the maximum is refused, never trimmed."""
+    default, maximum = GRANT_MINUTES[mode]
+    if value is None:
+        return default
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise Refused(f'minutes must be a whole number of at least 1 (default {default}, at most {maximum})')
+    if value > maximum:
+        raise Refused(
+            f'{value} minutes is over the {mode} maximum of {maximum}; nothing was opened '
+            f'(a longer campaign needs a fresh approval after this one expires)'
+        )
+    return value
+
+
+def check_grant_verbs(mode: str, value: object) -> tuple[str, ...]:
+    """The verbs a grant covers: a list from the mode's closed set, or (TEST only) the preset name."""
+    allowed = GRANT_VERBS[mode]
+    if isinstance(value, str):
+        if mode == MODE_TEST and value == GRANT_PRESET_TEST:
+            return GRANT_PRESET_TEST_VERBS
+        if value == GRANT_PRESET_TEST:
+            raise Refused(f'there is no preset in {mode} mode: name each verb of {", ".join(allowed)}')
+        raise Refused(f'verbs is a list of {mode} verbs ({", ".join(allowed)})' + _preset_hint(mode))
+    if not isinstance(value, list) or not value or not all(isinstance(item, str) for item in value):
+        raise Refused(f'verbs must be a non-empty list of {mode} verbs ({", ".join(allowed)})' + _preset_hint(mode))
+    outside = [item for item in dict.fromkeys(value) if item not in allowed]
+    if outside:
+        raise Refused(
+            f'{", ".join(map(repr, outside))} is not a {mode} grant verb; the {mode} verbs are: {", ".join(allowed)}'
+        )
+    return tuple(dict.fromkeys(value))
+
+
+def _preset_hint(mode: str) -> str:
+    if mode != MODE_TEST:
+        return ''
+    return f"; or the preset '{GRANT_PRESET_TEST}' ({', '.join(GRANT_PRESET_TEST_VERBS)}), as a string, without down"
+
+
+def grant_ask(verb: str, mode: str) -> str:
+    """What to ask the owner for, for VERB in MODE."""
+    return f'ask the owner to approve {GRANT_OPEN_TOOLS[mode]} with {verb} in verbs'
+
+
+def grant_refusal(verb: str, grant: Grant | None, expired: Grant | None, mode: str | None) -> Refused:
+    """The refusal for a state-changing VERB that no open grant covers.
+
+    MODE is the mode the verb needs when it is known (its name fixes it, or the guard resolved it), else
+    None. The text names the open grant, or says none is open, and exactly what to ask for.
+    """
+    need = mode or GRANT_FIXED_MODE.get(verb)
+    if grant is not None:
+        asked = grant_ask(verb, need or grant.mode)
+        where = f' in {need} mode' if need else ''
+        return Refused(f'refused: no grant covers {verb}{where} (open grant: {grant.summary()}); {asked}')
+    base = 'refused: no session grant is open'
+    if expired is not None:
+        base = f'refused: the session grant {expired.summary().replace(" expires ", " expired ")}'
+    if need is None:
+        return Refused(
+            f'{base}; ask the owner to approve {GRANT_OPEN_TOOLS[MODE_TEST]} or {GRANT_OPEN_TOOLS[MODE_DEV]}'
+        )
+    return Refused(f'{base}; {verb} acts in {need} mode: {grant_ask(verb, need)}')
 
 
 def dev_prod_guard_argv() -> tuple[str, ...]:
@@ -1430,33 +1630,6 @@ def check_trusted_copies_current(repo_root: Path, trusted_dir: Path = TRUSTED_CO
             )
 
 
-# S10. A looping agent must be stopped, not served: starting data_ingest can trigger the daily refresh
-# against the owner's paper quota. In memory, so an MCP restart resets it.
-DEV_BUDGET_LIMIT = 12
-DEV_BUDGET_WINDOW_SECONDS = 3600.0
-
-
-class DevBudget:
-    """At most DEV_BUDGET_LIMIT state-changing dev verbs per rolling DEV_BUDGET_WINDOW_SECONDS."""
-
-    def __init__(self, clock: Callable[[], float] = time.monotonic):
-        self._clock = clock
-        self._lock = threading.Lock()
-        self._calls: list[float] = []
-
-    def charge(self) -> None:
-        """Count one verb, or Refused when the window already holds the limit; a refused call is not counted."""
-        now = self._clock()
-        with self._lock:
-            self._calls = [at for at in self._calls if now - at < DEV_BUDGET_WINDOW_SECONDS]
-            if len(self._calls) >= DEV_BUDGET_LIMIT:
-                raise Refused(
-                    f'{DEV_BUDGET_LIMIT} state-changing dev verbs in the last hour is the budget; wait, '
-                    'or run the make target yourself'
-                )
-            self._calls.append(now)
-
-
 # ---------------------------------------------------------------------------------------------
 # THE LABEL-ONLY MUTATING VERBS, down AND restart (tj-iee6sn.7; owner rulings D1, D2, D6, D7).
 # `docker compose -p trader_joe_dev down` and `... restart <service>` pass no -f, so compose may search the
@@ -1529,7 +1702,7 @@ def dev_restart_steps(stack_dir: Path, service: str) -> list[Step]:
 # --project-directory the repository's host path. It creates and starts nothing and reads no env file
 # (the step env is dev_placeholder_step_env), so it needs no prod guard, no symlink check and no
 # steering walk: every -f is given, and a `:dev` image is not a container. What it does run, in
-# order: the stale-copy check (S6), the generated-code freshness precondition, the budget, the two
+# order: the stale-copy check (S6), the generated-code freshness precondition, the two
 # source digests from the TRUSTED source_digest.sh, then the build (the runner has the base images
 # present first, as for every building step).
 DEV_GENERATED_DIRS = ('gen/proto/python', 'gen/proto/ts')
@@ -1891,11 +2064,11 @@ def migrate_selection(mode: str) -> str:
     if mode == MODE_TEST:
         return (
             f'using the TEST definition (docker-compose.yaml + docker-compose.fake.yaml) of project {DEV_PROJECT} '
-            'in TEST mode (the :test image; alembic.ini and revisions from the root checkout)'
+            'in TEST mode (the :test image; alembic.ini and revisions from that image)'
         )
     return (
         f'using the DEV definition (docker-compose.yaml + docker-compose.override.yaml) of project {DEV_PROJECT} '
-        'in DEV mode (revisions from the root checkout)'
+        'in DEV mode (revisions from the :dev image)'
     )
 
 
@@ -2097,6 +2270,9 @@ DEV_EXEC_PGOPTIONS = 'PGOPTIONS=-c default_transaction_read_only=on'
 # set and so are refused.
 _DEV_EXEC_OPTIONS_POSTGRES = ('-u', 'postgres', '-e', DEV_EXEC_PGOPTIONS)
 _DEV_EXEC_OPTIONS_CODE = ('-w', '/code')
+# test_reset alone WRITES through this exec family, so it alone has user postgres without the read-only
+# option. Which tail it goes with is the table's: it is bound to TEST_RESET_TAIL and to nothing else.
+_DEV_EXEC_OPTIONS_POSTGRES_WRITE = ('-u', 'postgres')
 
 # db_tables: the tables whose presence it reports (to_regclass, so a missing one is false, not an
 # error), in the order of the models under server/data/store/app/database/models. The schema is the
@@ -2107,8 +2283,19 @@ DEV_DB_TABLES = (
     'dataset_override_log',
     'dataset_deletion',
     'ingest_run',
+    'ingest_request',
+    'ingest_instance',
     'store_dataset_entry',
     'stock_market_activity',
+    'asset_list_snapshot',
+    'asset_list_row',
+    'asset_list_event',
+    'corporate_action',
+    'panel',
+    'panel_settings_version',
+    'panel_source_settings_version',
+    'panel_pass',
+    'panel_member_transition',
     'alembic_version',
 )
 DEV_DB_VERSION_TABLE = 'alembic_version'
@@ -2182,6 +2369,43 @@ DEV_DB_TABLES_SCRIPT = (
     .replace('@VERSION@', _DEV_DB_VERSION_QUERY)
 )
 DEV_DB_TABLES_TAIL = ('sh', '-c', DEV_DB_TABLES_SCRIPT)
+
+# test_reset (tj-w0rddi): the TEST database cleared IN PLACE. Run INSIDE the postgres container by `sh -c`, as
+# user postgres (the container's superuser over the local socket, so no password and no secret is on any
+# command line), and the only member of this family without the read-only session. No file is deleted and no
+# bind mount is touched: the public schema (every model's table, and alembic_version) is dropped and
+# recreated, so the next `migrate` applies every revision from empty. The database itself is not dropped: the
+# session is connected to it. The recreated schema is what initdb makes in PG 15+: owned by
+# pg_database_owner, USAGE for everyone. The SQL is constant, with no placeholder. lock_timeout makes a
+# session holding a lock on a table fail the reset instead of hanging it. The reset is one implicit
+# transaction (a single -c string), so it applies whole or not at all.
+TEST_RESET_SQL = (
+    "SET lock_timeout = '15s'; "
+    'DROP SCHEMA IF EXISTS public CASCADE; '
+    'CREATE SCHEMA public AUTHORIZATION pg_database_owner; '
+    "COMMENT ON SCHEMA public IS 'standard public schema'; "
+    'GRANT USAGE ON SCHEMA public TO PUBLIC'
+)
+# What it then prints, and all it prints: names and counts, never a row. The relation count is every kind of
+# relation in public (tables, indexes, sequences, views), so a leftover of any kind shows.
+TEST_RESET_VERIFY_SQL = (
+    "SELECT 'database', current_database()::text "
+    "UNION ALL SELECT 'schema_owner', pg_get_userbyid(nspowner)::text FROM pg_namespace WHERE nspname = 'public' "
+    "UNION ALL SELECT 'alembic_version', CASE WHEN to_regclass('public.alembic_version') IS NULL "
+    "THEN 'absent' ELSE 'present' END "
+    "UNION ALL SELECT 'public_relations', count(*)::text FROM pg_class c "
+    "JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = 'public'"
+)
+# Every printed byte goes through redact, errors included (a psql error can quote a connection setting).
+_TEST_RESET_TEMPLATE = (
+    _DEV_REDACT_FUNCTION
+    + r"""
+out=$(psql -X -q -At -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "@RESET@" 2>&1) || { printf '%s\n' "$out" | redact; exit 1; }
+out=$(psql -X -At -F '|' -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "@VERIFY@" 2>&1) || { printf '%s\n' "$out" | redact; exit 1; }
+printf '%s\n' "$out" | redact"""
+)
+TEST_RESET_SCRIPT = _TEST_RESET_TEMPLATE.replace('@RESET@', TEST_RESET_SQL).replace('@VERIFY@', TEST_RESET_VERIFY_SQL)
+TEST_RESET_TAIL = ('sh', '-c', TEST_RESET_SCRIPT)
 
 # migrate_status (DEV or TEST mode): alembic's `current`, then `history`, run in the RUNNING data_store container by
 # its own interpreter environment (PATH, DATABASE_URI) and its mounted alembic.ini and migrations/;
@@ -2314,6 +2538,7 @@ DEV_HTTP_GET_TAILS: dict[str, tuple[str, ...]] = {
 DEV_EXEC_COMMANDS: dict[tuple[str, ...], tuple[str, ...]] = {
     DEV_DB_TABLES_TAIL: _DEV_EXEC_OPTIONS_POSTGRES,
     DEV_MIGRATE_STATUS_TAIL: _DEV_EXEC_OPTIONS_CODE,
+    TEST_RESET_TAIL: _DEV_EXEC_OPTIONS_POSTGRES_WRITE,
     **dict.fromkeys(DEV_HTTP_GET_TAILS.values(), ()),
 }
 
@@ -2427,6 +2652,55 @@ def dev_migrate_status_steps(stack_dir: Path, container_id: str) -> list[Step]:
     return dev_exec_steps(stack_dir, container_id, DEV_MIGRATE_STATUS_TAIL)
 
 
+def test_reset_steps(stack_dir: Path, container_id: str) -> list[Step]:
+    """test_reset's one exec: the fixed schema reset and its verification, as user postgres, in the test postgres."""
+    return dev_exec_steps(stack_dir, container_id, TEST_RESET_TAIL)
+
+
+# test_reset's output, parsed: `database|<name>`, `schema_owner|<role>`, `alembic_version|absent|present` and
+# `public_relations|<n>`. A name is an identifier; any other line is ignored (the redacted output stays in the
+# step), so an echoed row cannot become a reported value.
+_IDENTIFIER = re.compile(r'^[A-Za-z0-9_]{1,63}$')
+TEST_RESET_SCHEMA_OWNER = 'pg_database_owner'
+
+
+@dataclass(frozen=True)
+class ResetState:
+    """What the database looks like after test_reset, from the script's verification."""
+
+    database: str
+    schema_owner: str
+    alembic_version: str
+    public_relations: int
+
+    @property
+    def clean(self) -> bool:
+        """The reset's whole claim: the public schema is empty, owned by the database owner, and has no alembic_version."""
+        return (
+            self.schema_owner == TEST_RESET_SCHEMA_OWNER
+            and self.alembic_version == 'absent'
+            and self.public_relations == 0
+        )
+
+
+def parse_test_reset(stdout: bytes) -> ResetState | None:
+    """The verification the script printed, or None when any of its four lines is missing."""
+    found: dict[str, str] = {}
+    for line in stdout.decode('utf-8', errors='replace').splitlines():
+        name, _, value = line.partition('|')
+        if (
+            (name in ('database', 'schema_owner') and _IDENTIFIER.fullmatch(value))
+            or (name == 'alembic_version' and value in ('absent', 'present'))
+            or (name == 'public_relations' and value.isascii() and value.isdigit())
+        ):
+            found[name] = value
+    if set(found) != {'database', 'schema_owner', 'alembic_version', 'public_relations'}:
+        return None
+    return ResetState(
+        found['database'], found['schema_owner'], found['alembic_version'], int(found['public_relations'])
+    )
+
+
 def validate_dev_http_get_name(name: object) -> str:
     """NAME must be a key of the closed DEV_HTTP_GET_PATHS; anything else (a path, a URL, empty) is Refused."""
     if not isinstance(name, str) or name not in DEV_HTTP_GET_PATHS:
@@ -2467,3 +2741,506 @@ def parse_db_tables(stdout: bytes) -> tuple[dict[str, bool], str | None]:
         elif name == 'version_num' and _REVISION.fullmatch(value):
             version = value
     return tables, version
+
+
+# ---------------------------------------------------------------------------------------------
+# test_stop, test_start AND test_env (ADR tj-4rr0la addendum 32; tj-7zjov1.268), TEST MODE ONLY, in the
+# lineage of test_reset: fixed verbs, closed argument sets, and the MCP never reads an env file or a
+# container's environment. test_env is the only verb here that takes free-form data, and it takes
+# it through the allow-list below and nowhere else.
+LABEL_ENV_GENERATION = 'trader_joe.agent.env_generation'
+LABEL_ENV_NAMES = 'trader_joe.agent.env_names'
+AGENT_ENV_MAX_NAMES = 8
+
+
+@dataclass(frozen=True)
+class EnvRule:
+    """One allowed variable: the FULL value grammar, then (numbers only) the inclusive range, in that order."""
+
+    pattern: re.Pattern[str]
+    low: Decimal | None
+    high: Decimal | None
+    grammar: str
+
+    def accepts(self, value: str) -> bool:
+        """Whether VALUE matches the grammar in full and then lies in the range. fullmatch, so no trailing newline."""
+        if not self.pattern.fullmatch(value):
+            return False
+        if self.low is None or self.high is None:
+            return True
+        return self.low <= Decimal(value) <= self.high
+
+
+# Decimal digits only, spelt [0-9] (\d also matches other scripts' digits): no sign, exponent, whitespace,
+# newline, '$' or quote can match any pattern below.
+_BOOL_RULE = EnvRule(re.compile(r'true|false'), None, None, 'exactly true or false')
+
+
+def _integer_rule(low: int, high: int) -> EnvRule:
+    digits = len(str(high))
+    return EnvRule(re.compile(rf'[0-9]{{1,{digits}}}'), Decimal(low), Decimal(high), f'an integer from {low} to {high}')
+
+
+# THE ALLOW-LIST, a literal. Values may only LOWER a default (the high end of each range is the default);
+# a new name needs an addendum to ADR tj-4rr0la.
+AGENT_ENV_ALLOW: dict[str, dict[str, EnvRule]] = {
+    'data_store': {
+        'PANEL_MANAGER_ENABLED': _BOOL_RULE,
+        'PANEL_MANAGER_DRY_RUN': _BOOL_RULE,
+        'INSTANCE_WATCH_INTERVAL_SECONDS': _integer_rule(1, 15),
+        'INSTANCE_WATCH_RESUBMIT_MARGIN_SECONDS': _integer_rule(0, 15),
+    },
+    'data_ingest': {
+        'ALPACA_OUTGOING_BUFFER_SIZE': _integer_rule(1, 64),
+        'ALPACA_STALL_TIMEOUT_S': EnvRule(
+            re.compile(r'[0-9]{1,3}(?:\.[0-9]{1,3})?'),
+            Decimal(1),
+            Decimal(300),
+            'a decimal from 1 to 300 with at most 3 fraction digits',
+        ),
+        'ALPACA_MAX_ATTEMPTS': _integer_rule(1, 5),
+    },
+}
+
+# NEVER on the list (addendum 32 (2)). Checked first, so the refusal says which kind it was, and checked at
+# import against the allow-list itself, so no edit of the literal above can put one of them on it.
+ENV_NEVER_CONTAINS = ('KEY', 'SECRET', 'PASS', 'TOKEN', 'CREDENTIAL')
+ENV_NEVER_PREFIXES = ('DATABASE_', 'POSTGRES_', 'ALPACA_API_', 'APP_INTERNAL_GRPC_')
+ENV_NEVER_NAMES = frozenset(
+    {
+        'INSTANCE_WRITE_SECRET',
+        'ALPACA_TRADING_BASE_URL',
+        'ALPACA_SIP_ENABLED',
+        'DATA_STORE_GRPC_TARGET',
+        'SERVICE_WORKERS',
+        'REAPER_DELETES_ENABLED',
+        'DEPLOYMENT_LABEL',
+        'DATA_DIR',
+    }
+)
+
+
+def env_name_never_allowed(name: str) -> bool:
+    """Whether NAME is one of the never-allowed names or patterns (case-insensitive)."""
+    upper = name.upper()
+    return (
+        upper in ENV_NEVER_NAMES
+        or any(word in upper for word in ENV_NEVER_CONTAINS)
+        or upper.startswith(ENV_NEVER_PREFIXES)
+    )
+
+
+for _allowed in AGENT_ENV_ALLOW.values():
+    for _name in _allowed:
+        if env_name_never_allowed(_name):
+            raise RuntimeError(f'{_name} is on the test_env allow-list but is never allowed')
+
+
+def validate_agent_env_service(service: object) -> str:
+    """SERVICE must be data_store or data_ingest; postgres, test_client and web are refused. The value is not echoed."""
+    if not isinstance(service, str) or service not in AGENT_ENV_SERVICES:
+        raise Refused(f'service must be one of: {", ".join(AGENT_ENV_SERVICES)}')
+    return service
+
+
+def _shown_name(name: object) -> str:
+    return repr(name[:64]) if isinstance(name, str) else 'a name that is not a string'
+
+
+def validate_agent_env(service: object, overrides: object) -> dict[str, str]:
+    """OVERRIDES checked against SERVICE's allow-list: {NAME: value}, sorted by name. A refusal names the variable, never the value.
+
+    At most AGENT_ENV_MAX_NAMES names. A name must not be a never-allowed one and must be on the service's
+    list; a value must be a string that matches the name's grammar in full and then its range. {} is valid
+    (it clears the service's set).
+    """
+    checked = validate_agent_env_service(service)
+    if not isinstance(overrides, dict):
+        raise Refused('overrides must be an object of NAME: value pairs ({} clears the service)')
+    if len(overrides) > AGENT_ENV_MAX_NAMES:
+        raise Refused(f'at most {AGENT_ENV_MAX_NAMES} names per call')
+    rules = AGENT_ENV_ALLOW[checked]
+    values: dict[str, str] = {}
+    for name, value in overrides.items():
+        if not isinstance(name, str):
+            raise Refused('an override name must be a string')
+        if env_name_never_allowed(name):
+            raise Refused(f'{_shown_name(name)} can never be set through test_env')
+        rule = rules.get(name)
+        if rule is None:
+            raise Refused(f'{_shown_name(name)} is not on the {checked} allow-list: {", ".join(rules)}')
+        if not isinstance(value, str) or not rule.accepts(value):
+            raise Refused(f'the value given for {name} is not accepted: it must be {rule.grammar}')
+        values[name] = value
+    return dict(sorted(values.items()))
+
+
+@dataclass(frozen=True)
+class AgentEnvEntry:
+    """One service's override set in the generated file: its generation and its sorted (name, value) pairs."""
+
+    generation: int
+    values: tuple[tuple[str, str], ...]
+
+    @property
+    def names(self) -> tuple[str, ...]:
+        return tuple(name for name, _ in self.values)
+
+
+def agent_env_path(stack_dir: Path) -> Path:
+    """The generated overlay: in the MCP's own stack directory, never the repository, never an env file."""
+    return stack_dir / AGENT_ENV_FILE
+
+
+def agent_env_exists(stack_dir: Path) -> bool:
+    """Whether the overlay exists (lstat, no follow); Refused when something that is not a regular file is there."""
+    try:
+        found = os.lstat(agent_env_path(stack_dir))
+    except (FileNotFoundError, NotADirectoryError):
+        return False
+    except OSError as error:
+        raise Refused(f'{AGENT_ENV_FILE} could not be checked: {error.strerror}') from error
+    if not stat.S_ISREG(found.st_mode):
+        raise Refused(f'{AGENT_ENV_FILE} in the stack directory is not a regular file: remove it')
+    return True
+
+
+class _AgentEnvDumper(yaml.SafeDumper):
+    """SafeDumper that never writes an anchor or alias, so equal sub-objects cannot change the text."""
+
+    def ignore_aliases(self, data: object) -> bool:
+        return True
+
+
+# THE EXACT DUMP ARGUMENTS. parse_agent_env's canonical check (the file must be byte for byte what
+# render_agent_env gives for the entries read back) depends on every one of them, so a change here changes
+# which files are accepted. sort_keys: key order is content, not insertion order. default_flow_style=False:
+# block style throughout, no inline {} or []. width: wide enough that no scalar is ever folded across lines
+# (the longest is a list of at most AGENT_ENV_MAX_NAMES names). indent=2. allow_unicode=False (the default):
+# the text is ASCII. No explicit document start or end markers. No anchors or aliases (the dumper above).
+# SafeDumper: no tags, no Python objects.
+_AGENT_ENV_DUMP = {
+    'Dumper': _AgentEnvDumper,
+    'sort_keys': True,
+    'default_flow_style': False,
+    'width': 10_000,
+    'indent': 2,
+    'allow_unicode': False,
+    'explicit_start': False,
+    'explicit_end': False,
+}
+
+
+def render_agent_env(entries: Mapping[str, AgentEnvEntry]) -> str:
+    """The overlay's text, built from a dict by the serializer (no string formatting of values).
+
+    Real YAML, as ADR tj-4rr0la addendum 32 designed it. The dump arguments are _AGENT_ENV_DUMP.
+    """
+    services = {
+        service: {
+            'environment': dict(entries[service].values),
+            'labels': {
+                LABEL_ENV_GENERATION: str(entries[service].generation),
+                LABEL_ENV_NAMES: ','.join(entries[service].names),
+            },
+        }
+        for service in AGENT_ENV_SERVICES
+        if service in entries
+    }
+    return yaml.dump({'services': services}, **_AGENT_ENV_DUMP)
+
+
+_BAD_AGENT_ENV = f'{AGENT_ENV_FILE} is not what this server wrote: call test_up, which deletes it'
+_GENERATION = re.compile(r'[1-9][0-9]{0,8}')
+
+
+def parse_agent_env(text: str) -> dict[str, AgentEnvEntry]:
+    """The entries of a file this server wrote; Refused unless TEXT is byte for byte what render_agent_env gives for them.
+
+    Every value goes through validate_agent_env again, so a file edited by hand cannot carry anything the
+    allow-list would have refused.
+    """
+    try:
+        document = yaml.safe_load(text)
+    except yaml.YAMLError:
+        raise Refused(_BAD_AGENT_ENV) from None
+    if not isinstance(document, dict) or set(document) != {'services'} or not isinstance(document['services'], dict):
+        raise Refused(_BAD_AGENT_ENV)
+    entries: dict[str, AgentEnvEntry] = {}
+    for service, body in document['services'].items():
+        if service not in AGENT_ENV_SERVICES or not isinstance(body, dict) or set(body) != {'environment', 'labels'}:
+            raise Refused(_BAD_AGENT_ENV)
+        labels = body['labels']
+        generation = labels.get(LABEL_ENV_GENERATION) if isinstance(labels, dict) else None
+        if not isinstance(generation, str) or not _GENERATION.fullmatch(generation):
+            raise Refused(_BAD_AGENT_ENV)
+        try:
+            values = validate_agent_env(service, body['environment'])
+        except Refused:
+            raise Refused(_BAD_AGENT_ENV) from None
+        entries[service] = AgentEnvEntry(int(generation), tuple(values.items()))
+    if render_agent_env(entries) != text:
+        raise Refused(_BAD_AGENT_ENV)
+    return entries
+
+
+def read_agent_env(stack_dir: Path) -> dict[str, AgentEnvEntry]:
+    """The override sets now in the overlay, {} when there is none; Refused when the file is not one this server wrote."""
+    if not agent_env_exists(stack_dir):
+        return {}
+    data = _read_regular(agent_env_path(stack_dir))
+    if data is None:
+        raise Refused(_BAD_AGENT_ENV)
+    try:
+        text = data.decode('utf-8')
+    except UnicodeDecodeError:
+        raise Refused(_BAD_AGENT_ENV) from None
+    return parse_agent_env(text)
+
+
+def delete_agent_env(stack_dir: Path) -> None:
+    """Remove the overlay if it is there (a link is removed, not followed). test_up calls it before its down and up."""
+    try:
+        os.unlink(agent_env_path(stack_dir))
+    except FileNotFoundError:
+        return
+    except OSError as error:
+        raise Refused(f'{AGENT_ENV_FILE} could not be removed ({error.strerror}): remove it') from error
+
+
+def write_agent_env(stack_dir: Path, entries: Mapping[str, AgentEnvEntry]) -> None:
+    """Write the overlay: mode 0600, to a temporary name in the same directory and then renamed over it. No entries removes it."""
+    if not entries:
+        delete_agent_env(stack_dir)
+        return
+    text = render_agent_env(entries)
+    temporary = stack_dir / f'.{AGENT_ENV_FILE}.tmp'
+    with contextlib.suppress(FileNotFoundError):
+        os.unlink(temporary)
+    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    try:
+        os.fchmod(descriptor, 0o600)
+        with os.fdopen(descriptor, 'w', encoding='utf-8') as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, agent_env_path(stack_dir))
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(temporary)
+        raise
+
+
+def replace_agent_env(
+    current: Mapping[str, AgentEnvEntry], service: str, values: Mapping[str, str]
+) -> dict[str, AgentEnvEntry]:
+    """CURRENT with SERVICE's whole set replaced by VALUES ({} drops it). The other service's entry is untouched.
+
+    The new generation is above every generation in the file, so it never equals the label of a container
+    that still runs an older set.
+    """
+    entries = {name: entry for name, entry in current.items() if name != service}
+    if values:
+        generation = max((entry.generation for entry in current.values()), default=0) + 1
+        entries[service] = AgentEnvEntry(generation, tuple(sorted(values.items())))
+    return entries
+
+
+def test_stop_step(stack_dir: Path, service: object) -> Step:
+    """`docker compose -p trader_joe_dev stop <service>` (label-only): the container is kept, with its environment."""
+    tail = TEST_STOP_TAILS[validate_agent_env_service(service)]
+    return _dev_lifecycle_label_steps(stack_dir, list(tail))[0]
+
+
+def _testmode_service_step(stack_dir: Path, repo_host_path: Path, tail: Sequence[str]) -> Step:
+    """One file-based TEST command with the overlay last when it exists, checked as built, under test_up's step env."""
+    argv = tuple(testmode_prefix(repo_host_path, stack_dir) + list(tail))
+    check_dev_lifecycle_argv(argv, repo_host_path, stack_dir)
+    return Step(argv, stack_dir, builds(tail), env=testmode_pinned_step_env())
+
+
+def test_start_step(stack_dir: Path, repo_host_path: Path, service: object) -> Step:
+    """`up -d --wait --wait-timeout 300 --no-deps --no-recreate <service>`: a stopped container comes back as it was."""
+    return _testmode_service_step(stack_dir, repo_host_path, TEST_START_TAILS[validate_agent_env_service(service)])
+
+
+def test_env_step(stack_dir: Path, repo_host_path: Path, service: object) -> Step:
+    """`up -d --wait --wait-timeout 300 --no-deps --force-recreate <service>`: only that service, from the overlay as written."""
+    return _testmode_service_step(stack_dir, repo_host_path, TEST_ENV_TAILS[validate_agent_env_service(service)])
+
+
+# THE ONE-SERVICE LOOKUP of the three verbs' rails: every non-one-off container of the service in any state,
+# its id and its state. Stopped containers count; a `docker ps` with status=running would not see them.
+_SERVICE_CONTAINER_LINE = re.compile(r'([0-9a-f]{12,64}) ([a-z]+)')
+CONTAINER_RUNNING = 'running'
+_CONTAINER_STOPPED_STATES = ('exited', 'created')
+
+
+def service_containers_argv(service: str) -> tuple[str, ...]:
+    """`docker ps -a` over the project's non-one-off containers of SERVICE, printing `<id> <state>`."""
+    return (
+        DOCKER,
+        'ps',
+        '-a',
+        '--filter',
+        f'label={DEV_LABEL_PROJECT}={DEV_PROJECT}',
+        '--filter',
+        f'label={DEV_LABEL_SERVICE}={service}',
+        '--filter',
+        f'label={DEV_LABEL_ONEOFF}=False',
+        '--format',
+        '{{.ID}} {{.State}}',
+    )
+
+
+def check_service_containers_argv(argv: Sequence[str]) -> None:
+    """Refuse any argv but service_containers_argv() of one AGENT_ENV_SERVICES member, word for word."""
+    if not any(tuple(argv) == service_containers_argv(service) for service in AGENT_ENV_SERVICES):
+        raise Refused(
+            'the service lookup is `docker ps -a` filtered to one of data_store, data_ingest, printing id and state'
+        )
+
+
+def service_containers_step(stack_dir: Path, service: str) -> Step:
+    """The lookup of one service's containers in any state, checked as built."""
+    argv = service_containers_argv(validate_agent_env_service(service))
+    check_service_containers_argv(argv)
+    return Step(argv, stack_dir)
+
+
+def parse_service_containers(stdout: bytes) -> list[tuple[str, str]]:
+    """[(container id, state)] from the lookup; Refused on a line that is neither."""
+    found = []
+    for line in stdout.decode('utf-8', errors='replace').splitlines():
+        if not line.strip():
+            continue
+        match = _SERVICE_CONTAINER_LINE.fullmatch(line.strip())
+        if match is None:
+            raise Refused('the container lookup returned something that is not a container id and a state')
+        found.append((match.group(1), match.group(2)))
+    return found
+
+
+def pick_service_container(service: str, containers: Sequence[tuple[str, str]], expected: str | None) -> str:
+    """The id of the ONE container of SERVICE, in the state EXPECTED ('running', 'stopped', or None for any); Refused otherwise.
+
+    Several containers are refused, as for the exec verbs, rather than guessed between. The ids are never listed.
+    """
+    if not containers:
+        raise Refused(f'no {service} container in the {DEV_PROJECT} project: call test_up')
+    if len(containers) > 1:
+        raise Refused(
+            f'{len(containers)} {service} containers in the {DEV_PROJECT} project; refusing to guess which one'
+        )
+    container_id, state = containers[0]
+    if expected == CONTAINER_RUNNING and state != CONTAINER_RUNNING:
+        raise Refused(f'the {service} container is {state}, not running: test_stop needs a running one')
+    if expected == 'stopped' and state not in _CONTAINER_STOPPED_STATES:
+        raise Refused(f'the {service} container is {state}, not stopped: test_start needs a stopped one')
+    return check_container_id(container_id)
+
+
+# SEEING WHAT IS ACTIVE (addendum 32 (6)), for ps. One read-only `docker ps -a` over the project's non-one-off
+# containers, printing service|generation|names from the two labels and nothing else: never a container's
+# environment. The values are the MCP's own file's.
+def agent_env_labels_argv() -> tuple[str, ...]:
+    """`docker ps -a` over the project's non-one-off containers, printing service, env_generation and env_names."""
+    return (
+        DOCKER,
+        'ps',
+        '-a',
+        '--filter',
+        f'label={DEV_LABEL_PROJECT}={DEV_PROJECT}',
+        '--filter',
+        f'label={DEV_LABEL_ONEOFF}=False',
+        '--format',
+        f'{{{{.Label "{DEV_LABEL_SERVICE}"}}}}|{{{{.Label "{LABEL_ENV_GENERATION}"}}}}|{{{{.Label "{LABEL_ENV_NAMES}"}}}}',
+    )
+
+
+def check_agent_env_labels_argv(argv: Sequence[str]) -> None:
+    """Refuse any argv but agent_env_labels_argv(), word for word."""
+    if tuple(argv) != agent_env_labels_argv():
+        raise Refused('the env label read is `docker ps` over the project label, printing three labels')
+
+
+def agent_env_labels_step(stack_dir: Path) -> Step:
+    """The label read of ps, checked as built."""
+    argv = agent_env_labels_argv()
+    check_agent_env_labels_argv(argv)
+    return Step(argv, stack_dir)
+
+
+_LABEL_NAMES = re.compile(r'[A-Z][A-Z0-9_]*(?:,[A-Z][A-Z0-9_]*)*')
+
+
+def parse_agent_env_labels(stdout: bytes) -> dict[str, list[tuple[int | None, tuple[str, ...]]]] | None:
+    """{service: [(generation or None, names)] per container} for the two services, or None when the output cannot be read."""
+    found: dict[str, list[tuple[int | None, tuple[str, ...]]]] = {service: [] for service in AGENT_ENV_SERVICES}
+    for line in stdout.decode('utf-8', errors='replace').splitlines():
+        if not line.strip():
+            continue
+        service, _, rest = line.strip().partition('|')
+        generation, _, names = rest.partition('|')
+        if service not in found:
+            continue
+        if generation and not _GENERATION.fullmatch(generation):
+            return None
+        if names and not _LABEL_NAMES.fullmatch(names):
+            return None
+        found[service].append((int(generation) if generation else None, tuple(names.split(',')) if names else ()))
+    return found
+
+
+def describe_agent_env(
+    file_entries: Mapping[str, AgentEnvEntry] | None,
+    labels: Mapping[str, Sequence[tuple[int | None, tuple[str, ...]]]] | None,
+) -> tuple[list[str], dict[str, object]]:
+    """Ps's report: one line per service (and a structured form) from the containers' labels and the MCP's own file.
+
+    FILE_ENTRIES None means the file could not be read; LABELS None means the containers' labels could not.
+    A service is 'pending' when its container exists and the file's generation (none when it has no entry)
+    differs from the container's label (none when it has none): test_env would change what runs.
+    """
+    lines: list[str] = []
+    details: dict[str, object] = {}
+    for service in AGENT_ENV_SERVICES:
+        entry = file_entries.get(service) if file_entries is not None else None
+        if file_entries is None:
+            file_part = f'file: unreadable ({_BAD_AGENT_ENV})'
+        elif entry is None:
+            file_part = 'file: no overrides'
+        else:
+            pairs = ', '.join(f'{name}={value}' for name, value in entry.values)
+            file_part = f'file: generation {entry.generation}: {pairs}'
+        containers = labels.get(service) if labels is not None else None
+        pending: bool | None = None
+        container: dict[str, object] | None = None
+        if containers is None:
+            container_part = 'container: labels unreadable'
+        elif not containers:
+            container_part = 'container: none'
+        elif len(containers) > 1:
+            container_part = f'container: {len(containers)} containers, not compared'
+        else:
+            generation, names = containers[0]
+            container = {'generation': generation, 'names': list(names)}
+            container_part = (
+                'container: no overrides'
+                if generation is None
+                else f'container: generation {generation}: {",".join(names)}'
+            )
+            if file_entries is not None:
+                pending = (entry.generation if entry is not None else None) != generation
+        suffix = (
+            '; pending: the file differs from the running container (test_env applies it, test_up clears it)'
+            if pending
+            else ''
+        )
+        lines.append(f'agent env {service}: {container_part}; {file_part}{suffix}')
+        details[service] = {
+            'container': container,
+            'file': None if entry is None else {'generation': entry.generation, 'values': dict(entry.values)},
+            'pending': pending,
+        }
+    return lines, details

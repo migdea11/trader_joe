@@ -1,27 +1,47 @@
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Callable, Mapping
 from concurrent.futures import ThreadPoolExecutor
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime, time, timedelta
+from http import HTTPStatus
+from urllib.parse import quote
 
+from alpaca.common.exceptions import APIError
 from alpaca.data.enums import DataFeed
 from alpaca.data.historical import StockHistoricalDataClient
+from alpaca.data.historical.corporate_actions import CorporateActionsClient
 from alpaca.data.models.bars import BarSet
+from alpaca.trading.client import TradingClient
 
 from common.enums.data_select import AssetType, DataType
-from common.errors.vocabulary import InvalidRequestError, Reason, TraderJoeError
+from common.enums.data_stock import DataSource, Feed
+from common.errors.vocabulary import ExogenousError, InvalidRequestError, Reason, TraderJoeError
 from common.logging import get_logger
 from common.worker_pool import SharedWorkerPool
 from data.ingest.app.brokers.alpaca import broker_api
+from data.ingest.app.brokers.alpaca.assets import AssetListMalformed, parse_asset, parse_asset_list
 from data.ingest.app.brokers.alpaca.broker_codes import AlpacaGranularity
 from data.ingest.app.brokers.alpaca.classify import VENDOR_FAILURES, classify_vendor_error
-from data.ingest.app.brokers.broker_errors import MissingCredentialsError
+from data.ingest.app.brokers.broker_errors import MalformedCredentialsError, MissingCredentialsError
 from data.ingest.app.brokers.interface import (
+    AssetListFailure,
+    AssetListQuery,
+    AssetListResponse,
+    AssetLookupFailure,
+    AssetLookupQuery,
+    AssetNotFound,
+    AssetResponse,
     Bar,
     BarsFailure,
     BarsQuery,
     BarsResponse,
     BrokerUnsupportedError,
+    CallTally,
+    CorporateActionsFailure,
+    CorporateActionsQuery,
+    CorporateActionsResponse,
     ServedRange,
 )
+from data.ingest.app.brokers.rate_budget import RequestPriority
+from data.ingest.app.scheduler import Scheduler
 
 
 log = get_logger(__name__)
@@ -30,16 +50,66 @@ log = get_logger(__name__)
 # listing exchange.
 ALPACA_CURRENCY = 'USD'
 
+# Sent on every asset-list call: without it the vendor adds its crypto rows, which are not stock listings.
+ASSET_CLASS_US_EQUITY = 'us_equity'
+
+# The newest data a SIP request may reach on this plan (decision tj-7zjov1.306 addendum 1, spike s8b tj-0g1bf6): Alpaca
+# answers a SIP request that reaches the latest 15 minutes with a 403. The window and the margin are two constants, never
+# a fused 16, so the boundary probe of s8b can shrink the margin alone. This rule lives here and nowhere else (C1).
+SIP_RECENT_WINDOW = timedelta(minutes=15)
+# Absorbs our clock running ahead of the vendor's and the vendor's unknown boundary rounding.
+SIP_EDGE_MARGIN = timedelta(minutes=1)
+
+# The fixed start of the detail of a refused asset list; the check and a count follow, never a vendor value.
+ASSET_LIST_REFUSED = 'asset list refused as malformed'
+
+CHECK_STATUS = 'G1 HTTP status is 200'
+CHECK_CONTENT_TYPE = 'G2 content type is application/json'
+CHECK_CONTENT_LENGTH = 'G3 content length matches the body'
+
+
+def _header(headers: Mapping[str, str], name: str) -> str | None:
+    """Give a header's value by case-insensitive name, or None when absent."""
+    wanted = name.lower()
+    return next((value for key, value in headers.items() if key.lower() == wanted), None)
+
+
+def _check_list_envelope(page: broker_api.RawPage) -> None:
+    """Check the asset list's response envelope (G1 to G3); the body's own checks are parse_asset_list's.
+
+    G1 the status is exactly 200. G2 the media type is application/json. G3 a Content-Length, when present and no
+    Content-Encoding is applied, equals the body length; an absent header is not checked.
+
+    Raises:
+        AssetListMalformed: On the first violated check, counting 1 (the response).
+    """
+    if page.status_code != HTTPStatus.OK:
+        raise AssetListMalformed(CHECK_STATUS, 1)
+    content_type = _header(page.headers, 'Content-Type')
+    if content_type is None or content_type.split(';', 1)[0].strip().lower() != 'application/json':
+        raise AssetListMalformed(CHECK_CONTENT_TYPE, 1)
+    length = _header(page.headers, 'Content-Length')
+    encoded = bool(_header(page.headers, 'Content-Encoding'))
+    if length is not None and not encoded and (not length.strip().isdigit() or int(length) != len(page.content)):
+        raise AssetListMalformed(CHECK_CONTENT_LENGTH, 1)
+
 
 def _utc_now() -> datetime:
     return datetime.now(UTC)
+
+
+def _utc_day_rounded_up(moment: datetime) -> date:
+    """Give the UTC day of moment, or the next day unless moment is exactly midnight UTC."""
+    utc = moment.astimezone(UTC)
+    day = utc.date()
+    return day if utc.time() == time.min else day + timedelta(days=1)
 
 
 class AlpacaRead:
     """The Alpaca implementation of BrokerRead.
 
     Conforms structurally and inherits nothing (decision tj-j4wknb U7). The vendor machinery --
-    single-flight, the rate budget, the request key, the lazy client -- stays in broker_api and
+    single-flight, the quota scope, the request key, the lazy client -- stays in broker_api and
     is reached through it, so nothing vendor-shaped leaks into the interface.
 
     Args:
@@ -52,6 +122,16 @@ class AlpacaRead:
             reads: the future-range pre-check, the as_of a fetch is stamped with, the end its
             served_range is clamped to, and the reset a rate-limited answer is measured from.
             Injectable so tests need not sleep or patch datetime.
+        scheduler (Scheduler): The Alpaca handle's scheduler. Its quota limits pace every vendor call this
+            reader makes; nothing else does.
+        scope (str): The quota scope those calls are charged to.
+        trading_client (TradingClient | None): Client for the asset reads, or None to use this process's own
+            (broker_api.get_trading_client()), resolved on each call so it stays lazy.
+        corporate_actions_client (CorporateActionsClient | None): Client for the corporate-actions read, or None to use
+            this process's own (broker_api.get_corporate_actions_client()), resolved on each call so it stays lazy.
+        trading_scope (str | None): The trading-API quota scope the asset reads are charged to, apart from `scope`
+            so they never count against the data API. None for a reader built without asset reads; calling one then
+            is a bug and raises.
     """
 
     def __init__(
@@ -59,7 +139,18 @@ class AlpacaRead:
         client: StockHistoricalDataClient | None = None,
         executor_provider: Callable[[], ThreadPoolExecutor] | None = None,
         clock: Callable[[], datetime] = _utc_now,
+        *,
+        scheduler: Scheduler,
+        scope: str,
+        trading_client: TradingClient | None = None,
+        corporate_actions_client: CorporateActionsClient | None = None,
+        trading_scope: str | None = None,
     ) -> None:
+        self.__scheduler = scheduler
+        self.__scope = scope
+        self.__trading_client = trading_client
+        self.__corporate_actions_client = corporate_actions_client
+        self.__trading_scope = trading_scope
         self.__client = client
         self.__executor_provider = executor_provider if executor_provider is not None else SharedWorkerPool.get_instance
         self.__clock = clock
@@ -78,12 +169,13 @@ class AlpacaRead:
             query (BarsQuery): What to fetch.
 
         Returns:
-            BarsResponse | BarsFailure: The feed this deployment is entitled to, the converted
+            BarsResponse | BarsFailure: The feed resolved for this request, the converted
                 bars and the range they answer for, or the failure: UNSUPPORTED_ASSET_TYPE or
                 UNSUPPORTED_INSTRUMENT (BrokerUnsupportedError) for an instrument or adjustment
-                Alpaca cannot serve, FEED_NOT_AVAILABLE for a feed this deployment cannot,
-                RANGE_IN_FUTURE for a start at or after the clock, VENDOR_AUTH for a missing
-                credential or a 401 or 403, VENDOR_INVALID_REQUEST for a 400, VENDOR_REJECTED for
+                Alpaca cannot serve, FEED_NOT_AVAILABLE for a feed Alpaca has no tape for,
+                RANGE_IN_FUTURE for a start at or after the clock, RANGE_TOO_RECENT (with its reset_at) for a range
+                that reaches into data too recent for the account's feed, VENDOR_AUTH for a missing
+                or malformed credential or a 401 or 403, VENDOR_INVALID_REQUEST for a 400, VENDOR_REJECTED for
                 another 4xx, VENDOR_RATE_LIMITED for a 429, VENDOR_UNAVAILABLE for a 5xx, a
                 connection error or timeout, or a connection cut while the body was read, and
                 RATE_BUDGET for the rate budget's own refusal.
@@ -119,16 +211,16 @@ class AlpacaRead:
                 Reason.UNSUPPORTED_INSTRUMENT, f'Alpaca serves {ALPACA_CURRENCY} only: currency={instrument.currency!r}'
             )
 
-        # Resolved once for the whole fetch and threaded through explicitly (fetch_data_type's
-        # key, the vendor params below, and the response returned at the end) rather than
-        # re-read from sip_enabled() at each site (tj-vhboky.9). One deployment has exactly one
-        # active tape at a time (tj-rh4b7f), so it can serve a named feed only if that is the one.
-        feed = broker_api.resolve_feed()
-        if query.feed is not None and query.feed != feed:
+        # The feed of THIS request (ADR tj-xn3qa6 addendum 3): the same rule the handle's Submit intake applies, so a
+        # direct caller gets the same answer. It is threaded through explicitly (fetch_data_type's key, the vendor
+        # params below, the SIP edge and the response returned at the end).
+        feed = broker_api.resolve_feed(query.feed)
+        if feed is None:
+            named = query.feed.value if query.feed is not None else None
             return self.__refuse(
                 Reason.FEED_NOT_AVAILABLE,
-                f'This deployment cannot serve the requested feed: feed={query.feed.value}',
-                metadata={'feed': query.feed.value},
+                f'This broker cannot serve the requested feed: feed={named}',
+                metadata={'feed': named},
             )
 
         # A historical fetch: a range starting at or after now is a caller's mistake (a swapped date,
@@ -144,17 +236,41 @@ class AlpacaRead:
                 )
             )
 
-        # Resolved once, before any task is spawned, so a missing credential fails here with a
+        # Decision tj-7zjov1.306 addendum 1 (spike s8b, tj-0g1bf6): a SIP request must not reach the newest
+        # SIP_RECENT_WINDOW of data. Never clamped silently: an explicit end past the edge is refused, typed, with the
+        # instant the same request becomes servable, before any credential lookup, rate token or vendor call. An open end
+        # means 'up to what is current', which for this feed is the edge: it is sent as the edge, and served_range
+        # reports that edge (C2), never the requested (absent) end. IEX is never checked.
+        sent_end = query.end
+        if feed is Feed.SIP:
+            edge = now - SIP_RECENT_WINDOW - SIP_EDGE_MARGIN
+            reaches = query.end if query.end is not None else query.start
+            if (query.end is not None and query.end > edge) or (query.end is None and query.start >= edge):
+                bound = 'range_end' if query.end is not None else 'range_start'
+                return BarsFailure(
+                    ExogenousError(
+                        Reason.RANGE_TOO_RECENT,
+                        f'The range reaches into data too recent for this feed: {bound}={reaches.isoformat()}, '
+                        f'edge={edge.isoformat()}',
+                        metadata={'feed': feed.value, bound: reaches.isoformat()},
+                        reset_at=reaches + SIP_RECENT_WINDOW + SIP_EDGE_MARGIN,
+                        clock=self.__clock,
+                    )
+                )
+            if query.end is None:
+                sent_end = edge
+
+        # Resolved once, before any task is spawned, so a missing or malformed credential fails here with a
         # named variable rather than inside a gathered task.
         try:
             client = self.__client if self.__client is not None else broker_api.get_client()
-        except MissingCredentialsError as e:
+        except (MissingCredentialsError, MalformedCredentialsError) as e:
             return BarsFailure(e)
         params = {
             'symbol_or_symbols': instrument.symbol,
             'timeframe': AlpacaGranularity.from_granularity(query.granularity).broker_code,
             'start': query.start.isoformat(),
-            'end': query.end.isoformat() if query.end is not None else None,
+            'end': sent_end.isoformat() if sent_end is not None else None,
             # Sent to the vendor so the entitled tape is the one actually requested, rather than
             # whatever Alpaca defaults to in feed's absence.
             'feed': DataFeed(feed.value.lower()),
@@ -170,26 +286,232 @@ class AlpacaRead:
         # included, is a bug and propagates.
         try:
             bar_set = await broker_api.fetch_data_type(
-                self.__executor_provider(), query, DataType.MARKET_ACTIVITY, False, params, feed, client
+                self.__executor_provider(),
+                query,
+                DataType.MARKET_ACTIVITY,
+                False,
+                params,
+                feed,
+                client,
+                scheduler=self.__scheduler,
+                scope=self.__scope,
             )
         except TraderJoeError as e:
             return BarsFailure(e)
         except VENDOR_FAILURES as e:
-            error = classify_vendor_error(e, rate_budget=broker_api.get_rate_budget(), clock=self.__clock)
+            error = classify_vendor_error(
+                e,
+                rate_budget=self.__scheduler.window(self.__scope),
+                clock=self.__clock,
+                last_reset=broker_api.last_reset(self.__scope, self.__clock()),
+            )
             if error is None:
                 raise
             return BarsFailure(error)
 
         # A 200 answered, so this range is SERVED, whether or not it holds a bar. The vendor cannot have
-        # answered for time after it answered, so an open end, or one past now, is clamped to as_of.
+        # answered for time after it answered, so an open end, or one past now, is clamped to as_of. The end SENT is the
+        # one served: on SIP an open end was sent as the edge, and that edge is what the client is told (C2).
         as_of = self.__clock().astimezone(UTC)
-        served_end = as_of if query.end is None else min(query.end, as_of)
+        served_end = as_of if sent_end is None else min(sent_end, as_of)
         return BarsResponse(
             feed=feed,
-            bars=self.__iterate(self.__convert(bar_set, instrument.symbol, query.end)),
+            bars=self.__iterate(self.__convert(bar_set, instrument.symbol, sent_end)),
             served_range=ServedRange(query.start, served_end),
             as_of=as_of,
         )
+
+    async def get_assets(self, query: AssetListQuery) -> AssetListResponse | AssetListFailure:
+        """Fetch one of Alpaca's asset lists, whole, in one vendor call.
+
+        Sends asset_class=us_equity explicitly (without it the vendor mixes crypto rows into the list) and the one
+        status the query names, never both and never absent. The body is read as served, not through the SDK model
+        (see assets.py). Paced on the trading-API scope; the data scope is not touched.
+
+        Args:
+            query (AssetListQuery): Which list to fetch.
+
+        Returns:
+            AssetListResponse | AssetListFailure: Every asset served, or BrokerUnsupportedError
+                (UNSUPPORTED_ASSET_TYPE) for a kind that is not a stock, VENDOR_AUTH for a missing or malformed
+                credential or an unset trading host or a 401 or 403, VENDOR_RATE_LIMITED with its reset_at for a 429,
+                VENDOR_UNAVAILABLE for a 5xx, a connection error or a timeout, another vendor status as the bars
+                read classifies it, RATE_BUDGET for the rate budget's own refusal, and VENDOR_UNAVAILABLE with the
+                detail prefix ASSET_LIST_REFUSED for a list that fails an integrity check (G1 to G7,
+                tj-7zjov1.218): the whole list is refused and the attempt is retried.
+
+        Raises:
+            RuntimeError: If this reader was built without a trading scope.
+        """
+        if query.asset_type is not AssetType.STOCK:
+            return AssetListFailure(
+                BrokerUnsupportedError(
+                    Reason.UNSUPPORTED_ASSET_TYPE, f'Alpaca lists stocks only: asset_type={query.asset_type!r}'
+                )
+            )
+        try:
+            page = await self.__read_raw(
+                broker_api.ASSETS_PATH,
+                {'status': query.status.value, 'asset_class': ASSET_CLASS_US_EQUITY},
+                query.priority,
+                query.deadline,
+                query.tally,
+            )
+        except TraderJoeError as e:
+            return AssetListFailure(e)
+        except VENDOR_FAILURES as e:
+            return AssetListFailure(self.__classify(e, self.__trading_scope or self.__scope))
+        as_of = self.__clock().astimezone(UTC)
+        try:
+            _check_list_envelope(page)
+            assets = parse_asset_list(page.content, query.status.value, ASSET_CLASS_US_EQUITY)
+        except AssetListMalformed as malformed:
+            # A refused list is an ordinary transient failure the executor retries, never a raise (tj-7zjov1.218 D2).
+            refusal = ExogenousError(
+                Reason.VENDOR_UNAVAILABLE,
+                f'{ASSET_LIST_REFUSED}: {malformed}',
+                metadata={'vendor': DataSource.ALPACA_API.value},
+            )
+            refusal.__cause__ = malformed
+            log.warning('Alpaca asset list refused: %s', malformed)
+            return AssetListFailure(refusal)
+        return AssetListResponse(assets=assets, as_of=as_of)
+
+    async def get_asset(self, query: AssetLookupQuery) -> AssetResponse | AssetNotFound | AssetLookupFailure:
+        """Look up Alpaca's record for one symbol, in one vendor call.
+
+        A vendor 404 is AssetNotFound, an answer. Every other expected failure is an AssetLookupFailure, a rate limit
+        carrying its reset_at. Paced on the trading-API scope. Nothing about the record is judged: an asset the
+        vendor reports inactive or untradable is returned like any other.
+
+        Args:
+            query (AssetLookupQuery): The symbol to look up.
+
+        Returns:
+            AssetResponse | AssetNotFound | AssetLookupFailure: The record, the not-found answer, or the failure,
+                classified as get_assets does; an empty symbol is INVALID_REQUEST before any vendor call.
+
+        Raises:
+            ValueError: If the vendor's body is not one asset record. Vendor corruption, loud.
+            RuntimeError: If this reader was built without a trading scope.
+        """
+        if not query.symbol.strip():
+            return AssetLookupFailure(InvalidRequestError(Reason.INVALID_REQUEST, 'An asset lookup needs a symbol'))
+        try:
+            page = await self.__read_raw(
+                f'{broker_api.ASSETS_PATH}/{quote(query.symbol, safe="")}', None, query.priority, query.deadline, None
+            )
+        except TraderJoeError as e:
+            return AssetLookupFailure(e)
+        except VENDOR_FAILURES as e:
+            if isinstance(e, APIError) and e.status_code == HTTPStatus.NOT_FOUND:
+                return AssetNotFound(symbol=query.symbol, as_of=self.__clock().astimezone(UTC))
+            return AssetLookupFailure(self.__classify(e, self.__trading_scope or self.__scope))
+        as_of = self.__clock().astimezone(UTC)
+        return AssetResponse(asset=parse_asset(page.content), as_of=as_of)
+
+    async def get_corporate_actions(
+        self, query: CorporateActionsQuery
+    ) -> CorporateActionsResponse | CorporateActionsFailure:
+        """Fetch Alpaca's corporate actions for one symbol over a window, every page, nothing filtered.
+
+        Sends the symbol and the window's days (sorted ascending, no type filter: the store decides which types it
+        wants) and follows the page token to the end, one scheduler token per page on the DATA scope. The vendor
+        matches the symbol on either side of an action. The window is sent as UTC days: the start's own day (rounded
+        down) and the end's day rounded up, the next day unless the end is exactly midnight UTC. The vendor's
+        treatment of its end day is unconfirmed, so the read is a superset whether it counts that day inclusively or
+        not: a record beyond the window may be returned (the store keeps every record and recognises repeats by
+        vendor id and payload), and none inside it is missed. Nothing is filtered afterwards. The bodies are read as
+        served, not through the SDK model (see corporate_actions.py). A failure on any page fails the whole read.
+
+        Args:
+            query (CorporateActionsQuery): The symbol and the window.
+
+        Returns:
+            CorporateActionsResponse | CorporateActionsFailure: Every action served, or the failure: INVALID_REQUEST
+                for an empty symbol or a window that ends at or before its start (before any vendor call), VENDOR_AUTH
+                for a missing or malformed credential or a 401 or 403 (the entitlement too), VENDOR_RATE_LIMITED with
+                its reset_at for a 429, VENDOR_UNAVAILABLE for a 5xx, a connection error or a timeout, another vendor
+                status as the bars read classifies it, and RATE_BUDGET for the rate budget's own refusal.
+
+        Raises:
+            ValueError: If a page is not a corporate-actions page, or the vendor repeats a page token or never ends.
+                Vendor corruption, loud.
+        """
+        if not query.symbol.strip():
+            return CorporateActionsFailure(
+                InvalidRequestError(Reason.INVALID_REQUEST, 'A corporate-actions read needs a symbol')
+            )
+        if query.end <= query.start:
+            return CorporateActionsFailure(
+                InvalidRequestError(Reason.INVALID_REQUEST, 'A corporate-actions window must end after it starts')
+            )
+        try:
+            client = (
+                self.__corporate_actions_client
+                if self.__corporate_actions_client is not None
+                else broker_api.get_corporate_actions_client()
+            )
+        except (MissingCredentialsError, MalformedCredentialsError) as e:
+            return CorporateActionsFailure(e)
+        params = {
+            'symbols': query.symbol,
+            'start': query.start.astimezone(UTC).date().isoformat(),
+            'end': _utc_day_rounded_up(query.end).isoformat(),
+            'sort': 'asc',
+        }
+        try:
+            actions = await broker_api.read_corporate_action_pages(
+                self.__executor_provider(),
+                client,
+                params,
+                scheduler=self.__scheduler,
+                scope=self.__scope,
+                priority=query.priority,
+                deadline=query.deadline,
+                tally=query.tally,
+            )
+        except TraderJoeError as e:
+            return CorporateActionsFailure(e)
+        except VENDOR_FAILURES as e:
+            return CorporateActionsFailure(self.__classify(e, self.__scope))
+        return CorporateActionsResponse(actions=actions, as_of=self.__clock().astimezone(UTC))
+
+    async def __read_raw(
+        self,
+        path: str,
+        params: dict | None,
+        priority: RequestPriority,
+        deadline: datetime | None,
+        tally: CallTally | None,
+    ) -> broker_api.RawPage:
+        """Make one paced trading-API read. Credential and host problems raise the typed errors the callers return."""
+        if self.__trading_scope is None:
+            raise RuntimeError('AlpacaRead was built without a trading scope, so it cannot read assets')
+        client = self.__trading_client if self.__trading_client is not None else broker_api.get_trading_client()
+        return await broker_api.read_raw(
+            self.__executor_provider(),
+            client,
+            path,
+            params,
+            scheduler=self.__scheduler,
+            scope=self.__trading_scope,
+            priority=priority,
+            deadline=deadline,
+            tally=tally,
+        )
+
+    def __classify(self, error: BaseException, scope: str) -> TraderJoeError:
+        """Classify a failure of a raw read by the same table as the bars read, on the scope the read was charged to."""
+        classified = classify_vendor_error(
+            error,
+            rate_budget=self.__scheduler.window(scope),
+            clock=self.__clock,
+            last_reset=broker_api.last_reset(scope, self.__clock()),
+        )
+        if classified is None:
+            raise error
+        return classified
 
     @staticmethod
     def __refuse(reason: Reason, detail: str, metadata: dict[str, str] | None = None) -> BarsFailure:

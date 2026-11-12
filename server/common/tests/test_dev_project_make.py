@@ -24,6 +24,7 @@ from common.tests.test_ci_invariants import (
     DEV_PROJECT,
     ENV_DEFAULT_FILE,
     MAKEFILE,
+    MIGRATION_JOB_NAME,
     REPO_ROOT,
     SYSTEM_GUARD,
     SYSTEM_JOB_NAME,
@@ -325,16 +326,20 @@ def test_no_system_step_overrides_the_project():
                 assert project in (None, DEV_PROJECT), (step.get('name'), line)
 
 
-def test_only_the_system_job_sets_a_compose_project_name():
-    """Not at workflow level and not in another job: Image Build's renders stay project-free by design."""
+def test_only_the_system_and_migration_jobs_set_a_compose_project_name():
+    """Not at workflow level and not in another job: Image Build's renders stay project-free by design.
+
+    tj-7zjov1.10: the Migration Gate job starts the same test stack with make system-launch, so it sets
+    the dev project at job level for the same reason System Testing does, and to the same value.
+    """
     workflow = _load_yaml(TESTING_WORKFLOW) or {}
     assert 'COMPOSE_PROJECT_NAME' not in (workflow.get('env') or {}), workflow.get('env')
-    setters = [
-        job.get('name')
+    setters = {
+        job.get('name'): job['env']['COMPOSE_PROJECT_NAME']
         for job in (workflow.get('jobs') or {}).values()
         if 'COMPOSE_PROJECT_NAME' in ((job or {}).get('env') or {})
-    ]
-    assert setters == [SYSTEM_JOB_NAME], setters
+    }
+    assert setters == {SYSTEM_JOB_NAME: DEV_PROJECT, MIGRATION_JOB_NAME: DEV_PROJECT}, setters
 
 
 # --- compose files and .env.default ----------------------------------------------------------------

@@ -16,7 +16,7 @@ import { ExpiryType, DatasetState } from '@generated/trader_joe/proto/ui/v1/data
 import type { DatasetSummary } from '@generated/trader_joe/proto/ui/v1/data_pb'
 import { UpdateType } from '@generated/trader_joe/proto/market/v1/enums_pb'
 
-import { OPERATOR_CLIENT_ID, int64ToNumber } from '@/api'
+import { OPERATOR_CLIENT_ID, PANEL_MANAGED_TEXT, PANEL_OWNER, int64ToNumber } from '@/api'
 import type { OperatorOverride } from '@/api'
 import { granularityLabel } from '@/catalog/labels'
 import { MISSING, formatNumber, timestampToInstant } from '@/format/formatters'
@@ -60,7 +60,10 @@ const collectingFact = computed(() => {
   if (subscription.value) return stopped.value ? 'Stopped: not collecting' : 'Collecting'
   return props.dataset.collecting === true ? 'A fetch is running' : null
 })
-const heldElsewhere = computed(() => props.dataset.owner !== OPERATOR_CLIENT_ID)
+// A panel's dataset: the panel manager starts, stops and keeps it, so all four writes are withheld here
+// (disabled, with the reason). The override prompt is not offered for it.
+const panelOwned = computed(() => props.dataset.owner === PANEL_OWNER)
+const heldElsewhere = computed(() => props.dataset.owner !== OPERATOR_CLIENT_ID && !panelOwned.value)
 const owner = computed(() => (props.dataset.owner === '' ? MISSING : props.dataset.owner))
 
 // --- the Expiry Time field -----------------------------------------------------------------------
@@ -117,9 +120,9 @@ const expiryHint = computed(() =>
   ].join(' '),
 )
 const collectLabel = computed(() => titleCase(stopped.value ? 'Start Collecting' : 'Stop Collecting'))
-const canCollect = computed(() => !busy.value && overrideReady.value)
+const canCollect = computed(() => !busy.value && !panelOwned.value && overrideReady.value)
 const canApply = computed(
-  () => !busy.value && !dayProblem.value && (keepForever.value ? hasExpiry.value : true) && overrideReady.value,
+  () => !busy.value && !panelOwned.value && !dayProblem.value && (keepForever.value ? hasExpiry.value : true) && overrideReady.value,
 )
 
 function settle(outcome: WriteOutcome): boolean {
@@ -169,6 +172,7 @@ const deleteTrigger = ref<HTMLButtonElement | null>(null)
 
 // Focus follows the confirmation: into the typed field on open, back to the trigger on Cancel.
 async function openDelete(): Promise<void> {
+  if (panelOwned.value) return
   deleting.value = true
   typed.value = ''
   notice.value = null
@@ -192,7 +196,7 @@ const deleteHint = computed(() => {
 })
 
 async function deleteNow(): Promise<void> {
-  if (busy.value || !typedMatches.value || !overrideReady.value) return
+  if (busy.value || panelOwned.value || !typedMatches.value || !overrideReady.value) return
   if (settle(await store.deleteNow(override()))) emit('deleted')
 }
 
@@ -239,6 +243,22 @@ watch(
       The expiry type is fixed when the dataset is created.
     </p>
 
+    <p
+      v-if="panelOwned"
+      id="retention-panel-managed"
+      class="warning"
+      role="note"
+      data-testid="panel-managed"
+    >
+      {{ PANEL_MANAGED_TEXT }}
+      <RouterLink
+        to="/data/panels"
+        data-testid="panel-managed-link"
+      >
+        {{ titleCase('Panels') }}
+      </RouterLink>
+    </p>
+
     <div
       v-if="heldElsewhere"
       class="warning"
@@ -262,7 +282,8 @@ watch(
           type="text"
           inputmode="numeric"
           placeholder="Never"
-          :disabled="busy"
+          :disabled="busy || panelOwned"
+          :aria-describedby="panelOwned ? 'retention-panel-managed' : undefined"
           :aria-invalid="dayProblem"
           data-testid="expiry-input"
           @keydown.enter="apply"
@@ -270,7 +291,8 @@ watch(
         <button
           type="button"
           class="btn"
-          :disabled="busy"
+          :disabled="busy || panelOwned"
+          :aria-describedby="panelOwned ? 'retention-panel-managed' : undefined"
           data-testid="expiry-tomorrow"
           @click="setTomorrow"
         >
@@ -279,7 +301,8 @@ watch(
         <button
           type="button"
           class="btn"
-          :disabled="busy"
+          :disabled="busy || panelOwned"
+          :aria-describedby="panelOwned ? 'retention-panel-managed' : undefined"
           data-testid="expiry-clear"
           @click="clearField"
         >
@@ -334,6 +357,7 @@ watch(
         type="button"
         class="btn btn--primary"
         :disabled="!canApply"
+        :aria-describedby="panelOwned ? 'retention-panel-managed' : undefined"
         data-testid="expiry-apply"
         @click="apply"
       >
@@ -344,6 +368,7 @@ watch(
         type="button"
         class="btn"
         :disabled="!canCollect"
+        :aria-describedby="panelOwned ? 'retention-panel-managed' : undefined"
         data-testid="collecting-toggle"
         @click="toggleCollecting"
       >
@@ -354,7 +379,8 @@ watch(
         ref="deleteTrigger"
         type="button"
         class="btn btn--danger"
-        :disabled="busy"
+        :disabled="busy || panelOwned"
+        :aria-describedby="panelOwned ? 'retention-panel-managed' : undefined"
         data-testid="delete-open"
         @click="openDelete"
       >
@@ -377,7 +403,8 @@ watch(
         ref="typedField"
         v-model="typed"
         type="text"
-        :disabled="busy"
+        :disabled="busy || panelOwned"
+        :aria-describedby="panelOwned ? 'retention-panel-managed' : undefined"
         :aria-label="`Type ${confirmName} to confirm`"
         data-testid="delete-typed"
         @keydown.enter="deleteNow"
@@ -394,8 +421,8 @@ watch(
         <button
           type="button"
           class="btn btn--danger"
-          :disabled="busy || !typedMatches || !overrideReady"
-          :aria-describedby="deleteHint ? 'retention-delete-hint' : undefined"
+          :disabled="busy || panelOwned || !typedMatches || !overrideReady"
+          :aria-describedby="panelOwned ? 'retention-panel-managed' : deleteHint ? 'retention-delete-hint' : undefined"
           data-testid="delete-submit"
           @click="deleteNow"
         >
@@ -430,6 +457,11 @@ watch(
 </template>
 
 <style scoped>
+.warning a {
+  margin-left: 6px;
+  color: var(--tj-accent-tint);
+}
+
 .retention {
   display: flex;
   flex-direction: column;

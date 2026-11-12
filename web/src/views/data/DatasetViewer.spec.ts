@@ -10,7 +10,7 @@ import type { ColDef, IDatasource, IGetRowsParams } from 'ag-grid-community'
 
 import { BarSchema, type Bar } from '@generated/trader_joe/proto/market/v1/bar_pb'
 import { DataSource, DataType, Feed, Granularity, UpdateType } from '@generated/trader_joe/proto/market/v1/enums_pb'
-import { BarPageIndexSchema, DatasetSummarySchema, FreshnessStatus } from '@generated/trader_joe/proto/ui/v1/data_pb'
+import { BarPageIndexSchema, DatasetSummarySchema, DatasetHealthStatus } from '@generated/trader_joe/proto/ui/v1/data_pb'
 import { AccountGroup } from '@generated/trader_joe/proto/ui/v1/shell_pb'
 
 import { fakeEvents } from '@/__tests__/fakeEvents'
@@ -144,7 +144,7 @@ function summary(extra: MessageInitShape<typeof DatasetSummarySchema> = {}) {
     barCount: 3n,
     firstBar: timestampFromMs(T0),
     lastBar: timestampFromMs(T0 + 2 * DAY),
-    freshness: { status: FreshnessStatus.FRESH },
+    health: { status: DatasetHealthStatus.FRESH },
     siblings: [{ id: 'ds-1h', granularity: Granularity.ONE_HOUR }],
     ...extra,
   } as MessageInitShape<typeof DatasetSummarySchema>)
@@ -378,9 +378,16 @@ describe('header and states', () => {
   })
 
   it('an unset health shows the Unknown badge', async () => {
-    mocks.getDataset.mockResolvedValue(summary({ freshness: undefined }))
+    mocks.getDataset.mockResolvedValue(summary({ health: undefined }))
     const shell = await viewerAt('/data/datasets/ds-1/viewer')
     expect(shell.find('[data-testid="viewer-badge"]').text()).toBe('Unknown')
+  })
+
+  // tj-grna9p.168: the header badge reads DatasetSummary.health (OVERDUE is Failed).
+  it('an OVERDUE health shows the Failed badge', async () => {
+    mocks.getDataset.mockResolvedValue(summary({ health: { status: DatasetHealthStatus.OVERDUE } }))
+    const shell = await viewerAt('/data/datasets/ds-1/viewer')
+    expect(shell.find('[data-testid="viewer-badge"]').text()).toBe('Failed')
   })
 
   it('a 404 is the not-found state, not an error to retry', async () => {

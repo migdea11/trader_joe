@@ -13,6 +13,7 @@ import NotBuiltView from '@/views/data/NotBuiltView.vue'
 import UsageSidebar from '@/views/data/UsageSidebar.vue'
 import UsageView from '@/views/data/UsageView.vue'
 import NotFoundView from '@/views/NotFoundView.vue'
+import PanelListView from '@/views/panels/PanelListView.vue'
 
 declare module 'vue-router' {
   interface RouteMeta {
@@ -43,6 +44,8 @@ const shellChildren: RouteRecordRaw[] = [
     name: 'data-dataset-viewer',
     components: { default: DatasetViewerView, sidebar: DatasetViewerSidebar },
   },
+  // The Panels tab (tj-7zjov1.37): composition, settings and asset list history of the panels.
+  { path: 'data/panels', name: 'data-panels', component: PanelListView },
   // The Usage tab (tj-grna9p.62).
   // Later phases: the sub-tab is disabled in place and the route shows the placeholder.
   { path: 'data/requests', name: 'data-requests', component: NotBuiltView, meta: { title: 'Requests' } },

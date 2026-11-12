@@ -3,7 +3,7 @@
 // candles and volume chart with its zoom navigator and hover readout, and the paged bar table. Raw
 // bars only (owner ruling, tj-kqsnxb). The sidebar (DatasetViewerSidebar.vue) is the route's
 // `sidebar` view. Reached from a Datasets row click (the default destination; its Details link goes
-// on to the Dataset detail); the header badge comes from the dataset detail's freshness. No polling
+// on to the Dataset detail); the header badge comes from the dataset detail's health. No polling
 // and no events: it loads when the dataset or the range changes.
 //
 // The chart holds ONE page of raw bars: a 1,000-bar block plus a 50-bar look-ahead of the next one

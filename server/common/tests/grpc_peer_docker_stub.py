@@ -15,6 +15,13 @@ file with the docker arguments, and describes the stack through the environment:
                           store_dns           {name: address}: what data_store's resolver answers for the host
                                               of a gRPC target. The channel dials that address on the step's own
                                               port, so a real local server answers the step's real Health.Check.
+                          ingest_dns          the same for data_ingest's resolver: the peer step's reverse leg
+                                              (tj-7zjov1.49) dials data_store's StoreService health from there
+                          store_ps_id,        what `compose ps -q data_store` prints, and data_store's
+                          store_networks      NetworkSettings.Networks (the lockdown probes its gRPC port too)
+                          client_python_exit_for  {port: status}: as client_python_exit, for a test_client run
+                                              whose last argument is that port alone, so one probe leg can fail
+                                              to run while the other runs
                           reach               {container: {"address port": errno}}: what a TCP connect from that
                                               container returns, 0 for connected
                           client_resolves     {name: [address, ...]}: what `getent hosts` answers in test_client;
@@ -22,7 +29,8 @@ file with the docker arguments, and describes the stack through the environment:
                           client_python_exit  when set, a test_client run of the venv interpreter fails with this
                                               status before running anything (a missing image, a compose error)
   STUB_LOG              each call's arguments, appended as one JSON array per line
-  STUB_GRPC_LOG         each target data_store's code hands grpc.insecure_channel, before resolution
+  STUB_GRPC_LOG         each target a step's code hands grpc.insecure_channel, before resolution, with the
+                        container that dialled it
   STUB_CONNECT_LOG      each TCP connect a step makes: container, family, host, port
   STUB_POSTGRES_BIN     a directory holding a `timeout` shim that runs this file as postgres's network
 
@@ -115,18 +123,22 @@ def _probe_socket(container: str, scenario: Mapping[str, Any]) -> type:
     return ProbeSocket
 
 
-def _patch_grpc_resolution(scenario: Mapping[str, Any]) -> None:
-    """Resolve the host of each insecure_channel target through store_dns; the channel itself stays real."""
+# Whose resolver answers a gRPC target's host, by the container that dials it.
+_DNS = {DATA_STORE: 'store_dns', DATA_INGEST: 'ingest_dns'}
+
+
+def _patch_grpc_resolution(container: str, scenario: Mapping[str, Any]) -> None:
+    """Resolve the host of each insecure_channel target through CONTAINER's dns; the channel itself stays real."""
     import grpc
 
     real = grpc.insecure_channel
-    names = scenario.get('store_dns') or {}
+    names = scenario.get(_DNS[container]) or {}
 
     def insecure_channel(target: str, options=None, compression=None):
-        _log('STUB_GRPC_LOG', {'target': target})
+        _log('STUB_GRPC_LOG', {'container': container, 'target': target})
         host, separator, port = target.rpartition(':')
         if not separator or host not in names:
-            raise Unmodelled(f'data_store resolving the gRPC target {target!r}, which the scenario does not name')
+            raise Unmodelled(f'{container} resolving the gRPC target {target!r}, which the scenario does not name')
         return real(f'{names[host]}:{port}', options, compression)
 
     grpc.insecure_channel = insecure_channel
@@ -134,8 +146,8 @@ def _patch_grpc_resolution(scenario: Mapping[str, Any]) -> None:
 
 def _run_code(container: str, code: str, arguments: list[str], environment: Mapping[str, str], scenario) -> int:
     """Run a step's `python -c CODE ARGS` as CONTAINER would: its environment, its network."""
-    if container == DATA_STORE:
-        _patch_grpc_resolution(scenario)
+    if container in _DNS:
+        _patch_grpc_resolution(container, scenario)
     os.environ.clear()
     os.environ.update(environment)
     socket.socket = _probe_socket(container, scenario)
@@ -214,7 +226,10 @@ def _run(words: list[str], scenario: Mapping[str, Any]) -> int:
             print(f'{address}      {arguments[1]}')
         return 0 if addresses else 2
     if entrypoint == VENV_PYTHON and arguments[:1] == ['-c'] and len(arguments) >= 2:
-        if (status := scenario.get('client_python_exit')) is not None:
+        status = scenario.get('client_python_exit')
+        if status is None and arguments[2:]:
+            status = (scenario.get('client_python_exit_for') or {}).get(arguments[-1])
+        if status is not None:
             print(f'test_client: the interpreter did not run (exit {status})', file=sys.stderr)
             return int(status)
         return _run_code(TEST_CLIENT, arguments[1], arguments[2:], {}, scenario)
@@ -232,6 +247,12 @@ def _compose(words: list[str], scenario: Mapping[str, Any]) -> int:
         if scenario.get('ps_id'):
             print(scenario['ps_id'])
         return 0
+    if rest == ['ps', '-q', DATA_STORE]:
+        if 'store_ps_id' not in scenario:
+            raise Unmodelled('compose ps -q data_store, and the scenario names no store_ps_id')
+        if scenario['store_ps_id']:
+            print(scenario['store_ps_id'])
+        return 0
     if rest[:1] == ['exec']:
         return _exec(rest[1:], scenario)
     raise Unmodelled(f'compose {rest[:1]}')
@@ -242,12 +263,17 @@ def _inspect(words: list[str], scenario: Mapping[str, Any]) -> int:
     formats = options.get('--format', []) + options.get('-f', [])
     if len(formats) != 1 or not objects:
         raise Unmodelled(f'inspect with formats {formats} of {objects}')
-    data = {'Id': scenario.get('ps_id'), 'NetworkSettings': {'Networks': scenario.get('networks') or {}}}
+    containers = {}
+    for id_key, networks_key in (('ps_id', 'networks'), ('store_ps_id', 'store_networks')):
+        if container_id := scenario.get(id_key):
+            if container_id in containers:
+                raise Unmodelled(f'two services sharing the container id {container_id}')
+            containers[container_id] = scenario.get(networks_key) or {}
     for name in objects:
-        if not scenario.get('ps_id') or name != scenario['ps_id']:
+        if name not in containers:
             print(f'Error: No such object: {name}', file=sys.stderr)
             return 1
-        print(render_template(formats[0], data))
+        print(render_template(formats[0], {'Id': name, 'NetworkSettings': {'Networks': containers[name]}}))
     return 0
 
 

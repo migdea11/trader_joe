@@ -1,7 +1,10 @@
-"""THE RUN RECORDER: one ingest_run row around every fetch the store drives (tj-grna9p.18).
+"""THE RUN RECORDER: one ingest_run row around each fetch the store drove over the since-removed stream (tj-grna9p.18).
 
-WHY IT IS NOT PART OF THE FETCH'S TRANSACTION. data_action_request.py commits the entry and every page
-of bars at FetchDone and rolls everything back otherwise. The collection record has the opposite
+LEGACY: the push path's attempt rows (written by the delivery intake) are the record now, and nothing on the
+request path opens this recorder any more.
+
+WHY IT IS NOT PART OF THE FETCH'S TRANSACTION. The fetch this recorded (the since-removed FetchDataset stream)
+committed the entry and every page of bars at FetchDone and rolled everything back otherwise. The collection record has the opposite
 needs: the RUNNING row must be durable BEFORE the stream opens, so a second session can see the run
 while it is in flight, and a fetch that rolls back must still leave its FAILED row, since that row is
 the only trace the attempt happened. So every write here is its own short transaction on its own

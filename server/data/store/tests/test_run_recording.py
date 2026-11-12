@@ -24,7 +24,7 @@ import asyncio
 import logging
 import uuid
 from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, nullcontext
 from datetime import UTC, datetime
 
 import pytest
@@ -42,6 +42,7 @@ from data.store.app.database.models.ingest_run import INTERRUPTED_REASON, Ingest
 from data.store.app.database.models.store_dataset_entry import StoreDatasetEntry
 from data.store.app.events import IngestRunChanged
 from data.store.app.ingest import run_recording
+from data.store.tests.request_tables import create_request_tables
 from schemas.data_store.asset_dataset_store import StoreAssetDatasetBody, StoreAssetDatasetPath
 
 
@@ -81,6 +82,8 @@ async def engine(aware_sqlite_datetimes) -> AsyncIterator[AsyncEngine]:
         await connection.run_sync(
             lambda sync: IngestRun.metadata.create_all(sync, tables=[IngestRun.__table__, StoreDatasetEntry.__table__])
         )
+        # Running is read from open requests too since P35 (tj-7zjov1.28).
+        await connection.run_sync(create_request_tables)
     try:
         yield engine
     finally:
@@ -570,6 +573,8 @@ async def test_the_lifespan_sweeps_after_the_database_is_initialised(monkeypatch
     for name in ('initialize_latency_client', 'init_debugger', 'startup_logs'):
         monkeypatch.setattr(app_depends, name, lambda *args, **kwargs: None)
     monkeypatch.setattr(app_depends.SharedWorkerPool, 'worker_startup', lambda *args, **kwargs: None)
+    # The lifespan builds the StoreService host from the bind env first (tj-7zjov1.27); none is bound here.
+    monkeypatch.setattr(app_depends, 'build_grpc_host', nullcontext)
     # Never reached (the sweep stops the lifespan first), but if it were, no real DAILY refresh pass (tj-grna9p.92).
     monkeypatch.setenv('DAILY_REFRESH_ENABLED', 'false')
 

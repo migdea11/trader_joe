@@ -98,6 +98,13 @@ from common.tests.roots import REPO_ROOT, SERVER_ROOT
 CHECKOUT_CODE_ROOT = REPO_ROOT
 CHECKOUT_SERVER_DIR = SERVER_ROOT.relative_to(REPO_ROOT)
 
+# Every child this module starts is bounded by this (tj-grna9p.155). One full run stalled here for
+# about 25 minutes with no failure and no name: a child blocked on a lock, a prompt or a slow
+# filesystem hangs pytest silently. With the bound, the stuck call raises subprocess.TimeoutExpired,
+# whose message names the command, and only that test fails. Each child here finishes in seconds;
+# the margin is for a loaded machine, not for any child that is meant to run long.
+SUBPROCESS_TIMEOUT_SECONDS = 120
+
 WORKFLOW_DIR = REPO_ROOT / '.github' / 'workflows'
 COMPOSE_FILE = REPO_ROOT / 'docker-compose.yaml'
 OVERRIDE_FILE = REPO_ROOT / 'docker-compose.override.yaml'
@@ -133,12 +140,16 @@ BROKER_SECRET_PREFIXES = ('ALPACA_', 'IBKR_', 'QUESTRADE_')
 NON_SECRET_BROKER_SETTINGS = frozenset(
     {
         'ALPACA_ADJUSTMENT',
-        'ALPACA_BACKFILL_RESERVE',
-        'ALPACA_RATE_BURST',
-        'ALPACA_RATE_LIMIT_PER_SEC',
-        'ALPACA_SIP_ENABLED',
+        'ALPACA_MAX_ATTEMPTS',
+        'ALPACA_OUTGOING_BUFFER_SIZE',
+        'ALPACA_RATE_LIMIT_PER_MINUTE',
+        'ALPACA_STALL_TIMEOUT_S',
     }
 )
+
+# The ingest service's committed default env file. It travels with the service tree, so it is
+# resolved from SERVER_ROOT like the migration sites above, not from REPO_ROOT.
+INGEST_ENV_DEFAULT_FILE = SERVER_ROOT / 'data' / 'ingest' / '.env.default'
 
 # The right-hand sides that are a reference to a value held elsewhere, not the value itself:
 # one `${{ secrets.X }}` or `${{ env.X }}` expression, or a bare shell expansion `$X` / `${X}`.
@@ -543,7 +554,10 @@ _PASS_THROUGH = {
     'env-expression-in-echo': {'run': 'echo "ALPACA_API_SECRET=${{ env.ALPACA_API_SECRET }}" >> .env'},
     'docker-e-flag': {'run': 'docker run -e ALPACA_API_KEY="$ALPACA_API_KEY" image'},
     'env-mapping-secrets-expression': {'env': {'ALPACA_API_KEY': '${{ secrets.ALPACA_API_KEY }}'}},
-    'allowlisted-settings-as-literals': {'env': {'ALPACA_RATE_BURST': 5}, 'run': 'ALPACA_SIP_ENABLED=true ./x'},
+    'allowlisted-settings-as-literals': {
+        'env': {'ALPACA_RATE_LIMIT_PER_MINUTE': 60},
+        'run': 'ALPACA_MAX_ATTEMPTS=3 ./x',
+    },
 }
 _MUST_FAIL = {
     'literal-in-run': {'run': 'ALPACA_API_KEY=pk-literal ./x'},
@@ -551,7 +565,10 @@ _MUST_FAIL = {
     'secrets-expression-with-literal-fallback': {'env': {'ALPACA_API_KEY': "${{ secrets.K || 'pk-literal' }}"}},
     'lowercase-name': {'run': 'alpaca_api_key=pk-literal ./x'},
     'unlisted-questrade-token': {'env': {'QUESTRADE_REFRESH_TOKEN': 'rt-literal'}},
-    'allowlist-name-as-prefix-only': {'env': {'ALPACA_SIP_ENABLED_KEY': 'pk-literal'}},
+    'allowlist-name-as-prefix-only': {'env': {'ALPACA_MAX_ATTEMPTS_KEY': 'pk-literal'}},
+    # ALPACA_SIP_ENABLED was retired by the owner ruling of 2026-11-06 (the Alpaca feed is not config at all), so it
+    # left the allowlist: a workflow setting it to a literal is now judged a credential, failing closed.
+    'retired-feed-setting-as-literal': {'run': 'ALPACA_SIP_ENABLED=true ./x'},
     'literal-inside-quoted-echo': {'run': 'echo "ALPACA_API_KEY=pk-literal" >> .env'},
 }
 
@@ -570,6 +587,27 @@ def test_literal_credential_rule_accepts_references(step: dict):
 def test_literal_credential_rule_rejects_literals(step: dict):
     """Each of these commits a credential value, or a fallback to one, and must be caught."""
     assert _literal_broker_credentials({'jobs': {'j': {'steps': [step]}}}) != []
+
+
+def test_every_broker_setting_the_ingest_env_default_assigns_is_classified_non_secret():
+    """Every broker-prefixed name the ingest default env file assigns is on NON_SECRET_BROKER_SETTINGS.
+
+    The file is committed and public, so a broker name it assigns a value to is a plain setting by
+    construction: the credentials appear in it only as commented-out placeholders. A setting missing
+    from the allowlist is judged a credential, so a workflow setting it to a literal fails the check
+    above; a credential assigned here would be a leak in its own right. Either way the file and the
+    allowlist must agree, and this pins them together (tj-7zjov1.57).
+    """
+    assigned = [
+        name for name in _env_file_values(INGEST_ENV_DEFAULT_FILE) if name.upper().startswith(BROKER_SECRET_PREFIXES)
+    ]
+    assert assigned, f'{INGEST_ENV_DEFAULT_FILE} assigns no broker setting; this test has stopped looking'
+    unclassified = [name for name in assigned if _is_broker_credential(name)]
+    assert not unclassified, (
+        f'{INGEST_ENV_DEFAULT_FILE.name} assigns {unclassified}, which NON_SECRET_BROKER_SETTINGS does not '
+        f'classify. Add the name there if it is a plain setting; if it is a credential, remove its value '
+        f'from the committed file and rotate it.'
+    )
 
 
 @pytest.mark.parametrize('workflow', _workflow_files(), ids=lambda p: p.name)
@@ -1647,7 +1685,9 @@ RUFF_UNLINTED_SOURCE_PREFIXES = ('server/data/store/migrations/versions/', 'gen/
 
 def _run(*command: str) -> list[str]:
     """Run a command at the repository root and return its non-empty output lines."""
-    result = subprocess.run(command, cwd=REPO_ROOT, capture_output=True, text=True, check=True)
+    result = subprocess.run(
+        command, cwd=REPO_ROOT, capture_output=True, text=True, check=True, timeout=SUBPROCESS_TIMEOUT_SECONDS
+    )
     return [line.strip() for line in result.stdout.splitlines() if line.strip()]
 
 
@@ -2196,7 +2236,9 @@ def _expanded_make_variable(name: str, cwd: Path, env: dict[str, str]) -> str:
     assert shutil.which('make'), 'make is not on PATH, so the Makefile cannot be exercised'
     command = ['make', '-s', '--no-print-directory', '-C', str(cwd), '-f', str(MAKEFILE)]
     command += ['--eval', 'print-value-%: ; @: $(info $($*))', f'print-value-{name}']
-    result = subprocess.run(command, capture_output=True, text=True, env=env, check=False)
+    result = subprocess.run(
+        command, capture_output=True, text=True, env=env, check=False, timeout=SUBPROCESS_TIMEOUT_SECONDS
+    )
     assert result.returncode == 0, f'make could not evaluate {name}: {result.stderr}'
     return result.stdout.rstrip('\n')
 
@@ -2221,7 +2263,9 @@ def _run_make(cwd: Path, *arguments: str, env: dict[str, str]) -> subprocess.Com
     assert shutil.which('make'), 'make is not on PATH, so the Makefile target cannot be exercised'
     marker = _expanded_make_variable('VENV_MARKER', cwd, env)
     command = ['make', '--no-print-directory', '-C', str(cwd), '-f', str(MAKEFILE), '-o', marker]
-    return subprocess.run([*command, *arguments], capture_output=True, text=True, env=env, check=False)
+    return subprocess.run(
+        [*command, *arguments], capture_output=True, text=True, env=env, check=False, timeout=SUBPROCESS_TIMEOUT_SECONDS
+    )
 
 
 def _system_recipe_lines(cwd: Path, *arguments: str) -> list[str]:
@@ -2375,6 +2419,7 @@ def test_the_gate_does_not_collect_a_test_under_tests_system(
         text=True,
         env=_subprocess_env(),
         check=False,
+        timeout=SUBPROCESS_TIMEOUT_SECONDS,
     )
     output = result.stdout + result.stderr
     assert result.returncode == 0, f'collection in the copy failed (exit {result.returncode}):\n{output}'
@@ -2670,6 +2715,7 @@ def test_the_client_entrypoint_checks_tz_then_execs_pytest_with_its_arguments():
             text=True,
             env={**_subprocess_env(), 'TZ': zone},
             check=False,
+            timeout=SUBPROCESS_TIMEOUT_SECONDS,
         )
         if reaches:
             assert result.returncode == 0 and 'REACHED-EXEC -m pytest tests/system' in result.stdout, (
@@ -3349,6 +3395,12 @@ STACK_ALONE_SUBCOMMANDS = frozenset({'exec', 'logs', 'ps', 'down'})
 # The steps that may, and must, carry SYSTEM_TEST_DISPOSABLE_DB=1: each runs a make target behind the
 # disposable-database guard (test-system, system-launch, seed-dump), and nothing else may inherit it.
 ATTESTING_STEPS = frozenset({SYSTEM_TESTS_STEP, START_STEP, SEED_DUMP_STEP})
+# THE MIGRATION GATE (bead tj-7zjov1.10): its own job, on its own test stack, with the same rule. Start
+# System runs make system-launch behind the guard, so it carries it; the from-empty step runs make
+# migrate, which is not behind the guard and must not inherit it. The seed-upgrade step that also ran
+# make test-system went with the old migration chain (ADR tj-kg521d, tj-7zjov1.362.7).
+MIGRATION_JOB_NAME = 'Migration Gate'
+MIGRATION_ATTESTING_STEPS = frozenset({START_STEP})
 # Steps that must reach the stack, so an empty compose-invocation list cannot pass the file check.
 SYSTEM_JOB_COMPOSE_STEPS = (
     START_STEP,
@@ -3415,11 +3467,12 @@ TEARDOWN_CONDITIONS = frozenset({'failure()', 'always()'})
 # this module never spells a path that holds real credentials.
 STAGED_ENV_FILE = ENV_DEFAULT_FILE.stem
 # The write routes the lifecycle step must refuse with the secret blank, and how it probes each.
-# Six since tj-grna9p.184: the /store POST and DELETE, the /internal/asset-data POST, and the
-# /ui/v1 expiry PATCH, collecting PATCH and dataset DELETE. WHICH six is
-# test_every_secret_guarded_route_is_proven_to_refuse's job, derived from the app; this count only
-# pins the loop's length, so it must move with that set.
-LIFECYCLE_ROUTE_COUNT = 6
+# Nine since tj-7zjov1.242: the /store POST and DELETE, the /internal/asset-data POST, the
+# /ui/v1 expiry PATCH, collecting PATCH and dataset DELETE (six since tj-grna9p.184), and the three
+# /ui/v1 panel POSTs: the create, a panel's settings version and a source's settings version. WHICH
+# nine is test_every_secret_guarded_route_is_proven_to_refuse's job, derived from the app; this
+# count only pins the loop's length, so it must move with that set.
+LIFECYCLE_ROUTE_COUNT = 9
 LIFECYCLE_ROUTE_METHODS = frozenset({'POST', 'PATCH', 'DELETE'})
 LIFECYCLE_HEADER_VARIANTS = 4
 # docker compose global options that take a value, so the subcommand can be told from a value.
@@ -3454,8 +3507,14 @@ def _migration_revision_ids() -> list[str]:
                 continue
             if isinstance(target, ast.Name) and target.id == 'revision' and isinstance(node.value, ast.Constant):
                 ids.append(node.value.value)
-    assert len(ids) >= 2, f'found {ids} in {MIGRATION_VERSIONS_DIR}; the id checks below need at least two'
-    return ids
+    assert ids, f'found no revision in {MIGRATION_VERSIONS_DIR}; the id checks below need the real ids'
+    # The id checks need at least two ids ('every id' must count more than one). Since the alpha baseline (ADR
+    # tj-kg521d) the tree holds ONE revision, so a synthetic id of the same shape stands in for the next one.
+    return [*ids, *([SYNTHETIC_REVISION_ID] if len(ids) < 2 else [])]
+
+
+# Twelve hex digits, the shape alembic generates; never a real revision of the tree (asserted where it is used).
+SYNTHETIC_REVISION_ID = 'a0b1c2d3e4f5'
 
 
 def _grep_invocation(command: list[str]) -> tuple[list[str], str] | None:
@@ -3482,7 +3541,14 @@ def _grep_letters(flags: list[str]) -> str:
 def _grep(flags: list[str], pattern: str, text: str) -> str:
     """Run the real grep with a workflow's own options and pattern; exit 1 (no match) is an answer."""
     assert shutil.which('grep'), 'grep is not on PATH, so the workflow regex cannot be exercised'
-    result = subprocess.run(['grep', *flags, '--', pattern], input=text, capture_output=True, text=True, check=False)
+    result = subprocess.run(
+        ['grep', *flags, '--', pattern],
+        input=text,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=SUBPROCESS_TIMEOUT_SECONDS,
+    )
     assert result.returncode in (0, 1), f'grep {flags} {pattern!r} failed: {result.stderr}'
     return result.stdout
 
@@ -3586,6 +3652,43 @@ def test_system_job_steps_run_in_order_with_teardown_last():
         if any('docker' in shlex.split(line, comments=True) for line in _step_lines(step))
     ]
     assert not late_docker, f'steps after {STOP_STEP} still drive docker: {late_docker}'
+
+
+@pytest.mark.build_infra
+@pytest.mark.parametrize('step_name', [GRPC_BIND_STEP, PEER_STEP, LOCKDOWN_STEP])
+def test_the_grpc_steps_keep_every_probe_on_one_logical_line(step_name: str):
+    """tj-7zjov1.49: each gRPC check's inline probe is one quoted word on one logical line.
+
+    Every per-line check in this module (compose spellings, stack-only files, client options) splits a
+    step's logical lines with shlex. A `python -c` probe whose quoted code spans physical lines leaves an
+    unbalanced quote on each of them, so those checks would either raise or judge fragments of code as
+    commands. Each line must split cleanly, each `-c` must be followed by its code on the same line, and
+    that code must carry no newline.
+    """
+    run = _system_step(step_name).get('run') or ''
+    unbalanced = []
+    for line in _step_lines(_system_step(step_name)):
+        try:
+            shlex.split(line, comments=True)
+        except ValueError as error:
+            unbalanced.append(f'{error}: {line[:120]}')
+    assert not unbalanced, f'{step_name} has logical lines shlex cannot split: {unbalanced}'
+    # Most probes sit inside "$(...)", where shlex sees one word, so the -c and its code are found in the
+    # text itself: each `-c` (or the probe variable's assignment) followed, on the same logical line, by
+    # one quoted word -- and bash's single quotes admit no escape, so the first closing quote ends it.
+    folded = run.replace('\\\n', ' ')
+    code_word = r"""('[^']*'|"[^"]*")"""
+    probes = re.findall(r'(?:^|\s)-c\s+' + code_word, folded, re.MULTILINE)
+    probes += re.findall(r'^\s*\w+_code=' + code_word, folded, re.MULTILINE)
+    dangling = [
+        match
+        for match in re.findall(r'(?:^|\s)-c(\s+\S{0,40})', folded, re.MULTILINE)
+        if not re.match(r"""\s+['"]""", match)
+    ]
+    multiline = [code[:120] for code in probes if '\n' in code]
+    assert not dangling, f'{step_name} has a -c whose code is not one quoted word on its line: {dangling}'
+    assert not multiline, f'{step_name} has a multi-line -c probe: {multiline}'
+    assert probes, f'{step_name} runs no -c probe, so this check proves nothing about it'
 
 
 @pytest.mark.build_infra
@@ -4061,11 +4164,27 @@ def test_only_the_guarded_target_steps_attest_a_disposable_database():
     test_seed_dump_make.py), so Start System and Seed Dump carry it too. The property is unchanged:
     STEP-level only, on exactly the steps that run a guarded target -- ATTESTING_STEPS -- and never
     on the job, the workflow, another step, a run line or a `with:`.
+
+    tj-7zjov1.10: the Migration Gate job runs two guarded targets of its own (make system-launch and
+    make test-system), so MIGRATION_ATTESTING_STEPS is the same rule applied to that job.
     """
     for name in sorted(ATTESTING_STEPS):
         step = _system_step(name)
         assert str((step.get('env') or {}).get(SYSTEM_GUARD)) == '1', (
             f'{name} does not set {SYSTEM_GUARD}=1 in its env: {step.get("env")}'
+        )
+    # bead tj-7zjov1.10: the Migration Gate's two guarded-target steps, each exactly once.
+    migration_jobs = [
+        job
+        for job in ((_load_yaml(TESTING_WORKFLOW) or {}).get('jobs') or {}).values()
+        if (job or {}).get('name') == MIGRATION_JOB_NAME
+    ]
+    assert len(migration_jobs) == 1, f'expected one {MIGRATION_JOB_NAME!r} job, found {len(migration_jobs)}'
+    for name in sorted(MIGRATION_ATTESTING_STEPS):
+        matches = [step for step in migration_jobs[0].get('steps') or [] if step.get('name') == name]
+        assert len(matches) == 1, f'expected one {name!r} step in {MIGRATION_JOB_NAME}, found {len(matches)}'
+        assert str((matches[0].get('env') or {}).get(SYSTEM_GUARD)) == '1', (
+            f'{MIGRATION_JOB_NAME} / {name} does not set {SYSTEM_GUARD}=1 in its env: {matches[0].get("env")}'
         )
     elsewhere = []
     for path in _workflow_files():
@@ -4077,10 +4196,10 @@ def test_only_the_guarded_target_steps_attest_a_disposable_database():
                 elsewhere.append(f'{path.name} {job_id} env')
             for other in (job or {}).get('steps') or []:
                 where = f'{path.name} {job_id} / {other.get("name")}'
-                is_attesting_step = (
-                    path == TESTING_WORKFLOW
-                    and (job or {}).get('name') == SYSTEM_JOB_NAME
-                    and other.get('name') in ATTESTING_STEPS
+                job_name = (job or {}).get('name')
+                is_attesting_step = path == TESTING_WORKFLOW and (
+                    (job_name == SYSTEM_JOB_NAME and other.get('name') in ATTESTING_STEPS)
+                    or (job_name == MIGRATION_JOB_NAME and other.get('name') in MIGRATION_ATTESTING_STEPS)
                 )
                 if not is_attesting_step and SYSTEM_GUARD in (other.get('env') or {}):
                     elsewhere.append(f'{where} env')
@@ -6003,6 +6122,7 @@ def test_every_staged_env_read_takes_the_last_line_and_the_full_value(tmp_path: 
                 capture_output=True,
                 text=True,
                 check=False,
+                timeout=SUBPROCESS_TIMEOUT_SECONDS,
             )
             if result.returncode != 0 or result.stdout.rstrip('\n') != want:
                 wrong.append(f'{where} {function}(), {case}: got {result.stdout!r} (exit {result.returncode})')
@@ -6789,6 +6909,7 @@ def _ruff_codes_by_line(filename: str, source: str) -> dict[int, set[str]]:
         input=source,
         capture_output=True,
         text=True,
+        timeout=SUBPROCESS_TIMEOUT_SECONDS,
     )
     assert result.returncode in (0, 1), f'ruff did not run: exit {result.returncode}\n{result.stderr}'
     found: dict[int, set[str]] = {}
@@ -7203,7 +7324,9 @@ def _digest_services() -> list[tuple[str, str]]:
 
 def _run_source_digest(script: Path, *arguments: str) -> subprocess.CompletedProcess:
     """Run a source_digest.sh without checking its status; the status is what most tests assert."""
-    return subprocess.run([str(script), *arguments], capture_output=True, text=True, check=False)
+    return subprocess.run(
+        [str(script), *arguments], capture_output=True, text=True, check=False, timeout=SUBPROCESS_TIMEOUT_SECONDS
+    )
 
 
 def _source_digest(*arguments: str) -> list[str]:
@@ -7599,3 +7722,36 @@ def test_the_digest_moves_for_what_the_image_sees_and_only_for_that(digest_sandb
         assert after.stdout != before.stdout, 'the image would change, but the digest held still'
     else:
         assert after.stdout == before.stdout, 'the image would not change, but the digest moved'
+
+
+_SUBPROCESS_STARTERS = {'run', 'call', 'check_call', 'check_output', 'Popen'}
+
+
+def test_every_subprocess_call_in_this_module_carries_the_timeout():
+    """tj-grna9p.155: a child started here without a bound can hang the whole suite unattributed.
+
+    Read from this module's own syntax tree, so a new call added without the bound fails here by line
+    number instead of waiting for the next hang to find it. Popen is refused outright: it takes no
+    timeout, so the bound would rest on whoever remembers to pass one to wait().
+    """
+    tree = ast.parse(Path(__file__).read_text(encoding='utf-8'))
+    starts, unbounded = [], []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.module == 'subprocess':
+            unbounded.append(f'line {node.lineno}: `from subprocess import` hides calls from this check')
+        if not (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == 'subprocess'
+            and node.func.attr in _SUBPROCESS_STARTERS
+        ):
+            continue
+        starts.append(node.lineno)
+        bound = {keyword.arg: keyword.value for keyword in node.keywords}.get('timeout')
+        if node.func.attr == 'Popen':
+            unbounded.append(f'line {node.lineno}: subprocess.Popen takes no timeout')
+        elif not (isinstance(bound, ast.Name) and bound.id == 'SUBPROCESS_TIMEOUT_SECONDS'):
+            unbounded.append(f'line {node.lineno}: subprocess.{node.func.attr} without the module timeout')
+    assert starts, 'found no subprocess call in this module, so the check above read nothing'
+    assert not unbounded, f'unbounded children in {Path(__file__).name}: {unbounded}'

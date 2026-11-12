@@ -63,40 +63,45 @@ the hoist is the right repair rather than a workaround. The two worker cases at 
 handing the worker a bare ``AsyncMock()`` session: the worker now issues one real statement of its
 own before the stream, which a bare AsyncMock cannot answer, so they take this file's ``FakeSession``
 like every other case here. That is a fixture correction and changes nothing either case asserts.
+
+REPAIRED FOR THE PUSH PATH (validator, tj-7zjov1.28, P35). The POST no longer fetches: it writes an ingest_request row,
+SUBMITS it, and waits while ingest pushes the result to the delivery intake, which writes the entry (on the first
+delivered attempt, from the request row) and the bars, and publishes. So:
+  * the REFUSAL cases (the 409, the 422s at the edge) keep the fake request session -- a refusal may touch nothing
+    else -- and their "never reaches ingest" pins now read the Submit seam's recorder (RefusalOnlyClient);
+  * every case that needs the request to SUCCEED runs the whole chain over post_path.py's SQLite world: the real
+    route, submit path, waiter and delivery intake, with a Submit double that delivers. The principal and identity
+    pins follow the value through the request row to the entry the intake writes and onto the SubmitRequest; the
+    announcement pins read the INTAKE's publishes, after the delivery's commit.
 """
 
 import uuid
 from collections import defaultdict
-from contextlib import asynccontextmanager
 from datetime import UTC, datetime
-from unittest.mock import AsyncMock
 
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import Select
+from sqlalchemy.dialects import postgresql
 from sqlalchemy.dialects.postgresql import Insert as PostgresInsert
 
 from common.enums.data_select import AssetType, DataType
 from common.enums.data_stock import DataSource, ExpiryType, Feed, Granularity, UpdateType
 from common.errors.vocabulary import ExogenousError, Reason
-from data.store.app.app_depends import get_ingest_fetch_client
+from data.store.app.app_depends import get_ingest_submit_client
 from data.store.app.database.database import async_db
+from data.store.app.database.models.ingest_request import IngestRequestState
+from data.store.app.database.models.ingest_run import IngestRunTrigger
 from data.store.app.database.models.store_dataset_entry import StoreDatasetEntry
 from data.store.app.events import DatasetChange, DatasetChanged
-from data.store.app.ingest import data_action_request, run_recording
+from data.store.app.ingest import data_action_request, delivery_intake
 from data.store.app.main import app
-from data.store.tests.fetch_double import (
-    FetchScript,
-    RecordingFetchClient,
-    accepted_stream,
-    assert_body_served_range,
-    served_range_of,
-)
+from data.store.tests.post_path import Delivery, PostStore, SubmitDouble, assert_body_served_range, bar, post
+from data.store.tests.post_path import post_store as _post_store  # noqa: F401 (a fixture)
 from data.store.tests.problem_body import problem, validation_errors
+from data.store.tests.test_ui_datasets_route import aware_sqlite_datetimes  # noqa: F401 (a fixture)
 from routers.common.instance_secret import INSTANCE_SECRET_ENV_VAR, INSTANCE_SECRET_HEADER
-from routers.data_store import asset_dataset_store
-from schemas.data_ingest.fetch_dataset import FetchDatasetRequest
-from schemas.data_store.asset_dataset_store import AssetDatasetStoreCreate, StoreAssetDatasetBody, StoreAssetDatasetPath
+from schemas.data_ingest.delivery import DeliveryErrorClass, DeliveryOutcome
 
 
 pytestmark = pytest.mark.data_store
@@ -182,6 +187,58 @@ class FakeSession:
         return None
 
 
+class RefusalOnlyClient:
+    """The Submit seam for the cases where the POST must be refused BEFORE anything is sent: records, never answers.
+
+    The refusal cases run on a fake request session (no database), which is all a refusal may touch; a Submit
+    reaching this double is the failure those cases exist to catch, so it raises rather than inventing an answer.
+    """
+
+    def __init__(self) -> None:
+        self.submitted: list = []
+
+    async def submit(self, request):
+        self.submitted.append(request)
+        raise AssertionError('a request the store refuses before sending was submitted to ingest')
+
+    async def instance(self):
+        raise AssertionError('the POST never probes the instance')
+
+
+@pytest.fixture
+def store(_post_store: PostStore) -> PostStore:  # noqa: F811 (the imported fixture, under its own name here)
+    """post_path.py's SQLite world, for the cases that run the whole push path."""
+    return _post_store
+
+
+@pytest.fixture
+def clamp_stubbed(monkeypatch: pytest.MonkeyPatch) -> list:
+    """The name_change clamp (P51) stubbed to "no clamp", for the cases on a FAKE request session.
+
+    Since P51 every POST first writes, submits and awaits a corporate-actions request (the clamp's query) on the
+    request's session, before the own-overlap check. A fake session that holds a canned overlap answer cannot also
+    hold that row, so these cases stand the clamp in, as they stand ingest in. What they pin is unchanged: the 409's
+    shape, and that no BARS request is written or sent. The clamp itself, its order before the overlap check and the
+    409 reached through the real query are test_name_change_clamp.py's.
+
+    Returns:
+        list: One (symbol, start) per POST that reached the clamp.
+    """
+    seen: list = []
+
+    async def no_clamp(path, body, _db, _client, *, deadline_s):
+        seen.append((path.asset_symbol, body.start))
+        return None, uuid.uuid4()
+
+    monkeypatch.setattr(data_action_request, 'first_request_clamp', no_clamp)
+    return seen
+
+
+def _bar_attempt_written(journal: list[str], published: int) -> int:
+    """The bars attempt row's INSERT: the last ingest_run insert before the publish (the query's attempt is earlier)."""
+    return max(index for index, step in enumerate(journal[:published]) if step == 'INSERT ingest_run')
+
+
 def _sent_inserts(session: FakeSession) -> list:
     """Every INSERT the session was handed.
 
@@ -221,13 +278,13 @@ def post_dataset(monkeypatch: pytest.MonkeyPatch):
         monkeypatch: Sets INSTANCE_WRITE_SECRET for the duration of one test.
 
     Yields:
-        Callable: (session, fetch_client, body) -> httpx.Response.
+        Callable: (session, client, body) -> httpx.Response.
     """
     monkeypatch.setenv(INSTANCE_SECRET_ENV_VAR, CONFIGURED_SECRET)
 
-    def send(session: FakeSession, fetch_client: RecordingFetchClient, body: dict | None = None):
+    def send(session: FakeSession, client: 'RefusalOnlyClient', body: dict | None = None):
         app.dependency_overrides[async_db] = lambda: session
-        app.dependency_overrides[get_ingest_fetch_client] = lambda: fetch_client
+        app.dependency_overrides[get_ingest_submit_client] = lambda: client
         try:
             client = TestClient(app)
             return client.post(
@@ -248,7 +305,9 @@ def post_dataset(monkeypatch: pytest.MonkeyPatch):
 
 
 @pytest.mark.parametrize('collision_count', [1, 2], ids=['one-colliding-dataset', 'two-colliding-datasets'])
-def test_an_own_overlap_answers_409_carrying_the_ids_a_caller_can_extend(post_dataset, collision_count: int):
+def test_an_own_overlap_answers_409_carrying_the_ids_a_caller_can_extend(
+    post_dataset, clamp_stubbed, collision_count: int
+):
     """THE MAPPING tj-vhboky.8 CALLS THE ENTIRE POINT OF THE RULING, driven at the route for the first time.
 
     The status and the body are asserted as two separate claims because they fail separately, and all
@@ -307,13 +366,14 @@ def test_an_own_overlap_answers_409_carrying_the_ids_a_caller_can_extend(post_da
 
     Args:
         post_dataset: Drives the real POST route against a fake session.
+        clamp_stubbed: The name_change clamp stood in (P51), recording that it ran before the overlap check.
         collision_count: How many of the owner's own datasets the request is told it overlaps.
     """
     colliding_ids = [uuid.uuid4() for _ in range(collision_count)]
     session = FakeSession(FakeResult(rows=[(entry_id,) for entry_id in colliding_ids]))
-    fetch_client = RecordingFetchClient(FetchScript(events=accepted_stream([[0, 1], [2, 3]])))
+    client = RefusalOnlyClient()
 
-    response = post_dataset(session, fetch_client)
+    response = post_dataset(session, client)
 
     body = problem(response, status=409, reason='OWN_OVERLAP_CONFLICT')
 
@@ -345,62 +405,35 @@ def test_an_own_overlap_answers_409_carrying_the_ids_a_caller_can_extend(post_da
     assert _sent_inserts(session) == [], 'the entry was inserted despite the overlap being reported as a conflict'
     assert session.commits == 0, 'the conflicting request committed something'
     assert session.rollbacks == 1, 'the conflicting request left its transaction open instead of rolling it back'
-    assert fetch_client.requests == [], (
-        f'ingest was asked to fetch {len(fetch_client.requests)} dataset(s) for a request the store '
-        f'already knew it would refuse. The own-overlap check is one local SELECT and depends on '
-        f'nothing the fetch returns, so it must run BEFORE the stream is opened (tj-hywf7w): ingest '
-        f'performs the vendor call and takes a rate-budget slot before it yields the ack, so a fetch '
-        f'issued here is a live vendor call -- and a held single-flight slot blocking a concurrent '
-        f'legitimate fetch for the same key -- spent entirely on a 409'
+    assert client.submitted == [], (
+        f'ingest was sent {len(client.submitted)} request(s) for a request the store already knew it '
+        f'would refuse. The own-overlap check is one local SELECT and depends on nothing ingest returns, '
+        f'so it must run BEFORE the request is written and submitted (tj-hywf7w, kept by tj-7zjov1.28): a '
+        f'Submit queues work ingest will spend a vendor call and a rate-budget slot on, entirely for a 409'
     )
-    assert fetch_client.journal == [], (
-        f'the conflicting request pulled {fetch_client.journal} off the stream. NOTHING should have '
-        f'been consumed: the script carries two pages and a done behind the ack, so any entry here '
-        f'means the stream was opened for a request that was already refusable'
-    )
+    # SINCE P51 (ADR tj-26jt9w addendum 19) the overlap key is the CLAMPED start, so the clamp's corporate-actions
+    # query runs first and is the one Submit a 409 still costs (accepted: one vendor call per POST, repeats included).
+    # It is stubbed here (clamp_stubbed); the pin above is now about the BARS request, and that the clamp ran first:
+    assert clamp_stubbed == [('AAPL', datetime(2026, 1, 1, tzinfo=UTC))], 'the overlap was checked before the clamp'
 
 
-def test_a_request_overlapping_nothing_is_written_and_answers_200(post_dataset):
+@pytest.mark.asyncio
+async def test_a_request_overlapping_nothing_is_written_and_answers_200(store: PostStore, monkeypatch):
     """THE SUCCESS PATH, and it is not decoration -- it is the only thing that catches a guard that refuses too much.
 
-    Every assertion above is satisfied by a route that answers 409 to EVERYTHING, and the operand-level
-    mutation that does exactly that looks like a null-safety tidy-up: ``if colliding_ids:`` ->
-    ``if colliding_ids is not None:`` in ``upsert_entry``. ``_find_own_overlap`` returns a LIST, so the
-    empty list is not None, and every legitimate create becomes a 409 naming no ids at all.
+    Every assertion above is satisfied by a route that answers 409 to EVERYTHING, and the operand-level mutation that
+    does exactly that looks like a null-safety tidy-up (``if colliding_ids:`` -> ``if colliding_ids is not None:``).
+    A file made only of refusal cases cannot see a guard that refuses too much.
 
-    WHAT THAT MUTATION ACTUALLY MEASURED, stated as measured and not as this case's own achievement: 13
-    red, of which 12 are pre-existing cases in test_dataset_entry_identity.py that drive ``upsert_entry``
-    through to its insert, and the thirteenth is this one. So this case is NOT the only witness -- the
-    crud layer already refuses to let that mutation through. It is the witness AT THE ROUTE, which is
-    the layer the two conflict cases above live at, and without it every assertion this file makes about
-    POST /store is a refusal assertion.
-
-    That is the same shape as the lesson from the DELETE work, one function over, and it is why a
-    success case is worth its place at each layer that has refusal cases: changing ``!=`` to ``is not``
-    in ``_check_owner`` reds ONLY the happy path, because an HTTP-parsed query string is never the
-    interned constant, so identity comparison refuses the LEGITIMATE owner. A file made only of refusal
-    cases cannot see a guard that refuses too much.
-
-    The 200 body is asserted too. ``data_points`` is 0 because the scripted stream serves no bars --
-    what a populated one stores belongs to test_bar_batch_chunking.py and
-    test_dataset_fetch_transaction.py -- but the key must be there: the route's contract is a count,
-    and the worker returning None would still be a 200. A served-but-empty window is a success
-    carrying provenance, not a failure (ADR tj-fa1rpu D2), so this is also the case that pins an empty
-    fetch answering 200 rather than an error.
-
-    THE BODY GAINED served_range (TE-6 item 7, user ruling 2026-10-02). It is asserted as the WHOLE
-    member set, not just the new member: a route that answered the two old keys and dropped the new
-    one, and a route that added a fourth nobody declared, both have to red. The value is read off the
-    script's own FetchDone rather than written out, because the claim is that it was COPIED. That it
-    is not merely an echo of the REQUEST is this file's weakest angle on the property -- the fixture's
-    window happens to differ from the request's, but only incidentally -- so the deliberate
-    narrower-than-requested case lives in test_dataset_fetch_transaction.py, where it is the subject.
+    REPAIRED FOR THE PUSH PATH (validator, tj-7zjov1.28). The 200 is now the end of a longer chain, driven whole: the
+    route writes the request and submits it, ingest (the double) accepts and DELIVERS an empty success to the real
+    delivery intake, which writes the entry (once, from the request row) and the attempt row, and the waiter answers
+    from that attempt row. The body is asserted as the whole member set; served_range is the DELIVERED window, which
+    stops well short of the request's open end, so an echo of the request cannot pass.
     """
-    new_entry_id = uuid.uuid4()
-    session = FakeSession(FakeResult(rows=[]), FakeResult(stored=None), FakeResult(scalar=new_entry_id))
-    fetch_client = RecordingFetchClient()
+    client = SubmitDouble(store)
 
-    response = post_dataset(session, fetch_client)
+    response = await post(store, client, REQUEST_BODY, monkeypatch)
 
     assert response.status_code == 200, (
         f'a request that overlaps nothing answered {response.status_code}: {response.text}. The own-'
@@ -412,14 +445,13 @@ def test_a_request_overlapping_nothing_is_written_and_answers_200(post_dataset):
         f'data_points and served_range'
     )
     assert (body['message'], body['data_points']) == ('Data stored', 0)
-    assert_body_served_range(body, served_range_of(fetch_client.script))
-    assert len(_sent_inserts(session)) == 1, 'the accepted request did not insert exactly one entry'
-    assert session.commits == 1, 'the accepted request was never committed'
-    assert len(fetch_client.requests) == 1, 'the accepted request never asked ingest for its data'
-    assert fetch_client.journal == ['yield FetchAccepted', 'yield FetchDone'], (
-        f'the accepted request consumed {fetch_client.journal}: an empty stream is the ack and the '
-        f'done, and a worker that stopped at the ack would commit an entry it never finished fetching'
-    )
+    assert_body_served_range(body, client.delivery.served)
+    assert len(store.created) == 1, 'the delivered request did not write exactly one entry'
+    assert len(client.submitted) == 1, 'the accepted request was not submitted exactly once'
+    assert len(client.queries) == 1, 'the POST did not send exactly one name_change query before its bars (P51)'
+    (request,) = await store.bars_requests()
+    assert IngestRequestState(request.state) is IngestRequestState.EMPTY
+    assert request.dataset_id == store.entry_id
 
 
 # ---------------------------------------------------------------------------------------------
@@ -450,19 +482,16 @@ def test_an_offset_less_datetime_answers_422_naming_its_field_and_writes_nothing
         offset_less: Its ISO-8601 text, with no 'Z' and no offset.
     """
     session = FakeSession()
-    fetch_client = RecordingFetchClient()
+    client = RefusalOnlyClient()
 
-    response = post_dataset(session, fetch_client, REQUEST_BODY | {field: offset_less})
+    response = post_dataset(session, client, REQUEST_BODY | {field: offset_less})
 
     assert [(error['loc'], error['type']) for error in validation_errors(response)] == [
         (['body', field], 'timezone_aware')
     ], f'the 422 does not name {field} as timezone_aware: {response.text}'
     assert session.statements == [], 'a request refused at the edge still reached the database'
-    # STILL A LIVE PIN AFTER tj-3mk3u5.10, unlike the same assertion on the 409 above. The fetch now
-    # precedes the entry upsert, so an own-overlap DOES reach ingest -- but a body refused by
-    # validation never reaches the handler at all, so nothing may be fetched for it. That distinction
-    # is the whole reason the two assertions diverged.
-    assert fetch_client.requests == [], 'ingest was asked to fetch data for a request refused at the edge'
+    # A body refused by validation never reaches the handler at all, so nothing may be sent for it.
+    assert client.submitted == [], 'ingest was sent a request refused at the edge'
 
 
 # ---------------------------------------------------------------------------------------------
@@ -490,9 +519,9 @@ def test_a_create_whose_end_is_not_after_its_start_answers_422_on_the_body_and_w
         end: An end that is not after the body's start.
     """
     session = FakeSession()
-    fetch_client = RecordingFetchClient()
+    client = RefusalOnlyClient()
 
-    response = post_dataset(session, fetch_client, REQUEST_BODY | {'end': end})
+    response = post_dataset(session, client, REQUEST_BODY | {'end': end})
 
     errors = validation_errors(response)
     assert [(error['loc'], error['type']) for error in errors] == [(['body'], 'value_error')], (
@@ -500,18 +529,19 @@ def test_a_create_whose_end_is_not_after_its_start_answers_422_on_the_body_and_w
     )
     assert 'half-open' in errors[0]['msg'], errors[0]['msg']
     assert session.statements == [], 'a request refused at the edge still reached the database'
-    assert fetch_client.requests == [], 'ingest was asked to fetch data for a request refused at the edge'
+    assert client.submitted == [], 'ingest was sent a request refused at the edge'
 
 
-def test_a_create_one_microsecond_long_reaches_the_handler(post_dataset):
+@pytest.mark.asyncio
+async def test_a_create_one_microsecond_long_reaches_the_handler(store: PostStore, monkeypatch):
     """The positive that keeps the refusal above honest: [s, s + 1us) is the smallest non-empty range, and is written."""
-    session = FakeSession(FakeResult(rows=[]), FakeResult(stored=None), FakeResult(scalar=uuid.uuid4()))
-    fetch_client = RecordingFetchClient()
+    client = SubmitDouble(store)
 
-    response = post_dataset(session, fetch_client, REQUEST_BODY | {'end': '2026-01-01T00:00:00.000001Z'})
+    response = await post(store, client, REQUEST_BODY | {'end': '2026-01-01T00:00:00.000001Z'}, monkeypatch)
 
     assert response.status_code == 200, response.text
-    assert len(fetch_client.requests) == 1, 'a valid one-microsecond range never reached ingest'
+    assert len(client.submitted) == 1, 'a valid one-microsecond range never reached ingest'
+    assert client.submitted[0].bars.end == datetime(2026, 1, 1, 0, 0, 0, 1, tzinfo=UTC)
 
 
 # The GET on the same address: the dataset SEARCH, bound to StoreAssetDatasetQuery with Query().
@@ -565,184 +595,68 @@ def test_an_offset_less_search_bound_answers_422_naming_its_field_and_reads_noth
 # ---------------------------------------------------------------------------------------------
 
 
-def _only_instance(mock_call, model_type):
-    """The single argument of ``mock_call`` that is an instance of ``model_type``, positional or keyword.
-
-    Searched rather than indexed so that a later builder switching
-    ``upsert_entry_in_transaction(db, entry)`` to a keyword argument -- a legitimate refactor -- does
-    not red this test for a reason that has nothing to do with the principal it asserts.
-
-    Args:
-        mock_call: A ``unittest.mock`` call object, i.e. ``some_mock.await_args``.
-        model_type: The model class to look for.
-
-    Returns:
-        The one matching argument.
-    """
-    assert mock_call is not None, f'nothing was ever called with a {model_type.__name__}'
-    matching = [value for value in (*mock_call.args, *mock_call.kwargs.values()) if isinstance(value, model_type)]
-    assert len(matching) == 1, f'the call was handed {len(matching)} {model_type.__name__} arguments, expected 1'
-    return matching[0]
-
-
 @pytest.mark.asyncio
-async def test_the_worker_writes_and_fetches_under_the_principal_the_caller_declared(monkeypatch: pytest.MonkeyPatch):
-    """The caller's ``owner`` is the owner on BOTH models the worker builds -- the value, not just the key.
+async def test_the_post_writes_and_submits_under_the_principal_the_caller_declared(store: PostStore, monkeypatch):
+    """The caller's ``owner`` is the owner of the ENTRY and the principal ingest acts for -- the value, not just the key.
 
-    WHY THIS EXISTS WHEN THE PRODUCTION CODE IS ALREADY CORRECT. ``store_market_activity_worker`` builds
-    ``AssetDatasetStoreCreate`` and ``GetDatasetRequest`` by splatting ``request_body.model_dump()``, and
-    ``owner`` is a declared required field on both, so the splat carries it by construction and nothing
-    had to be written for it to work. The gap is that nothing RECORDED that it must: substituting the
-    value on either leg -- ``request_body.model_dump() | {'owner': 'somebody-else'}`` -- was green across
-    all 432 tests, on both legs independently.
+    WHAT EACH LEG COSTS, because they are two failures and not one. owner is identity on the entry (tj-vhboky.1
+    section 2), so a substituted owner writes the dataset under a principal that never asked for it -- a DIFFERENT
+    dataset, since owner is part of the unique key. On the Submit it makes ingest act for the wrong principal.
 
-    WHAT EACH LEG COSTS, because they are two failures and not one. owner is identity on the entry
-    (tj-vhboky.1 section 2), so a substituted owner on the ``AssetDatasetStoreCreate`` leg writes the
-    dataset under a principal that never asked for it -- and since owner is part of the ten-column
-    unique key, it is a DIFFERENT dataset, not a mislabelled one: the requesting principal's own later
-    request for the same spec will not find it, and the id it was handed belongs to somebody else's
-    entry. On the ``GetDatasetRequest`` leg it makes ingest fetch on behalf of the wrong principal;
-    ``BaseGetDatasetRequest.owner`` exists precisely "so the fetch knows which principal it is acting
-    for" and its comment already says the field "may not be invented here".
-
-    WHY THE EXISTING COVERAGE DOES NOT REACH IT, measured by the architect gate rather than assumed:
-    DROPPING owner from the splat reds two tests (the chunk-size worker test and the POST case in
-    test_http_smoke.py), because both target models then fail validation on a missing required field.
-    Those tests prove the KEY is present. Neither looks at the VALUE, and a wrong value validates
-    perfectly.
-
-    ``upsert_entry_in_transaction`` is replaced at the module level, not the session: this test asserts
-    what the worker HANDS its collaborators, so the collaborators are the seam. The scripted stream
-    serves no bars, so the bar write path is not reached at all.
-
-    REPOINTED (validator, tj-3mk3u5.10): the second leg is now a ``FetchDatasetRequest`` instead of a
-    ``GetDatasetRequest``, and ``owner`` is a declared required field on it too (SensitiveStr, "carried
-    so the fetch knows which principal it acts for and may not invent one downstream"), so both the
-    property and the mutation it guards survive the contract change unchanged.
-
-    Args:
-        monkeypatch: Replaces the worker's upsert collaborator for the duration of the test.
+    REPAIRED FOR THE PUSH PATH (validator, tj-7zjov1.28). The two legs moved: the entry is now written by the delivery
+    intake on the first delivered attempt, from the REQUEST ROW (owner = its client_label), and the outward leg is the
+    SubmitRequest. So the value is followed through three hops -- body, request row, entry -- and onto the wire.
     """
-    upsert = AsyncMock(return_value=uuid.uuid4())
-    monkeypatch.setattr(data_action_request, 'upsert_entry_in_transaction', upsert)
+    client = SubmitDouble(store)
 
-    fetch_client = RecordingFetchClient()
+    response = await post(store, client, REQUEST_BODY, monkeypatch)
 
-    # A FakeSession rather than a bare AsyncMock: the worker runs the hoisted own-overlap SELECT
-    # itself (tj-hywf7w), ahead of the collaborator this case replaces, and an AsyncMock answers it
-    # with a coroutine that `_find_own_overlap` cannot iterate. The empty row set is "no overlap"; the
-    # second answer is the pre-upsert collect lock's (tj-grna9p.189), no row yet.
-    await data_action_request.store_market_activity_worker(
-        StoreAssetDatasetPath(asset_type=AssetType.STOCK, data_type=DataType.MARKET_ACTIVITY, asset_symbol='AAPL'),
-        StoreAssetDatasetBody(**REQUEST_BODY),
-        FakeSession(FakeResult(rows=[]), FakeResult(stored=None)),
-        fetch_client,
-    )
-
-    created = _only_instance(upsert.await_args, AssetDatasetStoreCreate)
+    assert response.status_code == 200, response.text
+    ((created, _kwargs),) = store.created
     assert created.owner == DECLARED_PRINCIPAL, (
         f'the entry is being written under {created.owner!r} rather than under the principal the caller '
         f'declared ({DECLARED_PRINCIPAL!r}). owner is identity, so this is a different dataset.'
     )
-
-    assert len(fetch_client.requests) == 1, 'the worker did not ask ingest for the dataset exactly once'
-    fetched = fetch_client.requests[0]
-    assert isinstance(fetched, FetchDatasetRequest), f'ingest was asked with a {type(fetched).__name__}'
-    assert fetched.owner == DECLARED_PRINCIPAL, (
-        f'ingest is being asked to fetch on behalf of {fetched.owner!r} rather than the principal the '
+    (request,) = await store.bars_requests()
+    assert request.client_label == DECLARED_PRINCIPAL
+    (query_row,) = await store.query_requests()
+    assert query_row.client_label == DECLARED_PRINCIPAL, 'the name_change query is not labelled with the caller'
+    (submitted,) = client.submitted
+    assert submitted.owner == DECLARED_PRINCIPAL, (
+        f'ingest is being asked to act on behalf of {submitted.owner!r} rather than the principal the '
         f'caller declared ({DECLARED_PRINCIPAL!r})'
     )
 
 
 @pytest.mark.asyncio
-async def test_the_entry_and_the_fetch_agree_on_every_identity_field_the_caller_sent(monkeypatch: pytest.MonkeyPatch):
-    """The generalisation of the case above, for the fields that travel the same splat as ``owner``.
+async def test_the_entry_and_the_submit_agree_on_every_identity_field_the_caller_sent(store: PostStore, monkeypatch):
+    """The entry the delivery writes and the request ingest is sent must not DISAGREE about the request.
 
-    NOT A DUPLICATE, and the reason is the failure mode rather than the fields. The case above pins ONE
-    field by name because owner is the one that is an authorisation and identity decision. This pins
-    that the two models the worker builds do not DISAGREE about the request: they are built from two
-    separate splats of the same ``model_dump()``, so a substitution or a stale forward on one leg and
-    not the other is a real shape, and it is the shape that makes the entry claim coverage of a range
-    the fetch was never asked for -- this epic's stated failure class.
+    They are built at two different times by two different components (the Submit when the POST arrives, the entry
+    when ingest delivers), both from the request row, so a stale or substituted field on one leg is a real shape --
+    and it is the one that makes the entry claim coverage of a range ingest was never asked for.
 
-    IT EARNED ITS PLACE ON TWO MUTATIONS NOTHING ELSE CAUGHT, measured against the suite as it stood:
-      * recomputing ``expiry`` on the fetch leg instead of forwarding the body's --
-        ``model_dump() | {'expiry': datetime.now(UTC) + timedelta(days=2)}`` -- which is exactly the
-        plausible repair, since the body computes that default itself. 1 red: this case. The entry then
-        records one expiry and ingest is told another.
-      * ``data_types=[request_path.data_type]`` -> ``data_types=[]``. 1 red: this case. The entry is
-        written and ingest is asked for nothing, so the dataset exists and stays empty.
-    The owner substitutions red this case too, but the case above is what names those.
-
-    ONE OF THOSE TWO IS NOW DEAD, AND IT IS NOT REPLACED BY A SOFTER VERSION OF ITSELF (validator,
-    tj-3mk3u5.10). ``FetchDatasetRequest`` does not declare ``expiry`` -- "exactly the fields a reader
-    consumes, and nothing more"; retention is the store's business and no reader ever touched it -- so
-    the expiry mutation cannot be written any more and the two models cannot disagree about a field one
-    of them does not have. Comparing it would be comparing a value against ``AttributeError``.
-
-    WHAT TAKES ITS PLACE IS A FIELD THAT IS LOAD-BEARING ON THE NEW CONTRACT AND WAS NOT ON THE OLD
-    ONE. ``update_type`` travels the same splat and selects ingest's RATE BUDGET PRIORITY (STREAM ->
-    LIVE, STATIC -> BACKFILL, anything else -> INTERACTIVE), so a substituted value makes a backfill
-    compete with live traffic, or the reverse, while the entry records the update type the caller
-    actually asked for. The second new assertion is that the fetch names NO feed: an absent feed means
-    "the deployment decides", and a worker that started naming one would be steering a tape it is not
-    entitled to choose (tj-3mk3u5.22 Q5 -- ingest can only CHECK a named feed, never be steered by it,
-    so a wrong guess turns an ordinary fetch into a refusal).
-
-    The ``data_types`` mutation is unchanged: the new contract carries the same list field.
-
-    WHAT THIS CASE DOES NOT REACH, measured rather than assumed:
-    ``data_types=[request_path.data_type]`` -> ``data_types=[DataType.MARKET_ACTIVITY]``, i.e. hard-coding
-    the forwarded value, is GREEN across the whole suite. ``REQUEST_BODY`` drives this route with one
-    ``data_type`` only, so the literal and the forwarded value are the same string in the only request that
-    runs. That gap is left open deliberately: closing it would mean parametrising over ``DataType``, and a
-    case asserting that a ``quote`` request forwards ``data_types=[quote]`` would pin behaviour nobody
-    designed -- the route accepts all three members with no narrowing and then calls a worker named for
-    market activity regardless. Pinning that would freeze an accident and make the eventual narrowing look
-    like a regression, so the assertion message below claims only the emptied half.
-
-    ``data_type`` is deliberately not compared: the entry carries it and ``FetchDatasetRequest`` takes
-    a ``data_types`` LIST instead, which the worker builds from the path.
-
-    Args:
-        monkeypatch: Replaces the worker's upsert collaborator for the duration of the test.
+    THE FEED is asserted apart: the Submit names NONE (an absent feed means "the deployment decides"; naming one would
+    turn an ordinary request into a check ingest can only refuse), and the entry takes the tape the delivery header
+    RESOLVED, never a guess. data_types is the one data type of the path; a hard-coded list is beyond this case (the
+    fixture drives one data type) and is not claimed.
     """
-    upsert = AsyncMock(return_value=uuid.uuid4())
-    monkeypatch.setattr(data_action_request, 'upsert_entry_in_transaction', upsert)
+    client = SubmitDouble(store)
 
-    fetch_client = RecordingFetchClient()
+    response = await post(store, client, REQUEST_BODY, monkeypatch)
 
-    request_path = StoreAssetDatasetPath(
-        asset_type=AssetType.STOCK, data_type=DataType.MARKET_ACTIVITY, asset_symbol='AAPL'
-    )
-    # See the case above for why this is a FakeSession and not a bare AsyncMock (tj-hywf7w).
-    await data_action_request.store_market_activity_worker(
-        request_path,
-        StoreAssetDatasetBody(**REQUEST_BODY),
-        FakeSession(FakeResult(rows=[]), FakeResult(stored=None)),
-        fetch_client,
-    )
-
-    created = _only_instance(upsert.await_args, AssetDatasetStoreCreate)
-    fetched = fetch_client.requests[0]
-
-    for field in ('owner', 'asset_symbol', 'asset_type', 'source', 'granularity', 'start', 'end', 'update_type'):
+    assert response.status_code == 200, response.text
+    ((created, _kwargs),) = store.created
+    fetched = client.submitted[0].bars
+    for field in ('asset_symbol', 'asset_type', 'source', 'granularity', 'start', 'end', 'update_type'):
         assert getattr(created, field) == getattr(fetched, field), (
-            f'the entry being written and the fetch being requested disagree on {field}: '
+            f'the entry being written and the request sent disagree on {field}: '
             f'{getattr(created, field)!r} vs {getattr(fetched, field)!r}'
         )
-    assert fetched.feed is None, (
-        f'the fetch names feed={fetched.feed!r}. No caller can ask for a tape today, and an absent '
-        f'feed is what means "the deployment decides" -- naming one turns a fetch ingest would have '
-        f'served into one it can only check and refuse'
-    )
-    assert fetched.data_types == [request_path.data_type], (
-        'the fetch asks for a data type the request path did not name -- an emptied data_types list '
-        'would leave the entry claiming coverage of bars nobody asked ingest for. A HARD-CODED list is '
-        'beyond the reach of this case and is not claimed here: the fixture drives one data_type, so the '
-        'literal and the forwarded value are the same string in the only request that runs -- see the '
-        'docstring for why widening the fixture is the wrong repair'
-    )
+    assert fetched.feed is None, f'the Submit names feed={fetched.feed!r}: a POST that names no tape must send none'
+    assert created.feed is client.delivery.feed, 'the entry does not carry the tape the delivery resolved'
+    assert fetched.data_types == [DataType.MARKET_ACTIVITY], 'the Submit asks for a data type the path did not name'
+    assert created.data_type is DataType.MARKET_ACTIVITY
 
 
 # ---------------------------------------------------------------------------------------------
@@ -986,97 +900,124 @@ def test_the_store_openapi_documents_the_search_filters_as_nullable_names(field:
 
 # ---------------------------------------------------------------------------------------------
 # tj-grna9p.73 item 4: DatasetChanged after the commit; tj-grna9p.71: the STREAM create refusal
+#
+# REPAIRED FOR THE PUSH PATH (validator, tj-7zjov1.28). The route publishes nothing any more: the commit that writes
+# the entry and the bars is the DELIVERY INTAKE's, so the intake publishes after it, and these cases read the intake's
+# publishes (post_path.py journals them beside the statements and commits). What each pinned is unchanged: one event,
+# naming the entry the upsert returned, after the commit; nothing for a write that never committed.
 # ---------------------------------------------------------------------------------------------
 
 
-@pytest.fixture
-def announced(monkeypatch: pytest.MonkeyPatch) -> list:
-    """The route's DatasetChanged publishes, and the recorder kept off any database.
-
-    own_session refusing is the recorder's best-effort path (test_run_recording.py pins it): the run is not
-    recorded, the fetch goes ahead, and the handle still learns the dataset id from the ack. It keeps this
-    file at the unit tier rather than letting the recorder dial the Postgres the environment names.
-    """
-
-    @asynccontextmanager
-    async def no_database():
-        raise ConnectionRefusedError('no database at the unit tier')
-        yield  # pragma: no cover
-
-    monkeypatch.setattr(run_recording, 'own_session', no_database)
-    monkeypatch.setattr(run_recording, 'publish', lambda event: None)
-    seen: list = []
-    monkeypatch.setattr(asset_dataset_store, 'publish', seen.append)
-    return seen
+def _changed(store: PostStore) -> list:
+    return [event_ for event_ in store.events if isinstance(event_, DatasetChanged)]
 
 
-def test_a_stored_dataset_is_announced_updated_once_after_its_commit(post_dataset, announced, monkeypatch):
-    """UPDATED, not CREATED: the builder left xmax unread, so a create cannot be told from a repeat (reported).
-
-    The event names the id the ack's upsert returned, and it is published only once the fetch transaction
-    has committed -- an event for a write that then rolled back would be a lie the UI acts on.
-    """
-    new_entry_id = uuid.uuid4()
-    session = FakeSession(FakeResult(rows=[]), FakeResult(stored=None), FakeResult(scalar=new_entry_id))
-    commits_at_publish: list[int] = []
-
-    def record(event) -> None:
-        announced.append(event)
-        commits_at_publish.append(session.commits)
-
-    monkeypatch.setattr(asset_dataset_store, 'publish', record)
-
-    response = post_dataset(session, RecordingFetchClient())
+@pytest.mark.asyncio
+async def test_a_stored_dataset_is_announced_updated_once_after_its_commit(store: PostStore, monkeypatch):
+    """UPDATED, not CREATED: the upsert does not tell a create from a repeat (reported). After the delivery commits."""
+    response = await post(store, SubmitDouble(store), REQUEST_BODY, monkeypatch)
 
     assert response.status_code == 200, response.text
-    assert announced == [DatasetChanged(new_entry_id, DatasetChange.UPDATED)]
-    assert commits_at_publish == [1], 'the dataset was announced before the fetch transaction committed'
-
-
-def test_a_refused_or_failed_store_announces_nothing(post_dataset, announced):
-    """A rolled-back write publishes nothing: an own-overlap 409, and a fetch that breaks after its ack."""
-    overlap = FakeSession(FakeResult(rows=[(uuid.uuid4(),)]))
-    assert post_dataset(overlap, RecordingFetchClient()).status_code == 409
-
-    broken = FakeSession(FakeResult(rows=[]), FakeResult(stored=None), FakeResult(scalar=uuid.uuid4()))
-    script = FetchScript(
-        events=accepted_stream()[:-1], raises=ExogenousError(Reason.PEER_INTERNAL, 'broke after the ack')
+    assert _changed(store) == [DatasetChanged(store.entry_id, DatasetChange.UPDATED)]
+    journal = store.journal
+    published = journal.index('publish DatasetChanged')
+    written = _bar_attempt_written(journal, published)
+    assert written < journal.index('COMMIT', written) < published, (
+        f'the dataset was announced before the delivery transaction committed: {journal}'
     )
-    response = post_dataset(broken, RecordingFetchClient(script))
-    assert response.status_code == 502, response.text
-    assert broken.rollbacks == 1 and broken.commits == 0
 
-    assert announced == [], 'a write that never committed was announced'
+
+@pytest.mark.asyncio
+async def test_a_refused_or_failed_store_announces_nothing(monkeypatch, store: PostStore):
+    """Nothing committed, nothing announced: an own-overlap 409, and a request ingest failed for good.
+
+    The 409 runs through the real chain since P51 (the clamp's query is written and answered first, so a fake
+    session can no longer stand in): an entry of the same owner already overlaps the body's window.
+    """
+    await store.add(
+        StoreDatasetEntry(
+            id=uuid.uuid4(),
+            created_at=datetime(2025, 12, 1, tzinfo=UTC),
+            updated_at=datetime(2025, 12, 1, tzinfo=UTC),
+            owner=DECLARED_PRINCIPAL,
+            source=DataSource.ALPACA_API,
+            feed=Feed.IEX,
+            asset_symbol='AAPL',
+            asset_type=AssetType.STOCK,
+            data_type=DataType.MARKET_ACTIVITY,
+            granularity=Granularity.ONE_DAY,
+            start=datetime(2025, 12, 1, tzinfo=UTC),
+            end=datetime(2026, 2, 1, tzinfo=UTC),
+            expiry_type=ExpiryType.BULK,
+            update_type=UpdateType.STATIC,
+        )
+    )
+    refused = SubmitDouble(store)
+    problem(await post(store, refused, REQUEST_BODY, monkeypatch), status=409, reason='OWN_OVERLAP_CONFLICT')
+    assert refused.submitted == [] and await store.bars_requests() == [], 'a 409 wrote or sent a bars request'
+
+    failed = SubmitDouble(
+        store, Delivery(outcome=DeliveryOutcome.FAILED, error_class=DeliveryErrorClass.PERMANENT, detail='no such')
+    )
+    # Another owner, so the seeded entry above is not its own overlap.
+    response = await post(store, failed, REQUEST_BODY | {'owner': 'another-strategy'}, monkeypatch)
+    problem(response, status=422, reason='VENDOR_REJECTED')
+
+    assert _changed(store) == [], 'a write that never stored a dataset was announced'
+    assert store.created == [], 'a failed request wrote an entry'
 
 
 @pytest.mark.parametrize('update_type', ['STREAM', 'stream'])
-def test_a_stream_create_answers_422_invalid_request_and_never_reaches_ingest(post_dataset, announced, update_type):
-    """tj-grna9p.71: refused at the edge as INVALID_REQUEST, naming STREAM, before any SQL or fetch."""
+def test_a_stream_create_answers_422_invalid_request_and_never_reaches_ingest(post_dataset, update_type):
+    """tj-grna9p.71: refused at the edge as INVALID_REQUEST, naming STREAM, before any SQL or Submit."""
     session = FakeSession()
-    fetch_client = RecordingFetchClient()
+    client = RefusalOnlyClient()
     body = REQUEST_BODY | {'update_type': update_type, 'expiry_type': 'ROLLING'}
 
-    response = post_dataset(session, fetch_client, body)
+    response = post_dataset(session, client, body)
 
     problem_body = problem(response, status=422, reason='INVALID_REQUEST')
     assert 'STREAM' in response.text, problem_body
-    assert session.statements == [] and fetch_client.requests == [] and announced == []
+    assert session.statements == [] and client.submitted == []
 
 
 @pytest.mark.parametrize('update_type', ['STATIC', 'DAILY'])
-def test_a_non_stream_create_without_the_new_fields_still_reaches_the_handler(post_dataset, announced, update_type):
-    """ready_by and best_effort are optional: a body from before them is accepted unchanged."""
-    session = FakeSession(FakeResult(rows=[]), FakeResult(stored=None), FakeResult(scalar=uuid.uuid4()))
+@pytest.mark.asyncio
+async def test_a_non_stream_create_without_the_new_fields_still_reaches_the_handler(
+    store: PostStore, monkeypatch, update_type
+):
+    """ready_by and best_effort are optional: a body from before them is accepted unchanged, and sends neither."""
     extra = {} if update_type == 'STATIC' else {'update_type': 'DAILY', 'expiry_type': 'ROLLING'}
+    client = SubmitDouble(store)
 
-    response = post_dataset(session, RecordingFetchClient(), REQUEST_BODY | extra)
+    response = await post(store, client, REQUEST_BODY | extra, monkeypatch)
 
     assert response.status_code == 200, response.text
+    (submitted,) = client.submitted
+    assert (submitted.ready_by, submitted.best_effort) == (None, False)
 
 
-def test_a_naive_ready_by_is_a_422_naming_the_field(post_dataset, announced):
-    response = post_dataset(FakeSession(), RecordingFetchClient(), REQUEST_BODY | {'ready_by': '2026-02-01T09:30:00'})
+def test_a_naive_ready_by_is_a_422_naming_the_field(post_dataset):
+    response = post_dataset(FakeSession(), RefusalOnlyClient(), REQUEST_BODY | {'ready_by': '2026-02-01T09:30:00'})
     assert [error['loc'] for error in validation_errors(response)] == [['body', 'ready_by']]
+
+
+@pytest.mark.asyncio
+async def test_an_aware_ready_by_is_the_requests_deadline(store: PostStore, monkeypatch):
+    """A POST's ready_by is the caller's deadline (owner ruling R4): written on the request and sent with the Submit."""
+    client = SubmitDouble(store)
+
+    response = await post(store, client, REQUEST_BODY | {'ready_by': '2026-02-01T14:30:00Z'}, monkeypatch)
+
+    assert response.status_code == 200, response.text
+    deadline = datetime(2026, 2, 1, 14, 30, tzinfo=UTC)
+    assert client.submitted[0].ready_by == deadline
+    (request,) = await store.bars_requests()
+    assert request.ready_by == deadline
+    # The clamp's query waits under the same deadline: it carries the caller's ready_by too.
+    assert client.queries[0].ready_by == deadline
+    (query_row,) = await store.query_requests()
+    assert query_row.ready_by == deadline
 
 
 # ---------------------------------------------------------------------------------------------
@@ -1086,37 +1027,39 @@ def test_a_naive_ready_by_is_a_422_naming_the_field(post_dataset, announced):
 
 @pytest.mark.parametrize('collect', [True, False])
 @pytest.mark.parametrize('static', [{}, {'update_type': 'STATIC', 'expiry_type': 'BULK'}], ids=['default', 'named'])
-def test_collect_on_a_static_create_answers_422_invalid_request_and_never_reaches_ingest(
-    post_dataset, announced, collect, static
-):
+def test_collect_on_a_static_create_answers_422_invalid_request_and_never_reaches_ingest(post_dataset, collect, static):
     """Any value, true included, on STATIC: refused at the edge with the subscriptions-only text."""
     session = FakeSession()
-    fetch_client = RecordingFetchClient()
+    client = RefusalOnlyClient()
 
-    response = post_dataset(session, fetch_client, REQUEST_BODY | static | {'collect': collect})
+    response = post_dataset(session, client, REQUEST_BODY | static | {'collect': collect})
 
     problem_body = problem(response, status=422, reason='INVALID_REQUEST')
     assert 'collect applies to subscriptions only' in response.text, problem_body
-    assert session.statements == [] and fetch_client.requests == [] and announced == []
+    assert session.statements == [] and client.submitted == []
 
 
 @pytest.mark.parametrize('collect', [True, False, None])
-def test_collect_on_a_daily_create_is_accepted_at_the_edge(post_dataset, announced, collect):
-    """true, false and an explicit null all reach the handler on DAILY (what false then does is tj-grna9p.175)."""
-    session = FakeSession(FakeResult(rows=[]), FakeResult(stored=None), FakeResult(scalar=uuid.uuid4()))
+@pytest.mark.asyncio
+async def test_collect_on_a_daily_create_is_accepted_at_the_edge(store: PostStore, monkeypatch, collect):
+    """true, false and an explicit null all reach the handler on DAILY, and reach the request row as sent (note H)."""
     body = REQUEST_BODY | {'update_type': 'DAILY', 'expiry_type': 'ROLLING', 'collect': collect}
 
-    response = post_dataset(session, RecordingFetchClient(), body)
+    response = await post(store, SubmitDouble(store), body, monkeypatch)
 
     assert response.status_code == 200, response.text
+    (request,) = await store.bars_requests()
+    assert request.collect is collect
+    assert request.expiry_type == ExpiryType.ROLLING.value
+    assert request.trigger is IngestRunTrigger.REQUEST
 
 
 # ---------------------------------------------------------------------------------------------
 # tj-grna9p.189 (the tj-hhy3dk addendum): a POST that FLIPS collect publishes RETIRED or RESUMED
 #
-# The stored collect is what the pre-upsert lock reads (the second planned answer). A flip is an
-# EXPLICIT collect that differs from a stored one; an omitted collect flips nothing, and a create has
-# no stored value to flip. Every non-flip stays UPDATED, as it was.
+# The stored collect is what the intake's pre-upsert lock reads (PostStore.stored_collect). A flip is an EXPLICIT
+# collect that differs from a stored one; an omitted collect flips nothing, and a create has no stored value to flip.
+# Every non-flip stays UPDATED, as it was.
 # ---------------------------------------------------------------------------------------------
 
 DAILY_BODY = REQUEST_BODY | {'update_type': 'DAILY', 'expiry_type': 'ROLLING'}
@@ -1136,49 +1079,64 @@ DAILY_BODY = REQUEST_BODY | {'update_type': 'DAILY', 'expiry_type': 'ROLLING'}
         pytest.param(None, {}, DatasetChange.UPDATED, id='create-omitted-is-updated'),
     ],
 )
-def test_a_post_publishes_retired_or_resumed_on_a_collect_flip_and_updated_otherwise(
-    post_dataset, announced, monkeypatch, stored, sent, change
+@pytest.mark.asyncio
+async def test_a_post_publishes_retired_or_resumed_on_a_collect_flip_and_updated_otherwise(
+    store: PostStore, monkeypatch, stored, sent, change
 ):
-    """Exactly one DatasetChanged, naming the dataset the upsert returned, published after the commit."""
-    entry_id = uuid.uuid4()
-    session = FakeSession(FakeResult(rows=[]), FakeResult(stored=stored), FakeResult(scalar=entry_id))
-    commits_at_publish: list[int] = []
+    """Exactly one DatasetChanged, naming the dataset the upsert returned, published after the delivery's commit."""
+    store.stored_collect = stored
 
-    def record(event) -> None:
-        announced.append(event)
-        commits_at_publish.append(session.commits)
-
-    monkeypatch.setattr(asset_dataset_store, 'publish', record)
-
-    response = post_dataset(session, RecordingFetchClient(), DAILY_BODY | sent)
+    response = await post(store, SubmitDouble(store), DAILY_BODY | sent, monkeypatch)
 
     assert response.status_code == 200, response.text
-    assert announced == [DatasetChanged(entry_id, change)], f'stored {stored}, sent {sent}: published {announced}'
-    assert commits_at_publish == [1], 'the change was announced before the fetch transaction committed'
-
-
-def test_a_flipping_post_that_rolls_back_announces_nothing(post_dataset, announced):
-    """A flip whose fetch breaks after the ack never committed, so neither RETIRED nor anything else is published."""
-    broken = FakeSession(FakeResult(rows=[]), FakeResult(stored=True), FakeResult(scalar=uuid.uuid4()))
-    script = FetchScript(
-        events=accepted_stream()[:-1], raises=ExogenousError(Reason.PEER_INTERNAL, 'broke after the ack')
+    assert _changed(store) == [DatasetChanged(store.entry_id, change)], f'stored {stored}, sent {sent}: {store.events}'
+    published = store.journal.index('publish DatasetChanged')
+    assert 'COMMIT' in store.journal[_bar_attempt_written(store.journal, published) : published], (
+        'the change was announced before the delivery transaction committed'
     )
 
-    response = post_dataset(broken, RecordingFetchClient(script), DAILY_BODY | {'collect': False})
 
-    assert response.status_code == 502, response.text
-    assert broken.commits == 0
-    assert announced == [], 'a flip that never committed was announced'
+@pytest.mark.asyncio
+async def test_a_flipping_post_whose_delivery_rolls_back_announces_nothing(store: PostStore, monkeypatch):
+    """A flip whose delivery transaction fails never committed, so neither RETIRED nor anything else is published.
+
+    The bar write fails inside the delivery (as a database that drops mid-write would); the intake rolls the whole
+    attempt back, the request stays open (ingest would redeliver), and the POST answers the deadline (504) while the
+    request keeps running.
+    """
+    store.stored_collect = True
+
+    async def broken(*_args, **_kwargs):
+        raise ExogenousError(Reason.DATABASE_UNAVAILABLE, 'the database dropped mid-write')
+
+    monkeypatch.setattr(delivery_intake, 'write_market_activity_in_transaction', broken)
+    monkeypatch.setenv(data_action_request.VERDICT_DEADLINE_ENV, '0.3')
+    client = SubmitDouble(store, Delivery(bars=[bar(0)]))
+
+    response = await post(store, client, DAILY_BODY | {'collect': False}, monkeypatch)
+
+    problem(response, status=504, reason='DEADLINE')
+    assert _changed(store) == [], 'a flip that never committed was announced'
+    (request,) = await store.bars_requests()
+    assert IngestRequestState(request.state).is_open, 'a rolled-back delivery finished the request'
+    assert request.dataset_id is None, 'a rolled-back delivery left its entry id on the request'
 
 
 @pytest.mark.parametrize('stored', [True, False], ids=['collecting', 'stopped'])
-def test_a_repeat_post_without_collect_writes_no_collect_on_conflict(post_dataset, announced, stored):
-    """The route end of the chain: an SDK retry's body (no collect) reaches the upsert as omitted, not as a default."""
-    session = FakeSession(FakeResult(rows=[]), FakeResult(stored=stored), FakeResult(scalar=uuid.uuid4()))
+@pytest.mark.asyncio
+async def test_a_repeat_post_without_collect_writes_no_collect_on_conflict(store: PostStore, monkeypatch, stored):
+    """The route end of the chain: an SDK retry's body (no collect) reaches the entry upsert as omitted, not a default.
 
-    response = post_dataset(session, RecordingFetchClient(), DAILY_BODY)
+    The upsert statement is the one the REAL crud function builds for the delivery (post_path.py captures it rather
+    than running its Postgres-only ON CONFLICT), so its SET clause is what production would send.
+    """
+    store.stored_collect = stored
+
+    response = await post(store, SubmitDouble(store), DAILY_BODY, monkeypatch)
 
     assert response.status_code == 200, response.text
-    (insert,) = _sent_inserts(session)
-    set_clause = str(insert.compile()).split('DO UPDATE SET', 1)[1].split('RETURNING', 1)[0]
+    ((_created, kwargs),) = store.created
+    assert kwargs == {'collect': None}, f'the intake handed the upsert {kwargs}'
+    (insert,) = store.upserts
+    set_clause = str(insert.compile(dialect=postgresql.dialect())).split('DO UPDATE SET', 1)[1].split('RETURNING', 1)[0]
     assert 'collect' not in set_clause, f'a repeat without collect SETs it: {set_clause}'

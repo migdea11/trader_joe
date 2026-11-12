@@ -1,36 +1,44 @@
-"""The ingest_run record over the real stack: POST /store against FakeRead, read back from Postgres (tj-grna9p.79).
+"""The collection record over the real stack: POST /store against FakeRead, read back from Postgres (tj-7zjov1.235).
 
-Design: tj-grna9p.18's architect re-baseline of 2026-10-11 and its ACCEPTANCE for the validator --
+Design: the push path (P35, tj-7zjov1.28; server/data/store/CLAUDE.md, line 3 and the sections "Collection record and
+live events" and "Delivery intake", and the name_change clamp, P51). POST /store writes an ingest_request row BEFORE it
+sends it and no longer opens a RUNNING ingest_run row (the legacy run recorder, tj-grna9p.18/.79, is gone from the
+POST); every REPORTED ATTEMPT is one ingest_run row written by the delivery intake, naming its request by request_id.
+EVERY POST first sends its name_change clamp query, a CORPORATE_ACTIONS request whose attempt row carries the symbol
+alone (no granularity, no dataset, EMPTY against FakeRead without a world). So this module reads a POST's BARS attempt
+rows through the symbol's kind-BARS request (_bars_runs) and never by symbol alone; the clamp's row is never one of a
+POST's bars runs. The acceptance --
 
-  * POST /store that serves bars leaves exactly ONE SUCCEEDED row, bars_written equal to data_points and
-    dataset_id set; a served-but-empty fetch leaves one EMPTY row;
-  * a refused ack (FEED_NOT_AVAILABLE) and a peer failure each leave ONE FAILED row with (domain, reason) and a
-    NULL dataset_id, while the fetch transaction itself still writes nothing;
-  * the RUNNING row is visible from a second session before FetchDone;
+  * a served fetch is ONE bars attempt row, SUCCEEDED (or EMPTY when the vendor held no bars), attempt 1, trigger
+    REQUEST, naming the dataset, with no error at all; its bars request is finished in the same state with that
+    dataset id;
+  * a peer failure is SEVERAL FAILED attempt rows (attempt 1..N, trigger REQUEST then RETRY), no dataset, the
+    vendor's sentence each; the request is FAILED ATTEMPTS_EXHAUSTED and the POST answers 503 VENDOR_UNAVAILABLE.
+    The attempt row's error_domain and error_reason are NOT asserted either way (open question tj-7zjov1.236);
+  * a POST naming IEX is SERVED on IEX (owner ruling 2026-11-06, tj-7zjov1.343): one SUCCEEDED attempt row whose
+    feed is IEX, beside the default POST's SIP one, each naming its own dataset;
+  * a refused feed (FEED_NOT_AVAILABLE; NOT_APPLICABLE, since SIP and IEX are both served) is refused at Submit: NO
+    bars attempt row at all; the request is FAILED PERMANENT with no dataset, and the POST answers 422;
+  * the bars request is COMMITTED and OPEN, readable from a second connection, while the fetch is in flight, before
+    any attempt row; afterwards the same request is finished with its one attempt row. A first POST is NOT asserted
+    as catalog Running: Running reads open requests WITH a dataset id, and a first POST has none until its first
+    delivery;
   * runs keep their label after the dataset is deleted;
-  * POST /store's response and status codes are unchanged (test_ingest_e2e.py pins those and still passes).
-
--- and tj-grna9p.71's: a STREAM create is a 422 INVALID_REQUEST while a STORED STREAM entry still reads.
+  * a STREAM create is a 422 INVALID_REQUEST refused at the edge (no request of any kind, no run), while a STORED
+    STREAM entry still reads (tj-grna9p.71).
 
 ADDED BY tj-grna9p.81 (phase 2 system check, RESCOPED note of 2026-10-12, item 1), at the end of this module:
 last_run on the list and the detail after a real POST, and the running filter, DatasetFacets.running and
-last_run's newest-wins rule over run rows seeded by SQL. Seeded, not driven by a SLOW_ POST, because a SLOW_ run
-is never "running" in the catalog's sense: FakeRead sleeps inside get_bars, which ingest awaits BEFORE the ack, and
-running_dataset_ids counts only acknowledged runs (dataset_id set). The property under test there is the read
-over Postgres (the partial index on RUNNING rows, the window function behind last_run), which a seeded row
-exercises exactly.
+last_run's newest-wins rule over LEGACY RUNNING run rows seeded by SQL. That test pins the LEGACY read path
+(running_dataset_ids still counts legacy RUNNING rows beside open requests), which stays until the follow-up that
+removes recorded_run; the property under test is the read over Postgres (the partial index on RUNNING rows, the
+window function behind last_run), which a seeded row exercises exactly.
 
-WHAT ONLY THIS TIER SHOWS. The recorder writes on its OWN session while the fetch holds its transaction open:
-SQLite has one writer, so the unit tier (data/store/tests/test_run_recording.py) cannot hold the two side by
-side. Here the fetch transaction is a real Postgres one that commits at FetchDone or rolls back, and the run row
-is read on a separate psycopg2 connection.
+WHAT ONLY THIS TIER SHOWS. The request row is committed on its own session before the request is sent, while the
+POST waits; here that is read on a separate psycopg2 connection against a real Postgres, mid-POST.
 
-NOT PROVED HERE: the startup sweep after a real kill. The test client cannot restart data_store, and a sweep
-driven from here would fail other tests' live runs. The sweep's SQL is pinned at the unit tier; a kill and
-restart is reported as not run on tj-grna9p.79.
-
-CLEANUP. ingest_run has no foreign key, so the entry registry's cascade does not reach it: this module deletes
-the rows carrying this run's symbols at the end of the session.
+CLEANUP. ingest_run and ingest_request have no foreign key, so the entry registry's cascade does not reach them: this
+module deletes the run rows, then the request rows, carrying this run's symbols at the end of the session.
 """
 
 import threading
@@ -47,21 +55,38 @@ from sqlalchemy.engine import Engine
 from common.database.sql_alchemy_nullable_datetime import NullableDateTime
 from common.enums.data_select import AssetType, DataType
 from common.enums.data_stock import DataSource, ExpiryType, Feed, Granularity, UpdateType
-from common.errors.vocabulary import ERROR_DOMAIN, Reason
+from common.errors.vocabulary import Reason
+from data.store.app.database.models.ingest_instance import IngestInstance
+from data.store.app.database.models.ingest_request import (
+    IngestRequest,
+    IngestRequestFailureCause,
+    IngestRequestKind,
+    IngestRequestState,
+)
 from data.store.app.database.models.ingest_run import IngestRun, IngestRunState, IngestRunTrigger
 from routers.data_store.app_endpoints import AssetDatasetStoreInterface, UiDatasetsInterface
 from tests.fakes.market_data import EMPTY_PREFIX, FAIL_PREFIX, SLOW_PREFIX
-from tests.fakes.market_data import FEED as FAKE_DEPLOYMENT_FEED
+from tests.fakes.market_data import FEED as FAKE_DEFAULT_FEED
 from tests.system.problem_json import assert_problem
 
 
 pytestmark = pytest.mark.data_store
 
 RUNS = IngestRun.__table__
+REQUESTS = IngestRequest.__table__
+INSTANCES = IngestInstance.__table__
 GRANULARITY = Granularity.ONE_MINUTE
 START = datetime.fromisoformat('2001-02-05T14:30:00+00:00')
 END = START + timedelta(minutes=30)
-UNSERVABLE_FEED = Feed.SIP
+# A POST naming no feed is served on SIP, the production default the fake follows (owner ruling 2026-11-06, option A).
+DEFAULT_FEED = Feed.SIP
+NAMED_FEED = Feed.IEX
+# SIP and IEX are both served; NOT_APPLICABLE is the feed Alpaca has no tape for. The POST body admits it (Feed | None).
+UNSERVABLE_FEED = Feed.NOT_APPLICABLE
+# How long the in-flight test polls for the bars request: the clamp query's round trip comes first, then FakeRead's
+# SLOW_ delay (DEFAULT_SLOW_DELAY_SECONDS, 8 s) holds the bars request open. Generous on purpose.
+IN_FLIGHT_POLL_SECONDS = 30.0
+IN_FLIGHT_OPEN_STATES = {IngestRequestState.PENDING, IngestRequestState.QUEUED}
 
 
 @pytest.fixture(scope='module', autouse=True)
@@ -69,6 +94,7 @@ def delete_this_runs_ingest_runs(pg_engine: Engine, run_identity) -> Iterator[No
     yield
     with pg_engine.begin() as conn:
         conn.execute(sa.delete(RUNS).where(RUNS.c.asset_symbol.contains(run_identity.symbol)))
+        conn.execute(sa.delete(REQUESTS).where(REQUESTS.c.asset_symbol.contains(run_identity.symbol)))
 
 
 def _store_path(symbol: str) -> str:
@@ -88,9 +114,44 @@ def _body(owner: str, **fields: Any) -> dict[str, Any]:
     }
 
 
-def _runs(pg_engine: Engine, symbol: str) -> list[sa.Row]:
+def _is_bars_request_of(symbol: str) -> sa.ColumnElement[bool]:
+    return sa.and_(REQUESTS.c.kind == IngestRequestKind.BARS, REQUESTS.c.asset_symbol == symbol)
+
+
+def _bars_requests(pg_engine: Engine, symbol: str) -> list[sa.Row]:
+    """The symbol's kind-BARS ingest_request rows, oldest first. The clamp's CORPORATE_ACTIONS request is not one."""
     with pg_engine.connect() as conn:
-        return list(conn.execute(sa.select(RUNS).where(RUNS.c.asset_symbol == symbol).order_by(RUNS.c.started_at)))
+        return list(
+            conn.execute(
+                sa.select(REQUESTS).where(_is_bars_request_of(symbol)).order_by(REQUESTS.c.created_at, REQUESTS.c.id)
+            )
+        )
+
+
+def _bars_runs(pg_engine: Engine, symbol: str) -> list[sa.Row]:
+    """The attempt rows of the symbol's BARS requests, in attempt order, joined on request_id.
+
+    Never by asset_symbol alone: the clamp's corporate-actions attempt row carries the symbol too.
+    """
+    with pg_engine.connect() as conn:
+        return list(
+            conn.execute(
+                sa.select(RUNS)
+                .select_from(RUNS.join(REQUESTS, RUNS.c.request_id == REQUESTS.c.id))
+                .where(_is_bars_request_of(symbol))
+                .order_by(REQUESTS.c.created_at, RUNS.c.attempt_no)
+            )
+        )
+
+
+def _rows_naming(pg_engine: Engine, symbol: str) -> tuple[list[sa.Row], list[sa.Row]]:
+    """Every ingest_run and every ingest_request row of ANY kind carrying the symbol."""
+    with pg_engine.connect() as conn:
+        runs = list(conn.execute(sa.select(RUNS.c.id).where(RUNS.c.asset_symbol == symbol)))
+        requests = list(
+            conn.execute(sa.select(REQUESTS.c.id, REQUESTS.c.kind).where(REQUESTS.c.asset_symbol == symbol))
+        )
+    return runs, requests
 
 
 def _post(data_store, adopt: Callable[[str], list[UUID]], symbol: str, body: dict[str, Any]):
@@ -101,40 +162,137 @@ def _post(data_store, adopt: Callable[[str], list[UUID]], symbol: str, body: dic
     return response, ids
 
 
-@pytest.mark.parametrize(('prefix', 'state'), [('', IngestRunState.SUCCEEDED), (EMPTY_PREFIX, IngestRunState.EMPTY)])
-def test_a_served_fetch_leaves_one_finished_run_naming_its_dataset(
-    own_symbol, run_identity, data_store, pg_engine, adopt_entries, scenario_entries, prefix, state
+@pytest.mark.parametrize(
+    ('prefix', 'state', 'request_state'),
+    [
+        ('', IngestRunState.SUCCEEDED, IngestRequestState.SUCCEEDED),
+        (EMPTY_PREFIX, IngestRunState.EMPTY, IngestRequestState.EMPTY),
+    ],
+)
+def test_a_served_fetch_leaves_one_attempt_row_naming_its_dataset(
+    own_symbol, run_identity, data_store, pg_engine, adopt_entries, scenario_entries, prefix, state, request_state
 ):
     symbol = f'{prefix}{own_symbol}'
     response, ids = _post(data_store, scenario_entries if prefix else adopt_entries, symbol, _body(run_identity.owner))
 
     assert response.status_code == 200, data_store.describe(response)
-    (run,) = _runs(pg_engine, symbol)
+    (request,) = _bars_requests(pg_engine, symbol)
+    (run,) = _bars_runs(pg_engine, symbol)
     assert (run.state, run.bars_written, run.dataset_id) == (state, response.json()['data_points'], ids[0])
-    assert (run.trigger, run.feed, run.granularity) == (IngestRunTrigger.REQUEST, FAKE_DEPLOYMENT_FEED, GRANULARITY)
+    assert (run.request_id, run.attempt_no, run.trigger) == (request.id, 1, IngestRunTrigger.REQUEST)
+    assert FAKE_DEFAULT_FEED is DEFAULT_FEED, f'the fake serves an unnamed request on {FAKE_DEFAULT_FEED}, not SIP'
+    assert (run.feed, run.granularity) == (DEFAULT_FEED, GRANULARITY)
     assert (run.requested_start, run.requested_end) == (START, END)
-    assert run.finished_at is not None and run.finished_at >= run.started_at
+    assert run.finished_at is not None
+    # A success carries no error at all: designed, not as-built.
     assert (run.error_domain, run.error_reason, run.error_message) == (None, None, None)
     assert (state is IngestRunState.EMPTY) == (run.bars_written == 0)
+    assert (request.state, request.dataset_id) == (request_state, ids[0])
+    _assert_delivered_by_the_running_ingest(pg_engine, run_identity, request, run, response.json())
 
 
-def test_a_peer_failure_leaves_one_failed_run_with_no_dataset_and_no_entry(
+def _assert_delivered_by_the_running_ingest(pg_engine: Engine, run_identity, request: sa.Row, run: sa.Row, answer):
+    """The running-bind delivery (P26 S1, 16:14 UTC note on tj-7zjov1.38): the attempt came in over data-store-grpc.
+
+    Read from test_client through the store's database only, never by joining ingest_store. The attempt row carries the
+    window FakeRead served (its served_range is the query's [start, end), END being long past the fake's clock) and the
+    id of the ingest process that made it; that id is the one the request was QUEUED under, and it is a LIVE instance
+    the store sighted from the running ingest, not one this suite minted (a minted id carries the run id,
+    tests/system/live_instances.py). The POST's own answer is read from the same row, so it names the same window.
+
+    Reds on (P26 mutant plan, tj-7zjov1.38; tj-7zjov1.321): M1a (the attempt row's served_start is not the one
+    served, data/store/app/ingest/delivery_intake.py:876) at the served-range assertion, both parameters, the POST
+    answer's range after it too; M1b (the attempt row names no instance, delivery_intake.py:848) at 'names no ingest
+    instance'; M1s (the store records no instance sighting, data/store/app/database/crud/ingest_instance.py:53) at
+    'never sighted'. The 'superseded, not the live one' line after it has no mutant of its own: a store that marked
+    the live instance superseded would also refuse to queue under it (mark_queued), so the POST would be expected to
+    time out before this line; by reading, no single mutant reaches it alone. The 'QUEUED under' equality has none
+    either (M1b reds the line before it).
+    Covered by, without a mutant: 'an instance this suite minted' is a guard on the suite, not on production (no
+    production line can mint an id carrying the run id); the minted-id marker is pinned by
+    server/data/store/tests/test_system_live_instances.py, and ingest answering with its own instance id by
+    server/data/ingest/tests/test_ack_gated_retry.py (test_the_submit_handler_routes_by_source_and_answers_with_its_
+    instance_id).
+    """
+    assert (run.served_start, run.served_end) == (START, END), (
+        f'the attempt row carries served range [{run.served_start}, {run.served_end}), not [{START}, {END})'
+    )
+    served = answer['served_range']
+    assert (datetime.fromisoformat(served['start']), datetime.fromisoformat(served['end'])) == (START, END), answer
+    assert run.instance_id, 'the attempt row names no ingest instance'
+    assert run.instance_id == request.instance_id, (
+        f'the attempt was made by {run.instance_id}, but the request was QUEUED under {request.instance_id}'
+    )
+    assert run_identity.run_id not in run.instance_id, 'the attempt names an instance this suite minted'
+    with pg_engine.connect() as conn:
+        sighted = conn.execute(
+            sa.select(INSTANCES.c.superseded_at).where(INSTANCES.c.instance_id == run.instance_id)
+        ).one_or_none()
+    assert sighted is not None, 'the store never sighted the instance that made the attempt'
+    assert sighted.superseded_at is None, 'the instance that made the attempt is superseded, not the live one'
+
+
+def test_a_peer_failure_leaves_failed_attempts_and_an_exhausted_request(
     own_symbol, run_identity, data_store, pg_engine, scenario_entries
 ):
     symbol = f'{FAIL_PREFIX}{own_symbol}'
     response, ids = _post(data_store, scenario_entries, symbol, _body(run_identity.owner))
 
     assert response.status_code == 503, data_store.describe(response)
-    assert ids == [], 'the fetch transaction must still write nothing'
-    (run,) = _runs(pg_engine, symbol)
-    assert (run.state, run.dataset_id, run.bars_written) == (IngestRunState.FAILED, None, 0)
-    assert (run.error_domain, run.error_reason) == (ERROR_DOMAIN, response.json()['reason'])
-    assert run.error_message and run.finished_at is not None
+    assert response.json()['reason'] == Reason.VENDOR_UNAVAILABLE.value, data_store.describe(response)
+    assert ids == [], 'no attempt delivered, so no entry was written'
+    runs = _bars_runs(pg_engine, symbol)
+    assert len(runs) > 1, f'retried before giving up: {runs}'
+    assert [run.attempt_no for run in runs] == list(range(1, len(runs) + 1)), runs
+    assert [run.trigger for run in runs] == [IngestRunTrigger.REQUEST] + [IngestRunTrigger.RETRY] * (len(runs) - 1)
+    for run in runs:
+        assert (run.state, run.dataset_id, run.bars_written) == (IngestRunState.FAILED, None, 0), run
+        # The vendor's sentence; error_domain / error_reason are not asserted either way (tj-7zjov1.236).
+        assert run.error_message and run.finished_at is not None, run
+    (request,) = _bars_requests(pg_engine, symbol)
+    assert (request.state, request.failure_cause, request.dataset_id) == (
+        IngestRequestState.FAILED,
+        IngestRequestFailureCause.ATTEMPTS_EXHAUSTED,
+        None,
+    )
 
 
-def test_a_refused_ack_leaves_one_failed_run_naming_feed_not_available(
+def test_a_post_naming_iex_is_served_on_iex_with_its_own_attempt_row_beside_the_default_sip_one(
     own_symbol, run_identity, data_store, pg_engine, adopt_entries
 ):
+    """IEX named is served, not refused (tj-7zjov1.342): each POST's one attempt row carries the feed it resolved to.
+
+    The same window on purpose: a PARTIAL cross-tape overlap is refused by the feed-blind own-overlap check (ruled
+    acceptable, tj-7zjov1.351); the identical window is two datasets, because feed is part of the entry's identity.
+    """
+    default, after_default = _post(data_store, adopt_entries, own_symbol, _body(run_identity.owner))
+    named, after_named = _post(data_store, adopt_entries, own_symbol, _body(run_identity.owner, feed=NAMED_FEED.value))
+
+    assert default.status_code == 200, data_store.describe(default)
+    assert named.status_code == 200, data_store.describe(named)
+    assert len(after_named) == 2 and after_named[0] == after_default[0], f'IEX named: {after_named}'
+    sip_entry, iex_entry = after_named
+    requests = _bars_requests(pg_engine, own_symbol)
+    runs = _bars_runs(pg_engine, own_symbol)
+    assert len(requests) == 2 and len(runs) == 2, (requests, runs)
+    by_request = {run.request_id: run for run in runs}
+    assert set(by_request) == {request.id for request in requests}, 'a request without its own attempt row'
+    feeds = {request.dataset_id: by_request[request.id].feed for request in requests}
+    assert feeds == {sip_entry: DEFAULT_FEED, iex_entry: NAMED_FEED}, feeds
+    for request in requests:
+        run = by_request[request.id]
+        assert (request.state, run.state) == (IngestRequestState.SUCCEEDED, IngestRunState.SUCCEEDED), (request, run)
+        assert (run.attempt_no, run.trigger, run.dataset_id) == (1, IngestRunTrigger.REQUEST, request.dataset_id)
+        assert run.bars_written == named.json()['data_points']
+
+
+def test_a_refused_feed_leaves_a_failed_request_and_no_bars_attempt(
+    own_symbol, run_identity, data_store, pg_engine, adopt_entries
+):
+    """Refused at Submit: no vendor call, so no bars attempt row. FAILED is the REQUEST's state.
+
+    The clamp's EMPTY corporate-actions attempt row also carries own_symbol; it is not this POST's bars run.
+    """
     response, ids = _post(data_store, adopt_entries, own_symbol, _body(run_identity.owner, feed=UNSERVABLE_FEED.value))
 
     assert_problem(
@@ -145,15 +303,37 @@ def test_a_refused_ack_leaves_one_failed_run_naming_feed_not_available(
         describe=data_store.describe,
     )
     assert ids == []
-    (run,) = _runs(pg_engine, own_symbol)
-    assert (run.state, run.dataset_id, run.feed) == (IngestRunState.FAILED, None, None)
-    assert (run.error_domain, run.error_reason) == (ERROR_DOMAIN, Reason.FEED_NOT_AVAILABLE.value)
+    assert _bars_runs(pg_engine, own_symbol) == [], 'a refused Submit writes no attempt row'
+    (request,) = _bars_requests(pg_engine, own_symbol)
+    assert (request.state, request.failure_cause, request.dataset_id) == (
+        IngestRequestState.FAILED,
+        IngestRequestFailureCause.PERMANENT,
+        None,
+    )
 
 
-def test_the_running_row_is_visible_from_another_session_while_the_fetch_is_in_flight(
+def _in_flight_read(pg_engine: Engine, symbol: str) -> list[sa.Row]:
+    """The symbol's bars requests with their attempt-row count, in ONE statement, so one snapshot holds both."""
+    attempts = sa.select(sa.func.count()).select_from(RUNS).where(RUNS.c.request_id == REQUESTS.c.id).scalar_subquery()
+    with pg_engine.connect() as conn:
+        return list(
+            conn.execute(
+                sa.select(REQUESTS.c.id, REQUESTS.c.state, REQUESTS.c.dataset_id, attempts.label('attempts')).where(
+                    _is_bars_request_of(symbol)
+                )
+            )
+        )
+
+
+def test_the_bars_request_is_committed_and_open_while_the_fetch_is_in_flight(
     own_symbol, run_identity, data_store, pg_engine, scenario_entries
 ):
-    """SLOW_ sleeps before answering, so the fetch is open for seconds: the RUNNING row is already committed."""
+    """The request record is committed BEFORE the request is sent: a second connection reads it mid-POST.
+
+    SLOW_ sleeps before serving, so the bars request stays open for seconds after the clamp query is answered. It is
+    seen PENDING or QUEUED, with no dataset and no attempt row; after the 200 the SAME request is SUCCEEDED with its
+    one attempt row. Catalog Running is not asserted: a first POST has no dataset id until its first delivery.
+    """
     symbol = f'{SLOW_PREFIX}{own_symbol}'
     result: dict[str, Any] = {}
 
@@ -162,24 +342,40 @@ def test_the_running_row_is_visible_from_another_session_while_the_fetch_is_in_f
 
     thread = threading.Thread(target=post)
     thread.start()
+    seen: list[sa.Row] = []
+    still_in_flight = False
     try:
-        seen: list[sa.Row] = []
-        deadline = time.monotonic() + 6
-        while not seen and time.monotonic() < deadline:
-            seen = _runs(pg_engine, symbol)
+        deadline = time.monotonic() + IN_FLIGHT_POLL_SECONDS
+        while thread.is_alive() and time.monotonic() < deadline:
+            rows = _in_flight_read(pg_engine, symbol)
+            if rows:
+                # Alive after the read returned means alive while it ran: the POST had not answered yet.
+                seen, still_in_flight = rows, thread.is_alive()
+                break
             time.sleep(0.2)
     finally:
         thread.join(timeout=90)
 
-    assert seen, 'no run row was visible while the fetch was in flight'
+    assert seen and still_in_flight, f'no bars request was visible while the POST was in flight: {seen}'
     (in_flight,) = seen
-    assert (in_flight.state, in_flight.finished_at) == (IngestRunState.RUNNING, None)
+    assert in_flight.state in IN_FLIGHT_OPEN_STATES, in_flight
+    assert (in_flight.dataset_id, in_flight.attempts) == (None, 0), in_flight
+
+    assert not thread.is_alive(), 'the POST did not answer within the join bound'
     assert result['response'].status_code == 200, data_store.describe(result['response'])
-    (finished,) = _runs(pg_engine, symbol)
+    dataset_id = result['ids'][0]
+    (finished,) = _bars_requests(pg_engine, symbol)
     assert (finished.id, finished.state, finished.dataset_id) == (
         in_flight.id,
+        IngestRequestState.SUCCEEDED,
+        dataset_id,
+    )
+    (attempt,) = _bars_runs(pg_engine, symbol)
+    assert (attempt.request_id, attempt.state, attempt.trigger, attempt.dataset_id) == (
+        in_flight.id,
         IngestRunState.SUCCEEDED,
-        result['ids'][0],
+        IngestRunTrigger.REQUEST,
+        dataset_id,
     )
 
 
@@ -188,15 +384,23 @@ def test_runs_survive_the_deletion_of_their_dataset_with_their_label(
 ):
     response, ids = _post(data_store, adopt_entries, own_symbol, _body(run_identity.owner))
     assert response.status_code == 200, data_store.describe(response)
+    (attempt,) = _bars_runs(pg_engine, own_symbol)
     runs_path = UiDatasetsInterface.GET_UI_DATASET_RUNS.format(dataset_id=ids[0])
     listed = data_store.get(runs_path)
-    assert [item['id'] for item in listed.json()['items']] == [str(_runs(pg_engine, own_symbol)[0].id)]
+    assert listed.status_code == 200, data_store.describe(listed)
+    # The clamp's attempt row names no dataset, so the dataset's runs are its one bars attempt.
+    assert [item['id'] for item in listed.json()['items']] == [str(attempt.id)]
 
     deleted = data_store.delete(f'/store/{ids[0]}', params={'owner': run_identity.owner}, auth='right')
     assert deleted.status_code == 200, data_store.describe(deleted)
 
-    (run,) = _runs(pg_engine, own_symbol)
-    assert (run.state, run.dataset_id, run.asset_symbol) == (IngestRunState.SUCCEEDED, ids[0], own_symbol)
+    (run,) = _bars_runs(pg_engine, own_symbol)
+    assert (run.id, run.state, run.dataset_id, run.asset_symbol) == (
+        attempt.id,
+        IngestRunState.SUCCEEDED,
+        ids[0],
+        own_symbol,
+    )
     assert_problem(
         data_store.get(runs_path),
         status=404,
@@ -222,7 +426,9 @@ def test_a_stream_create_is_refused_and_a_stored_stream_entry_still_reads(
         describe=data_store.describe,
     )
     assert 'STREAM' in response.text
-    assert ids == [] and _runs(pg_engine, own_symbol) == [], 'refused at the edge, before any run or fetch'
+    assert ids == []
+    # Refused at the edge, before the clamp query is written: no request of any kind, and no run.
+    assert _rows_naming(pg_engine, own_symbol) == ([], []), 'refused at the edge, before any request or run'
 
     # As a STREAM entry created before the refusal existed would be stored: open-ended, a non-BULK expiry type.
     stored = insert_entry(
@@ -260,7 +466,7 @@ def test_a_served_post_is_the_last_run_on_the_list_and_the_detail(
 ):
     response, ids = _post(data_store, adopt_entries, own_symbol, _body(run_identity.owner))
     assert response.status_code == 200, data_store.describe(response)
-    (run,) = _runs(pg_engine, own_symbol)
+    (run,) = _bars_runs(pg_engine, own_symbol)
 
     (item,) = _ok(data_store, LIST_PATH, {'asset_symbol': own_symbol})['items']
     detail = _ok(data_store, UiDatasetsInterface.GET_UI_DATASET.format(dataset_id=ids[0]))
@@ -276,7 +482,7 @@ def test_a_served_post_is_the_last_run_on_the_list_and_the_detail(
 
 
 def _seed_run(pg_engine: Engine, entry: sa.Row, state: IngestRunState, started_at: datetime) -> UUID:
-    """One run row for `entry`, as the recorder would leave it: acknowledged (dataset_id set), in `state`."""
+    """One LEGACY run row for `entry`, as the legacy recorder would leave it: acknowledged, in `state`, no request."""
     finished = state is not IngestRunState.RUNNING
     values = {
         'dataset_id': entry.id,
@@ -314,6 +520,9 @@ def test_the_running_filter_facet_and_last_run_follow_the_run_rows_on_postgres(
     whichever run that is. A: an older success, a newer RUNNING run. B: an older RUNNING row (stale) under a newer success. Both read as
     running until B's stale row is finished; then running=true lists A alone and DatasetFacets.running counts it,
     equal to that list's total. Finishing A's run empties both.
+
+    This pins the LEGACY read path: the rows are legacy-shaped RUNNING runs (no request, no attempt number), which
+    running_dataset_ids still counts beside open requests. It stays until the follow-up that removes recorded_run.
     """
     entry_a = insert_entry(asset_symbol=f'{own_symbol}A')
     entry_b = insert_entry(asset_symbol=f'{own_symbol}B')

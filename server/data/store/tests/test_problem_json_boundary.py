@@ -20,37 +20,51 @@ test that stops below the edge:
      reason names the condition, and the second is a 200 carrying the window the vendor answered
      for. The pair of cases below is what makes that a tested claim rather than a design intention.
 
-THE FETCH DOUBLE IS AN IMPLEMENTATION OF THE INTERFACE, not a patched stub, which the bead requires
-in those words. data/store/tests/fetch_double.py's RecordingFetchClient is an ordinary
-IngestFetchClient (ADR tj-8konfu D3), scripted per case; nothing here monkeypatches a method onto
-production code, so a change to the seam's shape reds these cases instead of sliding past them.
+THE INGEST DOUBLE IS AN IMPLEMENTATION OF THE INTERFACE, not a patched stub, which the bead requires
+in those words. It was the FetchDataset client double until the push path; it is now post_path.py's
+SubmitDouble, an ordinary IngestSubmitClient (ADR tj-8konfu D3), scripted per case; nothing here
+monkeypatches a method onto production code, so a change to the seam's shape reds these cases
+instead of sliding past them.
 
-WHAT TIER THIS IS. TestClient against the real app with real handlers installed, over fake sessions
+REPAIRED FOR THE PUSH PATH (validator, tj-7zjov1.28, P35). The POST now writes a request row, SUBMITS it and waits
+while ingest pushes the result to the delivery intake. The canary half (section 1) is unchanged: the database fails
+on the very first statement, the overlap SELECT, so nothing past the request's session is reached and the fake
+session stays. Sections 2 to 4 need a request that is written, submitted and finished, so they run the whole chain
+over post_path.py's SQLite world: the real route, submit path, waiter and delivery intake, with a Submit double that
+answers and delivers. A failure can now come from the Submit call or from the request's delivered outcome, and both
+tables are driven. served_range is the finishing attempt row's, so the anti-echo fixture is now the DELIVERED window.
+
+WHAT TIER THIS IS. The real app with real handlers installed, over fake sessions (section 1) or SQLite (the rest)
 and a scripted seam. Every status here is one FastAPI assembled in-process; no Postgres and no
 ingest are reached. That a real deployment returns the same codes is the System Testing job's
 (TE-7), and nothing below should be read as having shown it.
 """
 
 import logging
-import re
 import uuid
 from collections import defaultdict
 from datetime import UTC, datetime, timedelta
+from typing import Any
 
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy.exc import IntegrityError, InterfaceError, OperationalError, ProgrammingError
 
 from common.enums.data_stock import Feed
-from common.errors.vocabulary import REASONS, ExogenousError, InvalidRequestError, Reason
-from data.store.app.app_depends import get_ingest_fetch_client
+from common.errors.vocabulary import ERROR_DOMAIN, REASONS, ExogenousError, Reason
+from data.store.app.app_depends import get_ingest_submit_client
 from data.store.app.database.database import async_db
+from data.store.app.database.models.ingest_request import IngestRequestState
+from data.store.app.ingest import data_action_request
 from data.store.app.main import app
-from data.store.tests.fetch_double import FetchScript, RecordingFetchClient, accepted_stream, bar
+from data.store.tests.post_path import Delivery, PostStore, SubmitDouble, bar, post
+from data.store.tests.post_path import post_store as _post_store  # noqa: F401 (a fixture)
 from data.store.tests.problem_body import PROBLEM_MEDIA_TYPE, problem
+from data.store.tests.test_ui_datasets_route import aware_sqlite_datetimes  # noqa: F401 (a fixture)
 from routers.common.errors import ProblemDetails
 from routers.common.instance_secret import INSTANCE_SECRET_ENV_VAR, INSTANCE_SECRET_HEADER
 from schemas.data_ingest import fetch_dataset
+from schemas.data_ingest.delivery import DeliveryErrorClass, DeliveryOutcome
 
 
 pytestmark = pytest.mark.data_store
@@ -80,21 +94,6 @@ REQUEST_BODY = {
 # nothing, which is the same trap as a non-lazy stream double on the paging tests.
 SERVED_START = REQUESTED_START
 SERVED_END = REQUESTED_START + timedelta(minutes=3)
-AS_OF = SERVED_END
-
-
-def served_done(bar_count: int) -> fetch_dataset.FetchDone:
-    """A FetchDone whose served window stops well short of the requested one.
-
-    Args:
-        bar_count: How many bars the stream served.
-
-    Returns:
-        fetch_dataset.FetchDone: The terminator.
-    """
-    return fetch_dataset.FetchDone(
-        bar_count=bar_count, served_range=fetch_dataset.ServedRange(start=SERVED_START, end=SERVED_END), as_of=AS_OF
-    )
 
 
 class FakeResult:
@@ -164,6 +163,22 @@ def _accepting_session(bar_statements: int = 0) -> FakeSession:
     return FakeSession(*answers)
 
 
+class NeverSubmitted:
+    """The Submit seam for the canary cases: the database fails on the overlap SELECT, so nothing may be sent."""
+
+    async def submit(self, request):
+        raise AssertionError('a request whose overlap check failed was submitted to ingest')
+
+    async def instance(self):
+        raise AssertionError('the POST never probes the instance')
+
+
+@pytest.fixture
+def store(_post_store: PostStore) -> PostStore:  # noqa: F811 (the imported fixture, under its own name here)
+    """post_path.py's SQLite world, for the cases that run the whole push path."""
+    return _post_store
+
+
 @pytest.fixture
 def post_dataset(monkeypatch: pytest.MonkeyPatch):
     """A callable driving the real POST /store against a given session and fetch client.
@@ -178,13 +193,13 @@ def post_dataset(monkeypatch: pytest.MonkeyPatch):
         monkeypatch: Sets INSTANCE_WRITE_SECRET for the duration of one test.
 
     Yields:
-        Callable: (session, fetch_client) -> httpx.Response.
+        Callable: (session, client) -> httpx.Response.
     """
     monkeypatch.setenv(INSTANCE_SECRET_ENV_VAR, CONFIGURED_SECRET)
 
-    def send(session: FakeSession, fetch_client: RecordingFetchClient, body: dict | None = None):
+    def send(session: FakeSession, client: 'NeverSubmitted', body: dict | None = None):
         app.dependency_overrides[async_db] = lambda: session
-        app.dependency_overrides[get_ingest_fetch_client] = lambda: fetch_client
+        app.dependency_overrides[get_ingest_submit_client] = lambda: client
         try:
             return TestClient(app, raise_server_exceptions=False).post(
                 app.url_path_for(ROUTE_NAME, **PATH_PARAMS),
@@ -264,7 +279,7 @@ def test_no_statement_or_bound_parameter_ever_reaches_the_response(post_dataset,
     """
     session = FakeSession(raises=error)
 
-    response = post_dataset(session, RecordingFetchClient())
+    response = post_dataset(session, NeverSubmitted())
 
     body = problem(response, status=status, reason=reason)
     assert CANARY_SQL not in response.text, 'the STATEMENT reached the response body (value withheld)'
@@ -290,7 +305,7 @@ def test_a_bug_publishes_an_error_id_and_nothing_else(post_dataset):
     """
     session = FakeSession(raises=ProgrammingError('SELECT ...', {}, Exception('column does not exist')))
 
-    response = post_dataset(session, RecordingFetchClient())
+    response = post_dataset(session, NeverSubmitted())
 
     body = problem(response, status=500)
     assert set(body) == {'type', 'title', 'status', 'error_id'}, (
@@ -319,7 +334,7 @@ def test_the_body_error_id_is_the_one_write_transaction_logged(post_dataset, cap
     caplog.set_level(logging.DEBUG)
     session = FakeSession(raises=_canary(OperationalError))
 
-    response = post_dataset(session, RecordingFetchClient())
+    response = post_dataset(session, NeverSubmitted())
 
     body = problem(response, status=503, reason='DATABASE_UNAVAILABLE')
     transaction_records = [record for record in caplog.records if record.name == 'data.store.app.database.transaction']
@@ -336,15 +351,22 @@ def test_the_body_error_id_is_the_one_write_transaction_logged(post_dataset, cap
 
 
 # ---------------------------------------------------------------------------------------------
-# 2. THE FETCH OUTCOMES (TE-6 item 6, tj-fe19tu): a vendor failure, by reason, at the edge
+# 2. THE OUTCOMES (TE-6 item 6, tj-fe19tu): a failure, by reason, at the edge
+#
+# REPAIRED FOR THE PUSH PATH (validator, tj-7zjov1.28). A POST can now fail in two places, and both are driven:
+#   - THE SUBMIT CALL: the seam raises a typed error (the peer is not there, a deadline, a broken contract, a rate
+#     budget). The request row was written first, by design, so "writes nothing" became "writes nothing PAST the
+#     request row": it stays PENDING for the instance watcher, with no entry and no attempt row.
+#   - THE REQUEST'S OUTCOME, delivered later by ingest and read by the waiter: a refused Submit (a tape ingest cannot
+#     serve), a vendor refusal for good, attempts exhausted, a request that expired on its ready_by, and a request
+#     still running at the POST's deadline. Each renders its reason's status; none writes an entry.
 # ---------------------------------------------------------------------------------------------
 
 _RESET_AT = datetime(2026, 1, 2, 13, 0, tzinfo=UTC)
 
-_FETCH_FAILURES: list[tuple[str, Reason, int]] = [
-    ('a refused ack', Reason.FEED_NOT_AVAILABLE, 422),
+_CALL_FAILURES: list[tuple[str, Reason, int]] = [
     ('the store rate budget', Reason.RATE_BUDGET, 429),
-    ('the vendor rate-limited us', Reason.VENDOR_RATE_LIMITED, 429),
+    ('a rate limit on the call', Reason.VENDOR_RATE_LIMITED, 429),
     ('the vendor is down', Reason.VENDOR_UNAVAILABLE, 503),
     ('the vendor refused our credentials', Reason.VENDOR_AUTH, 503),
     ('the peer is not there', Reason.PEER_UNAVAILABLE, 503),
@@ -357,70 +379,101 @@ _FETCH_FAILURES: list[tuple[str, Reason, int]] = [
 def _failure_for(reason: Reason) -> ExogenousError:
     """The error the seam raises for one reason, with reset_at where the row requires it."""
     requires_reset_at = reason in {Reason.RATE_BUDGET, Reason.VENDOR_RATE_LIMITED}
-    detail = f'the fetch failed with {reason.value}'
-    if reason is Reason.FEED_NOT_AVAILABLE:
-        return InvalidRequestError(reason, detail)
+    detail = f'the call failed with {reason.value}'
     return ExogenousError(reason, detail, reset_at=_RESET_AT if requires_reset_at else None)
 
 
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ('reason', 'status'), [(r, s) for _, r, s in _FETCH_FAILURES], ids=[n for n, _, _ in _FETCH_FAILURES]
+    ('reason', 'status'), [(r, s) for _, r, s in _CALL_FAILURES], ids=[n for n, _, _ in _CALL_FAILURES]
 )
-def test_a_fetch_failure_renders_as_its_reasons_status_and_writes_nothing(post_dataset, reason: Reason, status: int):
-    """TE-6 item 6's table, driven at the edge, one case per row.
+async def test_a_failed_submit_renders_as_its_reasons_status_and_writes_nothing_past_the_request(
+    store: PostStore, monkeypatch, reason: Reason, status: int
+):
+    """TE-6 item 6's table, driven at the edge, one case per row the Submit call can raise.
 
-    EVERY ROW, because the rows are the contract a caller programs against and a single
-    representative would pin only the handler's existence. The split that matters most is 429 from
-    503 from 504: all three mean "not your fault, try later", and only the status and reason tell a
-    caller whether to back off on a schedule, fail over, or lengthen its deadline.
+    EVERY ROW, because the rows are the contract a caller programs against: 429 from 503 from 504 tell a caller
+    whether to back off on a schedule, fail over, or lengthen its deadline.
 
-    AND WRITES NOTHING, which is the half a status assertion cannot see. The failure arrives inside
-    the one fetch transaction, so it must roll that transaction back on the way out -- a route that
-    rendered the right 503 having committed a dataset entry for a fetch that never happened would
-    leave an entry claiming coverage of bars nobody has. That is this epic's stated failure class,
-    and it is invisible to the body.
-
-    Args:
-        post_dataset: Drives the real POST route.
-        reason: The reason the seam raises before yielding anything.
-        status: The status its row renders as.
+    AND NOTHING PAST THE REQUEST ROW: no entry claiming coverage of bars nobody has, no attempt row; the request is
+    left PENDING so the watcher re-sends it.
     """
-    session = FakeSession(FakeResult(rows=[]))
-    fetch_client = RecordingFetchClient(FetchScript(raises=_failure_for(reason)))
-
-    response = post_dataset(session, fetch_client)
+    response = await post(store, SubmitDouble(store, raises=_failure_for(reason)), REQUEST_BODY, monkeypatch)
 
     body = problem(response, status=status, reason=reason.value)
     assert 'served_range' not in body, (
-        f'a FAILED fetch carries served_range: {body}. Only a 200 does -- a failure answered no '
-        f'window at all, and publishing one would tell the caller a range was served when none was.'
+        f'a FAILED request carries served_range: {body}. Only a 200 does -- a failure answered no window.'
     )
-    assert session.commits == 0, 'a failed fetch committed its transaction'
-    assert session.rollbacks == 1, 'a failed fetch did not roll its transaction back exactly once'
+    (request,) = await store.bars_requests()
+    assert store.created == [] and [run for run in await store.runs() if run.request_id == request.id] == []
+    assert IngestRequestState(request.state) is IngestRequestState.PENDING
 
 
+_REFUSED_FEED = fetch_dataset.FetchRefused(
+    reason=Reason.FEED_NOT_AVAILABLE.value, domain=ERROR_DOMAIN, detail='not this tape', metadata={}
+)
+
+_OUTCOMES: list[tuple[str, dict[str, Any], int, str]] = [
+    ('a refused Submit', {'refused': _REFUSED_FEED}, 422, 'FEED_NOT_AVAILABLE'),
+    (
+        'the vendor refused for good',
+        {'delivery': Delivery(DeliveryOutcome.FAILED, error_class=DeliveryErrorClass.PERMANENT, detail='no such')},
+        422,
+        'VENDOR_REJECTED',
+    ),
+    (
+        'the last attempt failed',
+        {'delivery': Delivery(DeliveryOutcome.FAILED, last_attempt=True, detail='the vendor answered 503')},
+        503,
+        'VENDOR_UNAVAILABLE',
+    ),
+    ('attempts exhausted', {'delivery': Delivery(DeliveryOutcome.EXHAUSTED)}, 503, 'VENDOR_UNAVAILABLE'),
+    ('expired on its ready_by', {'delivery': Delivery(DeliveryOutcome.EXPIRED)}, 504, 'DEADLINE'),
+]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ('script', 'status', 'reason'), [(c, s, r) for _, c, s, r in _OUTCOMES], ids=[n for n, _, _, _ in _OUTCOMES]
+)
+async def test_a_failed_request_renders_as_its_reasons_status_and_writes_no_entry(
+    store: PostStore, monkeypatch, script: dict[str, Any], status: int, reason: str
+):
+    """The request's own outcome, read by the waiter from the request row, at the edge; the request is FAILED."""
+    response = await post(store, SubmitDouble(store, **script), REQUEST_BODY, monkeypatch)
+
+    body = problem(response, status=status, reason=reason)
+    assert 'served_range' not in body
+    assert store.created == [], 'a failed request wrote an entry'
+    (request,) = await store.bars_requests()
+    assert IngestRequestState(request.state) is IngestRequestState.FAILED
+
+
+@pytest.mark.asyncio
+async def test_a_request_still_running_at_the_deadline_answers_504_and_keeps_running(store: PostStore, monkeypatch):
+    """Owner ruling R4 (a): the POST's wait is bounded; the request is not abandoned, its outcome lands in the history."""
+    # Long enough for the clamp's answered query (P51: one deadline covers both waits); the silent bars outlive it.
+    monkeypatch.setenv(data_action_request.VERDICT_DEADLINE_ENV, '0.5')
+
+    response = await post(store, SubmitDouble.silent(store), REQUEST_BODY, monkeypatch)
+
+    problem(response, status=504, reason='DEADLINE')
+    (request,) = await store.bars_requests()
+    assert IngestRequestState(request.state) is IngestRequestState.QUEUED
+    (query,) = await store.query_requests()
+    assert not IngestRequestState(query.state).is_open, 'the clamp query was answered; the BARS wait ran out'
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize('reason', [Reason.RATE_BUDGET, Reason.VENDOR_RATE_LIMITED])
-def test_a_rate_limited_fetch_carries_retry_after_and_reset_at(post_dataset, reason: Reason):
+async def test_a_rate_limited_submit_carries_retry_after_and_reset_at(store: PostStore, monkeypatch, reason: Reason):
     """The 429s say WHEN, in a header and in the body, and the two must agree.
 
-    TWO SPELLINGS OF ONE FACT, which is exactly the shape that drifts: an HTTP client obeys the
-    Retry-After header and a typed SDK reads reset_at, so a renderer that derived them from two
-    readings of the clock would have them disagree by a second or more and send the two clients to
-    different times. routers/common/errors.py derives both from one read for that reason; this is
-    the case at the edge that would notice if that stopped being true.
-
-    THE HEADER IS DELTA-SECONDS and reset_at is an instant, so they are compared by reconstruction
-    rather than by equality: now + Retry-After must land on reset_at, within the second that
-    rendering takes.
-
-    Args:
-        post_dataset: Drives the real POST route.
-        reason: The rate-limit reason, whose row requires reset_at.
+    TWO SPELLINGS OF ONE FACT, which is exactly the shape that drifts: an HTTP client obeys the Retry-After header and
+    a typed SDK reads reset_at, so a renderer that derived them from two readings of the clock would send the two
+    clients to different times. The header is delta-seconds and reset_at an instant: compared by reconstruction.
     """
-    session = FakeSession(FakeResult(rows=[]))
-    fetch_client = RecordingFetchClient(FetchScript(raises=_failure_for(reason)))
-
-    response = post_dataset(session, fetch_client)
+    response = await post(store, SubmitDouble(store, raises=_failure_for(reason)), REQUEST_BODY, monkeypatch)
 
     body = problem(response, status=429, reason=reason.value)
     assert 'Retry-After' in response.headers, f'a 429 carries no Retry-After header: {dict(response.headers)}'
@@ -435,47 +488,37 @@ def test_a_rate_limited_fetch_carries_retry_after_and_reset_at(post_dataset, rea
 
 
 # ---------------------------------------------------------------------------------------------
-# 3. served_range (TE-6 item 7): copied out of FetchDone, never echoed back from the request
+# 3. served_range (TE-6 item 7): copied from the finishing attempt, never echoed back from the request
 # ---------------------------------------------------------------------------------------------
 
 
+def _served(bar_minutes: list[int]) -> Delivery:
+    """A delivered success whose served window stops well short of the requested one."""
+    return Delivery(
+        bars=[bar(minute, feed=Feed.IEX) for minute in bar_minutes],
+        served=fetch_dataset.ServedRange(start=SERVED_START, end=SERVED_END),
+    )
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ('bar_minutes', 'expected_points'),
     [pytest.param([0, 1], 2, id='a-served-window-with-bars'), pytest.param([], 0, id='a-served-but-empty-window')],
 )
-def test_the_200_carries_the_window_the_vendor_answered_for_not_the_one_asked(
-    post_dataset, bar_minutes: list[int], expected_points: int
+async def test_the_200_carries_the_window_the_vendor_answered_for_not_the_one_asked(
+    store: PostStore, monkeypatch, bar_minutes: list[int], expected_points: int
 ):
     """THE ECHO IS THE BUG THIS GUARDS, and the fixture is what makes it detectable.
 
-    served_range is the FetchDone's, COPIED UNCHANGED -- never rebuilt from the request and never
-    clamped a second time at the store (TE-6 item 7, user ruling 2026-10-02). The plausible wrong
-    implementation is not an exotic one: it is building ServedRange(start=request.start,
-    end=request.end) at the route, which looks right, needs no plumbing out of the transaction, and
-    is correct for every fetch the vendor happens to serve in full. SERVED_END is three minutes
-    after the start while the request asks for twelve hours, so the echo is off by the whole
-    difference and cannot coincide.
-
-    BOTH PARAMETERS ARE REQUIRED BY THE BEAD and they are not the same case. The empty one is the
-    one that matters operationally: a misspelled symbol is SERVED, successfully, for the window
-    asked and with no bars in it (tj-lldllr's known gap), and the only thing that lets a caller tell
-    that from a window the vendor had nothing for is the range in the body. It is also the case a
-    lazy implementation gets wrong for free, by returning early on a zero-bar stream before the
-    FetchDone has been read.
-
-    Args:
-        post_dataset: Drives the real POST route.
-        bar_minutes: Minute offsets for the single scripted page, or none for an empty window.
-        expected_points: How many bars the body must report.
+    served_range is the FINISHING ATTEMPT ROW's (served_start, served_end), as the delivery reported it -- never
+    rebuilt from the request and never clamped a second time at the store (TE-6 item 7; tj-7zjov1.28 ruling B).
+    SERVED_END is three minutes after the start while the request asks for twelve hours, so an echo cannot
+    coincide. The empty window is the operationally important one: a misspelled symbol is SERVED, for the window
+    asked and with no bars, and only the range tells a caller that from a window the vendor had nothing for.
     """
-    pages = [fetch_dataset.BarPage(bars=[bar(minute, feed=Feed.IEX) for minute in bar_minutes])] if bar_minutes else []
-    events = [fetch_dataset.FetchAccepted(feed=Feed.IEX), *pages, served_done(len(bar_minutes))]
-    session = _accepting_session(bar_statements=len(pages))
-    fetch_client = RecordingFetchClient(FetchScript(events=events))
+    response = await post(store, SubmitDouble(store, _served(bar_minutes)), REQUEST_BODY, monkeypatch)
 
-    response = post_dataset(session, fetch_client)
-
-    assert response.status_code == 200, f'a served fetch answered {response.status_code}: {response.text}'
+    assert response.status_code == 200, f'a served request answered {response.status_code}: {response.text}'
     body = response.json()
     assert body['data_points'] == expected_points, f'the body reports {body["data_points"]} bars'
     served = body['served_range']
@@ -486,32 +529,19 @@ def test_the_200_carries_the_window_the_vendor_answered_for_not_the_one_asked(
         f'the body served_range is {served}, not the window the vendor answered for '
         f'([{SERVED_START.isoformat()}, {SERVED_END.isoformat()})).'
     )
-    # THE ANTI-ECHO ASSERTION, stated separately so its failure says what went wrong rather than
-    # merely that two timestamps differ.
     assert datetime.fromisoformat(served['end']) != REQUESTED_END, (
         f'the body served_range ends exactly where the REQUEST ended ({REQUESTED_END.isoformat()}), '
-        f'so the store is echoing what was asked for instead of copying what FetchDone answered. '
-        f"The clamp is ingest's (end = min(requested end, as_of)); a store that recomputes it "
-        f"publishes its own guess as the vendor's answer."
+        f'so the store is echoing what was asked for instead of copying what the delivery answered.'
     )
     assert 'as_of' not in body, 'as_of is not exposed at the HTTP edge: the ruling names served_range only'
 
 
-def test_an_empty_window_is_a_success_and_a_vendor_failure_is_not(post_dataset):
-    """tj-fe19tu's acceptance criterion in one case: the two outcomes are distinguishable.
-
-    THE WHOLE FEATURE IS THIS COMPARISON, so it is asserted as one rather than left implicit across
-    two files. Before TE-6 a vendor failure surfaced as an unhandled 500 and a served-but-empty
-    window as a 200 with a bare count, so a caller seeing "no bars" could not tell whether the
-    vendor had answered with nothing or the fetch had never happened -- and the 500 carried nothing
-    it could branch on either. Both halves are driven here, through the same route and the same
-    double, so neither can be repaired into agreement with the other by accident.
-    """
-    empty = RecordingFetchClient(FetchScript(events=[fetch_dataset.FetchAccepted(feed=Feed.IEX), served_done(0)]))
-    served_response = post_dataset(_accepting_session(), empty)
-
-    failed = RecordingFetchClient(FetchScript(raises=_failure_for(Reason.VENDOR_UNAVAILABLE)))
-    failed_response = post_dataset(FakeSession(FakeResult(rows=[])), failed)
+@pytest.mark.asyncio
+async def test_an_empty_window_is_a_success_and_a_vendor_failure_is_not(store: PostStore, monkeypatch):
+    """tj-fe19tu's acceptance criterion in one case: the two outcomes are distinguishable at the edge."""
+    served_response = await post(store, SubmitDouble(store, _served([])), REQUEST_BODY, monkeypatch)
+    failed = Delivery(DeliveryOutcome.FAILED, last_attempt=True, detail='the vendor answered 503')
+    failed_response = await post(store, SubmitDouble(store, failed), REQUEST_BODY, monkeypatch)
 
     assert served_response.status_code == 200, (
         f'a window the vendor SERVED with no bars answered {served_response.status_code}. An empty '
@@ -519,69 +549,59 @@ def test_an_empty_window_is_a_success_and_a_vendor_failure_is_not(post_dataset):
     )
     assert served_response.json()['data_points'] == 0
     failed_body = problem(failed_response, status=503, reason='VENDOR_UNAVAILABLE')
-    assert failed_body['reason'] != served_response.status_code, 'the two outcomes are not distinguishable'
     assert 'served_range' in served_response.json() and 'served_range' not in failed_body
 
 
 # ---------------------------------------------------------------------------------------------
-# 4. THE INFO LINE (Q-EMPTY, tj-3mk3u5.37.1): what a served fetch leaves in the log
+# 4. WHAT A SERVED REQUEST LEAVES BEHIND (Q-EMPTY, tj-3mk3u5.37.1): the attempt row, and no owner in any log line
 # ---------------------------------------------------------------------------------------------
+# The "Fetch served" INFO line (served range, as_of, feed, count) is RETIRED by the architect at the P35 gate
+# (tj-7zjov1.28, gate note of 2026-10-26, item 4): owner rulings 4 and 4b of tj-3mk3u5.37.1 never required a log, and
+# the push path keeps all four values durably on the attempt row. That row is what the next test pins.
 
 
-def test_a_served_fetch_logs_one_info_line_naming_the_range_as_of_feed_and_count(
-    post_dataset, caplog: pytest.LogCaptureFixture
-):
-    """One line per served fetch, carrying four values and NEVER the owner (D8).
+@pytest.mark.asyncio
+async def test_a_served_post_keeps_the_range_as_of_feed_and_count_on_its_attempt_row(store: PostStore, monkeypatch):
+    """The four values the retired INFO line carried, read from the one attempt row a served POST leaves.
 
-    WHY THE LINE EXISTS: tj-lldllr's known gap is a misspelled symbol served empty, and this line is
-    what makes that diagnosable from the logs alone. Each of the four values answers a different
-    question -- which window the vendor actually covered, how current it is, which tape, and how
-    much landed -- so each is asserted by name. A line that dropped one would still look like a
-    perfectly good log line.
-
-    AND NEVER THE OWNER. The owner is a principal's name and D8 keeps it out of logs entirely; it is
-    a SensitiveString elsewhere for the same reason. Adding it to this line is the single most
-    natural "improvement" anyone would make to it -- it is the one piece of context the line lacks
-    -- so the prohibition is asserted rather than left to the comment in the production file.
+    served_start and served_end are the trailer's served range (narrower than the request, so an echo is visible),
+    finished_at is the trailer's as_of, feed is the header's resolved tape and bars_written the bars stored.
     """
-    caplog.set_level(logging.INFO)
-    events = [fetch_dataset.FetchAccepted(feed=Feed.IEX), fetch_dataset.BarPage(bars=[bar(0, feed=Feed.IEX)])]
-    fetch_client = RecordingFetchClient(FetchScript(events=[*events, served_done(1)]))
+    sent: list[Any] = []
+    real_deliver = store.intake.deliver
 
-    response = post_dataset(_accepting_session(bar_statements=1), fetch_client)
+    async def deliver(attempt: Any) -> Any:
+        sent.append(attempt)
+        return await real_deliver(attempt)
+
+    monkeypatch.setattr(store.intake, 'deliver', deliver)
+
+    response = await post(store, SubmitDouble(store, _served([0])), REQUEST_BODY, monkeypatch)
 
     assert response.status_code == 200, response.text
-    served_lines = [
-        record.getMessage()
-        for record in caplog.records
-        if record.levelno == logging.INFO and 'Fetch served' in record.getMessage()
-    ]
-    assert len(served_lines) == 1, f'a served fetch logged {len(served_lines)} INFO lines, not one: {served_lines}'
-    line = served_lines[0]
-    for label, value in (
-        ('the served start', str(SERVED_START)),
-        ('the served end', str(SERVED_END)),
-        ('as_of', str(AS_OF)),
-        ('the resolved feed', str(Feed.IEX)),
-    ):
-        assert value in line, f'the INFO line does not name {label} ({value!r}): {line!r}'
-    assert re.search(r'\b1 written\b', line), f'the INFO line does not name the row count: {line!r}'
-    assert REQUEST_BODY['owner'] not in line, (
-        f'the INFO line names the owner, which is a principal and never goes to a log (D8): {line!r}'
-    )
+    # Since P51 the clamp's corporate-actions query is delivered first, with an attempt row of its own; this pin is
+    # about the BARS request's.
+    (request,) = await store.bars_requests()
+    (attempt,) = [report for report in sent if report.header.request_id == str(request.id)]
+    (run,) = [run for run in await store.runs() if run.request_id == request.id]
+    assert (run.served_start, run.served_end) == (SERVED_START, SERVED_END)
+    assert run.served_end != REQUESTED_END, 'the attempt row echoes the requested end, not the served one'
+    assert run.finished_at == attempt.trailer.as_of
+    assert (run.feed, run.bars_written) == (Feed.IEX, 1)
 
 
-def test_no_log_line_from_a_served_fetch_names_the_owner(post_dataset, caplog: pytest.LogCaptureFixture):
-    """The prohibition over EVERY record, not only the one line that is required to exist.
+@pytest.mark.asyncio
+async def test_no_log_line_from_a_served_request_names_the_owner(
+    store: PostStore, monkeypatch, caplog: pytest.LogCaptureFixture
+):
+    """D8 over EVERY record the request produced, at every level: the route, the submit path, the waiter, the intake.
 
-    The case above would stay green if the owner were logged by a different line at a different
-    level -- the route's own DEBUG line, say, which does log the symbol. This scans every record the
-    request produced, at every level, which is the form the D8 rule actually takes.
+    The owner now rides further than before -- the request row's client_label, the Submit's owner, the entry the
+    intake writes -- so there are more lines that could be tempted to name it, and this scans all of them.
     """
     caplog.set_level(logging.DEBUG)
-    fetch_client = RecordingFetchClient(FetchScript(events=accepted_stream([[0]])))
 
-    response = post_dataset(_accepting_session(bar_statements=1), fetch_client)
+    response = await post(store, SubmitDouble(store, _served([0])), REQUEST_BODY, monkeypatch)
 
     assert response.status_code == 200, response.text
     naming = [

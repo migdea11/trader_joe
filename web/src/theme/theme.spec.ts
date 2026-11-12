@@ -12,13 +12,13 @@ import { tokenCssVariables } from './cssVars'
 import { traderJoePreset } from './preset'
 import {
   ACCOUNT_GROUP_VALUES,
-  FRESHNESS_BADGES,
-  FRESHNESS_STATUS_VALUES,
+  DATASET_HEALTH_STATUS_VALUES,
   GROUP_SPECS,
+  HEALTH_BADGES,
   RUNNING_BADGE,
   STALE_BADGE,
   collectionBadge,
-  freshnessBadge,
+  healthBadge,
   needsAttention,
   requestBadge,
 } from './semantics'
@@ -167,49 +167,59 @@ describe('fonts are self-hosted', () => {
   })
 })
 
-describe('freshness status map', () => {
+describe('dataset health status map', () => {
   it('covers exactly the seven proto values', () => {
-    expect(Object.keys(FRESHNESS_BADGES).sort()).toEqual([...FRESHNESS_STATUS_VALUES].sort())
-    expect(FRESHNESS_STATUS_VALUES).toHaveLength(7)
+    expect(Object.keys(HEALTH_BADGES).sort()).toEqual([...DATASET_HEALTH_STATUS_VALUES].sort())
+    expect(DATASET_HEALTH_STATUS_VALUES).toHaveLength(7)
   })
 
   it.each([
-    ['FRESHNESS_STATUS_FRESH', 'Healthy', colors.status.ok],
-    ['FRESHNESS_STATUS_COMPLETE', 'Healthy', colors.status.ok],
-    ['FRESHNESS_STATUS_LATE', 'Late', colors.status.warn],
-    ['FRESHNESS_STATUS_OVERDUE', 'Failed', colors.status.fail],
-    ['FRESHNESS_STATUS_GAPS', 'Failed', colors.status.fail],
+    ['DATASET_HEALTH_STATUS_FRESH', 'Healthy', colors.status.ok],
+    ['DATASET_HEALTH_STATUS_COMPLETE', 'Healthy', colors.status.ok],
+    ['DATASET_HEALTH_STATUS_LATE', 'Late', colors.status.warn],
+    ['DATASET_HEALTH_STATUS_OVERDUE', 'Failed', colors.status.fail],
+    ['DATASET_HEALTH_STATUS_GAPS', 'Failed', colors.status.fail],
     // tj-grna9p.177: the enum name and the colour token stay; the word is Stopped (collect off).
-    ['FRESHNESS_STATUS_RETIRED', 'Stopped', colors.status.retired],
-    ['FRESHNESS_STATUS_UNSPECIFIED', 'Unknown', colors.text3],
+    ['DATASET_HEALTH_STATUS_RETIRED', 'Stopped', colors.status.retired],
+    ['DATASET_HEALTH_STATUS_UNSPECIFIED', 'Unknown', colors.text3],
   ])('%s is %s', (status, label, color) => {
-    expect(freshnessBadge(status)).toEqual({ label, color })
+    expect(healthBadge(status)).toEqual({ label, color })
   })
 
-  it.each([null, undefined, '', 'FRESHNESS_STATUS_STALE', 'fresh', 'HEALTHY', 'toString', '__proto__'])(
+  it.each([null, undefined, '', 'DATASET_HEALTH_STATUS_STALE', 'fresh', 'HEALTHY', 'toString', '__proto__'])(
     'an unset or unknown value (%j) is Unknown, never Healthy',
     (status) => {
-      const badge = freshnessBadge(status as string | null | undefined)
+      const badge = healthBadge(status as string | null | undefined)
       expect(badge.label).toBe('Unknown')
       expect(badge.color).not.toBe(colors.status.ok)
     },
   )
 
   it('needs attention is LATE, OVERDUE and GAPS only', () => {
-    const flagged = FRESHNESS_STATUS_VALUES.filter((s) => needsAttention(s))
-    expect(flagged.sort()).toEqual(['FRESHNESS_STATUS_GAPS', 'FRESHNESS_STATUS_LATE', 'FRESHNESS_STATUS_OVERDUE'])
+    const flagged = DATASET_HEALTH_STATUS_VALUES.filter((s) => needsAttention(s))
+    expect(flagged.sort()).toEqual(['DATASET_HEALTH_STATUS_GAPS', 'DATASET_HEALTH_STATUS_LATE', 'DATASET_HEALTH_STATUS_OVERDUE'])
     expect(needsAttention(null)).toBe(false)
     expect(needsAttention(undefined)).toBe(false)
   })
 
-  it('a running run overlays Running, otherwise the freshness badge shows', () => {
-    expect(collectionBadge('FRESHNESS_STATUS_GAPS', { running: true })).toBe(RUNNING_BADGE)
-    expect(collectionBadge('FRESHNESS_STATUS_GAPS').label).toBe('Failed')
+  // tj-grna9p.168: the server sends DATASET_HEALTH_STATUS_* now. A pre-rename value is not a
+  // synonym: it is a value this build does not know, so it is Unknown (and never Healthy).
+  it.each(['FRESHNESS_STATUS_FRESH', 'FRESHNESS_STATUS_COMPLETE', 'FRESHNESS_STATUS_LATE', 'FRESHNESS_STATUS_GAPS'])(
+    'the pre-rename value %s is Unknown',
+    (status) => {
+      expect(healthBadge(status)).toEqual({ label: 'Unknown', color: colors.text3 })
+      expect(needsAttention(status)).toBe(false)
+    },
+  )
+
+  it('a running run overlays Running, otherwise the health badge shows', () => {
+    expect(collectionBadge('DATASET_HEALTH_STATUS_GAPS', { running: true })).toBe(RUNNING_BADGE)
+    expect(collectionBadge('DATASET_HEALTH_STATUS_GAPS').label).toBe('Failed')
     expect(collectionBadge(null).label).toBe('Unknown')
   })
 
   it('the Stale usage badge shares no colour with any collection health state', () => {
-    const healthColours = new Set([...Object.values(FRESHNESS_BADGES).map((b) => b.color), RUNNING_BADGE.color])
+    const healthColours = new Set([...Object.values(HEALTH_BADGES).map((b) => b.color), RUNNING_BADGE.color])
     expect(STALE_BADGE.label).toBe('Stale')
     expect(healthColours.has(STALE_BADGE.color)).toBe(false)
   })
@@ -254,7 +264,7 @@ describe('trading group specs', () => {
 
 describe('StatusBadge', () => {
   it('renders the label as text and colours the dot and text from the spec', () => {
-    const wrapper = mount(StatusBadge, { props: { badge: freshnessBadge('FRESHNESS_STATUS_LATE') } })
+    const wrapper = mount(StatusBadge, { props: { badge: healthBadge('DATASET_HEALTH_STATUS_LATE') } })
     expect(wrapper.text()).toBe('Late')
     // jsdom normalises hex to rgb(): #d29922 is rgb(210, 153, 34).
     expect(wrapper.attributes('style')).toContain('rgb(210, 153, 34)')
@@ -288,7 +298,7 @@ describe('titleCase', () => {
   })
 
   it('the unit-checked string table: tabs, sections and sub-tabs are title case', () => {
-    expect(DATA_TABS).toEqual(['Datasets', 'Requests', 'Health', 'Usage'])
+    expect(DATA_TABS).toEqual(['Datasets', 'Panels', 'Requests', 'Health', 'Usage'])
     for (const label of [...DATA_TABS, ...SECTIONS.map((s) => s.label), ...DATA_SUB_TABS.map((t) => t.label)]) {
       expect(isTitleCase(label), label).toBe(true)
     }

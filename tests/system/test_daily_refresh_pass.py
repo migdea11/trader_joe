@@ -1,27 +1,34 @@
-"""The interim DAILY refresh on real Postgres, fetching from FakeRead over real gRPC (validator, gating tj-grna9p.22).
+"""The interim DAILY refresh on real Postgres, its requests answered through the real delivery intake (validator).
 
-The design is the architect's ruling on tj-utqd77 Q1 and its notes on tj-grna9p.22: the store triggers and ingest
-sees an ORDINARY FetchDataset request; each pass derives its work from the database and asks only for the MISSING
-TAIL of each behind, non-retired DAILY dataset, through the existing worker and run recorder (trigger SCHEDULE, actor
-`scheduler`).
+The design is the architect's ruling on tj-utqd77 Q1 and its notes on tj-grna9p.22, as the push path (tj-7zjov1.28,
+P35) changed it: each pass derives its work from the database, asks only for the MISSING TAIL of each behind,
+non-retired DAILY dataset, and now WRITES a request (trigger SCHEDULE, the entry's dataset_id, actor `scheduler`,
+ready_by the next market open) and SUBMITS it without waiting; ingest pushes the result to the store's delivery
+intake, which writes the bars under the named entry in one transaction.
 
-What only this tier shows, and is pinned here (data/store/tests/test_daily_refresh.py is the SQLite tier, where the
-entry upsert and the bar write are Postgres statements that cannot run):
-  * the narrowed request (fetch_start = last bar + one bar) resolves, through the real INSERT ... ON CONFLICT, to the
-    SAME entry: one entry, the same id, the declared range unchanged, and the own-overlap check passes it as an exact
-    repeat (no 409);
-  * the new bars are stored on that entry and the old ones are untouched, and a second pass asks only from the new
-    last bar (a restart re-requests only what is missing);
-  * a refused ack (the stored tape is one this deployment cannot serve) leaves no second entry and no bar, and its
-    run is FAILED with FEED_NOT_AVAILABLE;
-  * the recorded runs round-trip trigger SCHEDULE, actor `scheduler` and the narrowed requested_start;
+REPAIRED FOR THE PUSH PATH (validator, tj-7zjov1.28). Until P35 this file hosted ingest's FetchDataset servicer around
+FakeRead and the refresh fetched through GrpcIngestFetchClient; that stream and client are gone (P37). The Submit and
+the delivery have their own gRPC tier (test_delivery_intake.py, test_delivery_intake_pg.py); what only THIS file shows
+is the refresh's own end on Postgres, so ingest is now a double that answers each Submit as ingest does (a tape it
+cannot serve is a refused answer) and then DELIVERS, through the real DeliveryIntake on the scratch database, exactly
+the bars FakeRead serves (tests.fakes.market_data.fake_bar), as of the pass's clock. Pinned here:
+  * the narrowed request (the tail) lands, through the real bar INSERT ... ON CONFLICT, on the SAME entry: one entry,
+    the same id, the declared range unchanged; the new bars are stored on it and the old ones are untouched, and a
+    second pass asks only from the new last bar;
+  * a refused Submit (the stored tape is one this deployment cannot serve) leaves no second entry and no bar, and its
+    request is FAILED with cause PERMANENT; the refresh's request rows round-trip trigger SCHEDULE, the actor, the
+    dataset id, ready_by and the narrowed requested_start, and the attempt row takes the trigger;
+  * an operator Stop committed before the delivery drops it (the request EMPTY, cause DISCARDED), one committed while
+    the delivery holds the entry's row lock waits for it and is kept, and an expiry PATCH drops nothing;
   * (tj-grna9p.167) a newest bar written before its session closed is asked for again INCLUSIVELY, and the real
     ON CONFLICT DO UPDATE rewrites that row with an updated_at past the close, so it then reads FRESH.
 
-THE FAKE BROKER. This client container is not on the ingest_store network, so it cannot dial the stack's
-data-ingest-grpc. The same thing is built here instead: data_ingest's own registered_services (the real FetchDataset
-servicer and handler) around tests.fakes.market_data.FakeRead, hosted by the real GrpcServerHost on 127.0.0.1, and
-reached through the real GrpcIngestFetchClient. The fake's clock is the pass's clock.
+First run on Postgres 2026-10-26: four tests failed on the TEST, not the store. The double stepped 24 hours from the
+requested start instead of serving FakeRead's UTC-midnight grid, the expected tail was the last bar plus 24 hours
+instead of the local midnight after its session (_after_bar), and the provisional bar was stamped after its own
+session's close, so it was written before its stamp and fell under the lost-anchor rule instead. Repaired by the
+validator (tj-7zjov1.28); re-run on the stack pending. It runs with the rest of the suite (make test-system, or
+agent-stack run_system_tests after test_up) on a stack migrated to the head.
 
 WHY A SCRATCH DATABASE: a pass refreshes EVERY behind DAILY dataset it finds, and the stack's database holds rows
 this suite does not own. So every pass here runs against a database this test creates, migrates and drops.
@@ -35,6 +42,7 @@ from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import pytest
 import sqlalchemy as sa
@@ -42,23 +50,29 @@ from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 
 from common.database.sql_alchemy_nullable_datetime import NullableDateTime
 from common.enums.data_stock import DataSource, ExpiryType, Feed, Granularity, UpdateType
-from common.errors.vocabulary import Reason
-from common.rpc.channel import create_channel
-from common.rpc.clients.ingest_fetch import GrpcIngestFetchClient
-from common.rpc.server import BindAddress, GrpcServerHost
-from data.ingest.app.grpc_host import registered_services
+from common.errors.vocabulary import ERROR_DOMAIN, Reason
 from data.store.app import daily_refresh as refresh_module
-from data.store.app.client_label import OPERATOR_PRINCIPAL
+from data.store.app.client_label import OPERATOR_PRINCIPAL, PANEL_OWNER
 from data.store.app.daily_refresh import SCHEDULER_ACTOR, DailyRefresher, PassResult
 from data.store.app.database.crud.stock.dataset_catalog import get_catalog_row
 from data.store.app.database.models.dataset_override_log import DatasetOverrideLog
+from data.store.app.database.models.ingest_request import IngestRequest, IngestRequestFailureCause, IngestRequestState
 from data.store.app.database.models.ingest_run import IngestRun, IngestRunState, IngestRunTrigger
 from data.store.app.events import DatasetChange, DatasetChanged
-from data.store.app.health import FreshnessStatus, evaluate_dataset
-from data.store.app.ingest import data_action_request, run_recording
+from data.store.app.health import DatasetHealthStatus, evaluate_dataset
+from data.store.app.ingest import data_action_request, delivery_intake
 from data.store.app.trading_calendar import calendar_for_source
+from schemas.data_ingest.delivery import (
+    AttemptDelivery,
+    DeliveryHeader,
+    DeliveryOutcome,
+    DeliveryTrailer,
+    VendorCallStats,
+)
+from schemas.data_ingest.fetch_dataset import Bar, BarPage, FetchRefused, ServedRange
+from schemas.data_ingest.submit import SubmitAccepted, SubmitAck, SubmitRequest, SubmitResponse
 from tests.fakes.market_data import FEED as FAKE_FEED
-from tests.fakes.market_data import FakeRead, fake_bar
+from tests.fakes.market_data import fake_bar, grid_timestamps
 from tests.system import test_reaper_race as race
 from tests.system import test_usage_record
 from tests.system.conftest import BAR_TABLE, ENTRY_TABLE
@@ -73,7 +87,7 @@ _head = test_usage_record._head
 store = race.store
 
 RUN = IngestRun.__table__
-LOOPBACK = '127.0.0.1'
+REQUEST = IngestRequest.__table__
 
 # Tue 6 Oct 2026 22:00Z: the 6th's XNYS session closed at 20:00Z. FakeRead stamps a daily bar at UTC midnight, which
 # is the previous evening in New York, so a bar at 2 Oct 00:00Z belongs to the 1st's session and the dataset is behind.
@@ -81,20 +95,40 @@ NOW = datetime(2026, 10, 6, 22, 0, tzinfo=UTC)
 DAY = Granularity.ONE_DAY.offset
 START = datetime(2026, 9, 28, tzinfo=UTC)
 SEEDED = [START + DAY * k for k in range(5)]  # 28 Sep .. 2 Oct, 00:00Z
-UNSERVABLE_FEED = Feed.SIP
+# A feed no Alpaca handle serves (tj-7zjov1.343): SIP is now the default the fake serves and IEX is served when named,
+# so NOT_APPLICABLE is the refusal, in production and in this in-process fake alike.
+UNSERVABLE_FEED = Feed.NOT_APPLICABLE
 assert UNSERVABLE_FEED is not FAKE_FEED
+# The tape every entry this file expects refreshed is stored on: the one FakeIngest serves. The refresh asks for the
+# entry's stored tape, and FakeIngest refuses any other, so an entry left on entry_values' default (IEX, conftest.py)
+# is refused, not refreshed, once FAKE_FEED is SIP (tj-7zjov1.350 F-B). Named on every seeding site, not inherited.
+SERVED_FEED = FAKE_FEED
+# The DAILY loop's ready_by at NOW: the open of Wed 7 Oct, 09:30 New York (EDT).
+NEXT_OPEN = datetime(2026, 10, 7, 13, 30, tzinfo=UTC)
+# Where the tail starts after the newest stored 1day bar (CLAUDE.md DAILY refresh, _after_bar): the LOCAL midnight
+# after that bar's session, never the bar plus 24 hours. The bar at 2 Oct 00:00Z is the 1st's session (8 pm New
+# York), so the tail starts at the 2nd's local midnight, 04:00Z under EDT. Written as a literal on purpose: the
+# expectation does not come from the code under test.
+TAIL_START = datetime(2026, 10, 2, 4, 0, tzinfo=UTC)
+NY = ZoneInfo('America/New_York')
 
 
-class CountingRead(FakeRead):
-    """FakeRead, counting the bar queries that reach the vendor side."""
+def grid_stamps(start: datetime, end: datetime) -> list[datetime]:
+    """FakeRead's 1day stamps in [start, end): UTC midnights, the first at or after start (tests.fakes.market_data)."""
+    return list(grid_timestamps(Granularity.ONE_DAY, start, end))
 
-    def __init__(self, clock: Callable[[], datetime]) -> None:
-        super().__init__(clock=clock)
-        self.queries: list[Any] = []
 
-    async def get_bars(self, query, *args, **kwargs):
-        self.queries.append(query)
-        return await super().get_bars(query, *args, **kwargs)
+def vendor_stamps(start: datetime, end: datetime) -> list[datetime]:
+    """A real vendor's 1day stamps in [start, end): each New York local midnight, the first at or after start."""
+    day = start.astimezone(NY).date()
+    stamps = []
+    while True:
+        stamp = datetime.combine(day, datetime.min.time(), tzinfo=NY).astimezone(UTC)
+        if stamp >= end:
+            return stamps
+        if stamp >= start:
+            stamps.append(stamp)
+        day += timedelta(days=1)
 
 
 class Clock:
@@ -105,11 +139,96 @@ class Clock:
         return self.now
 
 
+class FakeIngest:
+    """Ingest as the refresh sees it: answers each Submit, then (deliver_all) reports the one attempt it made.
+
+    A request naming a tape other than FakeRead's is REFUSED in the answer, as ingest refuses a feed it cannot serve.
+    An accepted request is delivered as one SUCCEEDED attempt carrying every bar FakeRead serves for the symbol: its
+    grid (UTC midnights) from the first point at or after the requested start while before the clock, its served
+    window [start, clock). `stamps` replaces the grid where a test needs a real vendor's local-midnight stamps.
+    """
+
+    def __init__(
+        self,
+        clock: Clock,
+        intake: delivery_intake.DeliveryIntake,
+        stamps: Callable[[datetime, datetime], list[datetime]] = grid_stamps,
+    ) -> None:
+        self.clock = clock
+        self.intake = intake
+        self.stamps = stamps
+        self.instance_id = f'drp-{uuid.uuid4()}'
+        self.submitted: list[SubmitRequest] = []
+        self.queued: list[SubmitRequest] = []
+
+    def asked(self) -> list[tuple[Feed | None, datetime]]:
+        return sorted((request.bars.feed, request.bars.start) for request in self.submitted)
+
+    async def submit(self, request: SubmitRequest) -> SubmitResponse:
+        self.submitted.append(request)
+        if request.bars.feed not in (None, FAKE_FEED):
+            refused = FetchRefused(
+                reason=Reason.FEED_NOT_AVAILABLE.value, domain=ERROR_DOMAIN, detail='not this tape', metadata={}
+            )
+            return SubmitResponse(ack=SubmitAck(refused=refused), instance_id=self.instance_id)
+        self.queued.append(request)
+        accepted = SubmitAccepted(feed=FAKE_FEED, quota_key='drp-quota')
+        return SubmitResponse(ack=SubmitAck(accepted=accepted), instance_id=self.instance_id)
+
+    async def instance(self) -> Any:
+        raise AssertionError('the refresh never probes the instance')
+
+    def _report(self, request: SubmitRequest) -> AttemptDelivery:
+        now = self.clock.now
+        bars = []
+        for stamp in self.stamps(request.bars.start, now):
+            served = fake_bar(request.bars.asset_symbol, stamp)
+            bars.append(
+                Bar(
+                    bar_start=served.timestamp,
+                    open=served.open,
+                    high=served.high,
+                    low=served.low,
+                    close=served.close,
+                    volume=float(served.volume),
+                    trade_count=served.trade_count,
+                    feed=FAKE_FEED,
+                )
+            )
+        called = now - timedelta(seconds=5)
+        return AttemptDelivery(
+            header=DeliveryHeader(
+                request_id=request.request_id,
+                instance_id=self.instance_id,
+                attempt_no=1,
+                quota_key='drp-quota',
+                feed=FAKE_FEED,
+                vendor_asset_id='',
+            ),
+            parts=[BarPage(bars=bars)] if bars else [],
+            trailer=DeliveryTrailer(
+                outcome=DeliveryOutcome.SUCCEEDED,
+                vendor_stats=VendorCallStats(
+                    calls=1, pages=1, throttled_429=0, retries=0, first_call_at=called, last_call_at=called
+                ),
+                served_range=ServedRange(start=request.bars.start, end=now),
+                as_of=now,
+            ),
+        )
+
+    async def deliver_all(self) -> None:
+        """Deliver every accepted request, in the order it was submitted."""
+        queued, self.queued = self.queued, []
+        for request in queued:
+            await self.intake.deliver(self._report(request))
+
+
 def _seed(engine: sa.Engine, entry_values, bar_values, run_identity) -> dict[str, uuid.UUID]:
     daily = {
         'update_type': UpdateType.DAILY.value,
         'expiry_type': ExpiryType.ROLLING.value,
         'granularity': Granularity.ONE_DAY,
+        'feed': SERVED_FEED,
         'start': START,
         'end': NullableDateTime.EPOCH,
     }
@@ -149,18 +268,20 @@ def _bar_times(engine: sa.Engine, dataset_id: uuid.UUID) -> list[datetime]:
         )
 
 
-def _asked(reader: CountingRead) -> list[tuple[Feed, datetime]]:
-    return sorted((query.feed, query.start) for query in reader.queries)
-
-
 def _runs(engine: sa.Engine) -> list[sa.Row]:
     with engine.connect() as conn:
         return list(conn.execute(sa.select(RUN).order_by(RUN.c.started_at)))
 
 
+def _requests(engine: sa.Engine) -> dict[uuid.UUID | None, sa.Row]:
+    """The request rows, by the dataset they name."""
+    with engine.connect() as conn:
+        return {row.dataset_id: row for row in conn.execute(sa.select(REQUEST))}
+
+
 @pytest.fixture
 def point_refresh(monkeypatch: pytest.MonkeyPatch, scratch_async: AsyncEngine) -> list[Any]:
-    """The refresh's and the run recorder's own_session on the scratch database; returns the events published."""
+    """The refresh's, the submit path's and the intake's own_session on the scratch database; the events published."""
 
     @asynccontextmanager
     async def own_session() -> AsyncIterator[AsyncSession]:
@@ -169,23 +290,15 @@ def point_refresh(monkeypatch: pytest.MonkeyPatch, scratch_async: AsyncEngine) -
 
     published: list[Any] = []
     monkeypatch.setattr(refresh_module, 'own_session', own_session)
-    monkeypatch.setattr(run_recording, 'own_session', own_session)
-    monkeypatch.setattr(refresh_module, 'publish', published.append)
-    monkeypatch.setattr(run_recording, 'publish', published.append)
+    monkeypatch.setattr(data_action_request, 'own_session', own_session)
+    monkeypatch.setattr(delivery_intake, 'own_session', own_session)
+    monkeypatch.setattr(delivery_intake, 'publish', published.append)
     monkeypatch.delenv(refresh_module.MAX_PER_PASS_ENV, raising=False)
     return published
 
 
-@asynccontextmanager
-async def _ingest(clock: Clock) -> AsyncIterator[tuple[GrpcIngestFetchClient, CountingRead]]:
-    """data_ingest's FetchDataset servicer around FakeRead, on loopback, and the store's real client to it."""
-    reader = CountingRead(clock)
-    async with GrpcServerHost(BindAddress(LOOPBACK, 0), registered_services({DataSource.ALPACA_API: reader})) as host:
-        channel = create_channel(f'{LOOPBACK}:{host.port}')
-        try:
-            yield GrpcIngestFetchClient(channel, deadline_s=30), reader
-        finally:
-            await channel.close()
+def _ingest(clock: Clock, stamps: Callable[[datetime, datetime], list[datetime]] = grid_stamps) -> FakeIngest:
+    return FakeIngest(clock, delivery_intake.DeliveryIntake(), stamps)
 
 
 @pytest.mark.asyncio
@@ -196,68 +309,109 @@ async def test_a_refresh_extends_the_same_entry_with_only_the_missing_tail_on_po
     ids = _seed(scratch_db.engine, entry_values, bar_values, run_identity)
     before = _entries(scratch_db.engine)
     clock = Clock(NOW)
+    ingest = _ingest(clock)
 
-    async with _ingest(clock) as (client, reader):
-        result = await DailyRefresher(client, clock=clock).run_pass(DataSource.ALPACA_API)
+    result = await DailyRefresher(ingest, clock=clock).run_pass(DataSource.ALPACA_API)
 
-        # FEED_NOT_AVAILABLE is REFUSED in the vocabulary: a permanent refusal, not a transient failure.
-        assert result == PassResult(behind=2, refreshed=1, failed=0, deferred=0, refused=1)
-        # Retired is never asked for. Each request names the stored tape and starts at the missing tail.
-        assert _asked(reader) == sorted([(FAKE_FEED, SEEDED[-1] + DAY), (UNSERVABLE_FEED, SEEDED[-1] + DAY)])
+    # FEED_NOT_AVAILABLE is REFUSED in the vocabulary: a permanent refusal, not a transient failure.
+    assert result == PassResult(behind=2, refreshed=1, failed=0, deferred=0, refused=1)
+    # Retired is never asked for. Each request names the stored tape and starts at the missing tail.
+    assert ingest.asked() == sorted([(FAKE_FEED, TAIL_START), (UNSERVABLE_FEED, TAIL_START)])
+    requests = _requests(scratch_db.engine)
+    assert set(requests) == {ids['behind'], ids['refused']}
+    for request in requests.values():
+        assert request.trigger == IngestRunTrigger.SCHEDULE
+        assert request.client_label == SCHEDULER_ACTOR
+        assert request.requested_start == TAIL_START
+        assert request.requested_end is None
+        assert request.ready_by == NEXT_OPEN
+        assert (request.expiry, request.collect, request.expiry_type) == (None, None, None)
+    refused = requests[ids['refused']]
+    assert (refused.state, refused.failure_cause) == (IngestRequestState.FAILED, IngestRequestFailureCause.PERMANENT)
+    assert requests[ids['behind']].state == IngestRequestState.QUEUED, 'the pass waited, or the Submit was lost'
 
-        after = _entries(scratch_db.engine)
-        assert set(after) == set(before), 'the refresh created or removed an entry'
-        behind = after[ids['behind']]
-        assert (behind.start, behind.end, behind.feed, behind.expiry) == (
-            START,
-            NullableDateTime.EPOCH,
-            FAKE_FEED,
-            None,
-        ), 'the entry is not the declared one any more'
-        new_bars = [SEEDED[-1] + DAY * k for k in range(1, 5)]  # 3 Oct .. 6 Oct 00:00Z, all before NOW
-        assert _bar_times(scratch_db.engine, ids['behind']) == SEEDED + new_bars
-        for name in ('refused', 'retired'):
-            assert _bar_times(scratch_db.engine, ids[name]) == SEEDED, f'{name} changed'
-            assert after[ids[name]] == before[ids[name]]
+    await ingest.deliver_all()
 
-        runs = _runs(scratch_db.engine)
-        assert len(runs) == 2
-        ok = next(run for run in runs if run.state == IngestRunState.SUCCEEDED)
-        refused = next(run for run in runs if run.state == IngestRunState.FAILED)
-        for run in runs:
-            assert run.trigger == IngestRunTrigger.SCHEDULE
-            assert run.actor == SCHEDULER_ACTOR
-            assert run.requested_end is None
-        assert (ok.dataset_id, ok.bars_written, ok.requested_start) == (ids['behind'], 4, SEEDED[-1] + DAY)
-        assert (refused.dataset_id, refused.error_reason, refused.requested_start) == (
-            None,
-            str(Reason.FEED_NOT_AVAILABLE),
-            SEEDED[-1] + DAY,
-        )
-        assert [e for e in point_refresh if isinstance(e, DatasetChanged)] == [
-            DatasetChanged(ids['behind'], DatasetChange.UPDATED)
-        ]
+    after = _entries(scratch_db.engine)
+    assert set(after) == set(before), 'the refresh created or removed an entry'
+    behind = after[ids['behind']]
+    assert (behind.start, behind.end, behind.feed, behind.expiry) == (START, NullableDateTime.EPOCH, FAKE_FEED, None), (
+        'the entry is not the declared one any more'
+    )
+    # FakeRead's grid from TAIL_START: 3 Oct .. 6 Oct 00:00Z, all before NOW.
+    new_bars = [SEEDED[-1] + DAY * k for k in range(1, 5)]
+    assert _bar_times(scratch_db.engine, ids['behind']) == SEEDED + new_bars
+    for name in ('refused', 'retired'):
+        assert _bar_times(scratch_db.engine, ids[name]) == SEEDED, f'{name} changed'
+        assert after[ids[name]] == before[ids[name]]
 
-        # The next day's pass asks only from the new last bar, and still extends the same entry.
-        clock.now = NOW + timedelta(days=1)
-        reader.queries.clear()
-        second = await DailyRefresher(client, clock=clock).run_pass(DataSource.ALPACA_API)
+    (attempt,) = _runs(scratch_db.engine)
+    assert (attempt.dataset_id, attempt.state, attempt.bars_written) == (ids['behind'], IngestRunState.SUCCEEDED, 4)
+    assert (attempt.trigger, attempt.actor, attempt.requested_start) == (
+        IngestRunTrigger.SCHEDULE,
+        SCHEDULER_ACTOR,
+        TAIL_START,
+    )
+    assert _requests(scratch_db.engine)[ids['behind']].state == IngestRequestState.SUCCEEDED
+    assert [e for e in point_refresh if isinstance(e, DatasetChanged)] == [
+        DatasetChanged(ids['behind'], DatasetChange.UPDATED)
+    ]
 
-    # The refused tape's last scheduled attempt asked for the same tail and finished (server clock) after the last
-    # close, so it is skipped; matched on the request's fields, since it failed before the ack.
-    assert second == PassResult(behind=2, refreshed=1, skipped=1)
-    assert _asked(reader) == [(FAKE_FEED, new_bars[-1] + DAY)]
+    # The next day's pass asks only after the new last bar, and still extends the same entry. That bar (6 Oct 00:00Z)
+    # is the 5th's session, so the tail starts at the 6th's local midnight, 04:00Z.
+    clock.now = NOW + timedelta(days=1)
+    ingest.submitted.clear()
+    await DailyRefresher(ingest, clock=clock).run_pass(DataSource.ALPACA_API)
+    await ingest.deliver_all()
+
+    second_tail = datetime(2026, 10, 6, 4, 0, tzinfo=UTC)
+    assert [start for feed, start in ingest.asked() if feed == FAKE_FEED] == [second_tail]
     assert set(_entries(scratch_db.engine)) == set(before)
     assert _bar_times(scratch_db.engine, ids['behind']) == [*SEEDED, *new_bars, new_bars[-1] + DAY]
 
 
+@pytest.mark.asyncio
+async def test_a_refused_tape_is_skipped_by_the_next_pass_before_the_close_on_postgres(
+    scratch_db, point_refresh, entry_values, bar_values, run_identity
+):
+    """The refused tape's request asked for the same tail and finished after the last close: the next pass skips it.
+
+    The refusal writes no attempt row (no vendor call was made); finished_scheduled_runs reads the FAILED SCHEDULE
+    request itself into the history (tj-7zjov1.160), over Postgres's ARRAY data_types. The SQLite twin is
+    test_daily_refresh.py test_a_submit_refused_for_good_is_skipped_until_the_next_close.
+    """
+    scratch_db.must('upgrade', _head())
+    ids = _seed(scratch_db.engine, entry_values, bar_values, run_identity)
+    clock = Clock(NOW)
+    ingest = _ingest(clock)
+    await DailyRefresher(ingest, clock=clock).run_pass(DataSource.ALPACA_API)
+    await ingest.deliver_all()
+
+    clock.now = NOW + timedelta(hours=1)
+    ingest.submitted.clear()
+    second = await DailyRefresher(ingest, clock=clock).run_pass(DataSource.ALPACA_API)
+
+    assert [feed for feed, _start in ingest.asked()] == [FAKE_FEED]
+    assert second.skipped == 1
+    refused_id = _requests(scratch_db.engine)[ids['refused']].id
+    with scratch_db.engine.connect() as conn:
+        refused_requests = conn.execute(
+            sa.select(sa.func.count()).select_from(REQUEST).where(REQUEST.c.dataset_id == ids['refused'])
+        ).scalar_one()
+        attempts = conn.execute(
+            sa.select(sa.func.count()).select_from(RUN).where(RUN.c.request_id == refused_id)
+        ).scalar_one()
+    assert (refused_requests, attempts) == (1, 0), 'the refused tape was re-sent, or its refusal wrote an attempt row'
+
+
 # ---------------------------------------------------------------------------------------------
-# Round 2 (fix 0b6d9d8): an operator retire racing the scheduled write. The refresh locks the entry FOR UPDATE on
-# the ack and re-checks it; its upsert never writes expiry or collect. Since tj-grna9p.175 the retire is
-# PATCH .../collecting {collect: false}; an expiry PATCH is the deletion date only and drops nothing. Only Postgres has the row lock, so only here does the
-# second case (a PATCH after the ack waits for the refresh's commit) mean anything. The PATCH is the real operator
-# route (test_reaper_race's in-process app on the scratch database); the dataset is the operator's own, so the PATCH
-# writes no override row and any override row would be the system actor's.
+# Round 2 (fix 0b6d9d8), on the push path: an operator Stop racing the scheduled write. The delivery intake locks the
+# entry FOR UPDATE (lock_active_dataset_entry) and judges it under that lock; a stopped or deleted entry DROPS the
+# delivery. Its writes never touch expiry or collect. Since tj-grna9p.175 the Stop is PATCH .../collecting
+# {collect: false}; an expiry PATCH is the deletion date only and drops nothing. Only Postgres has the row lock, so
+# only here does the second case (a PATCH while the delivery holds the entry waits for its commit) mean anything. The
+# PATCH is the real operator route (test_reaper_race's in-process app on the scratch database); the dataset is the
+# operator's own, so the PATCH writes no override row and any override row would be the system actor's.
 
 RETIRE_AT = datetime(2026, 10, 10, tzinfo=UTC)
 STOP = {'collect': False}
@@ -281,6 +435,7 @@ def _operator_daily(engine: sa.Engine, entry_values, bar_values, run_identity) -
                     update_type=UpdateType.DAILY.value,
                     expiry_type=ExpiryType.ROLLING.value,
                     granularity=Granularity.ONE_DAY,
+                    feed=SERVED_FEED,
                     start=START,
                     end=NullableDateTime.EPOCH,
                 )
@@ -298,91 +453,79 @@ def _override_rows(engine: sa.Engine) -> int:
 
 
 @pytest.mark.asyncio
-async def test_a_retire_that_commits_during_the_vendor_call_drops_the_answer_on_postgres(
+async def test_a_stop_that_commits_before_the_delivery_drops_the_answer_on_postgres(
     store, scratch_db, point_refresh, entry_values, bar_values, run_identity
 ):
     dataset_id = _operator_daily(scratch_db.engine, entry_values, bar_values, run_identity)
     clock = Clock(NOW)
-    responses: list[Any] = []
+    ingest = _ingest(clock)
 
-    async with _ingest(clock) as (client, reader):
-        served = reader.get_bars
+    result = await DailyRefresher(ingest, clock=clock).run_pass(DataSource.ALPACA_API)
+    # The operator's PATCH commits while the request is out, before ingest delivers.
+    response = await _stop(store, dataset_id)
+    await ingest.deliver_all()
 
-        async def retire_then_serve(query, *args, **kwargs):
-            # The operator's PATCH commits while the vendor call is in flight, before ingest's ack.
-            responses.append(await _stop(store, dataset_id))
-            return await served(query, *args, **kwargs)
-
-        reader.get_bars = retire_then_serve
-        result = await DailyRefresher(client, clock=clock).run_pass(DataSource.ALPACA_API)
-
-    (response,) = responses
     assert response.status_code == 200, response.text
-    assert result == PassResult(behind=1, discarded=1)
+    assert result == PassResult(behind=1, refreshed=1)
     entry = _entries(scratch_db.engine)[dataset_id]
     assert entry.collect is False, 'the system actor undid the operator retire'
     assert _bar_times(scratch_db.engine, dataset_id) == SEEDED, 'bars were written for a retired dataset'
     (run,) = _runs(scratch_db.engine)
     assert (run.state, run.bars_written, run.error_reason) == (IngestRunState.EMPTY, 0, None)
+    request = _requests(scratch_db.engine)[dataset_id]
+    assert (request.state, request.failure_cause) == (IngestRequestState.EMPTY, IngestRequestFailureCause.DISCARDED)
     assert _override_rows(scratch_db.engine) == 0
     assert not [e for e in point_refresh if isinstance(e, DatasetChanged)]
 
 
 @pytest.mark.asyncio
-async def test_a_retire_after_the_ack_waits_for_the_refresh_and_is_kept_on_postgres(
+async def test_a_stop_while_the_delivery_holds_the_entry_waits_for_it_and_is_kept_on_postgres(
     store, scratch_db, point_refresh, entry_values, bar_values, run_identity, monkeypatch
 ):
     dataset_id = _operator_daily(scratch_db.engine, entry_values, bar_values, run_identity)
     clock = Clock(NOW)
-    upserted, release = asyncio.Event(), asyncio.Event()
-    # The scheduled write stops right after its locked re-check and upsert, holding the row lock, before any bar.
+    ingest = _ingest(clock)
+    locked, release = asyncio.Event(), asyncio.Event()
+    # The delivery stops right after its locked judgement of the entry (touch_entry runs under the row lock), before
+    # any bar, holding the lock.
     monkeypatch.setattr(
-        data_action_request,
-        'upsert_entry_in_transaction',
-        race._held(data_action_request.upsert_entry_in_transaction, upserted, release, after=True),
+        delivery_intake, 'touch_entry', race._held(delivery_intake.touch_entry, locked, release, after=True)
     )
 
-    async with _ingest(clock) as (client, _reader):
-        refresh = asyncio.create_task(DailyRefresher(client, clock=clock).run_pass(DataSource.ALPACA_API))
-        patch = None
-        try:
-            await asyncio.wait_for(upserted.wait(), race.WAIT_SECONDS)
-            patch = asyncio.create_task(_stop(store, dataset_id))
-            assert await race._a_backend_waits_on_a_lock(scratch_db), 'the PATCH did not wait on the refresh lock'
-            assert not patch.done(), 'the PATCH completed while the refresh held the entry'
-        finally:
-            release.set()
-            result = await refresh
-            response = await patch if patch is not None else None
+    result = await DailyRefresher(ingest, clock=clock).run_pass(DataSource.ALPACA_API)
+    delivery = asyncio.create_task(ingest.deliver_all())
+    patch = None
+    try:
+        await asyncio.wait_for(locked.wait(), race.WAIT_SECONDS)
+        patch = asyncio.create_task(_stop(store, dataset_id))
+        assert await race._a_backend_waits_on_a_lock(scratch_db), 'the PATCH did not wait on the delivery lock'
+        assert not patch.done(), 'the PATCH completed while the delivery held the entry'
+    finally:
+        release.set()
+        await delivery
+        response = await patch if patch is not None else None
 
     assert response is not None and response.status_code == 200, response
     assert result == PassResult(behind=1, refreshed=1)
     entry = _entries(scratch_db.engine)[dataset_id]
-    assert entry.collect is False, 'the stop that waited for the refresh was lost'
+    assert entry.collect is False, 'the stop that waited for the delivery was lost'
     assert _bar_times(scratch_db.engine, dataset_id) == SEEDED + [SEEDED[-1] + DAY * k for k in range(1, 5)]
     assert _override_rows(scratch_db.engine) == 0
 
 
 @pytest.mark.asyncio
-async def test_a_deletion_date_set_during_the_vendor_call_drops_nothing_on_postgres(
+async def test_a_deletion_date_set_before_the_delivery_drops_nothing_on_postgres(
     store, scratch_db, point_refresh, entry_values, bar_values, run_identity
 ):
-    """Decision tj-hhy3dk: an expiry PATCH in flight is the deletion date only; the answer is stored, collect stays."""
+    """Decision tj-hhy3dk: an expiry PATCH while the request is out is the deletion date only; the answer is stored."""
     dataset_id = _operator_daily(scratch_db.engine, entry_values, bar_values, run_identity)
     clock = Clock(NOW)
-    responses: list[Any] = []
+    ingest = _ingest(clock)
 
-    async with _ingest(clock) as (client, reader):
-        served = reader.get_bars
+    result = await DailyRefresher(ingest, clock=clock).run_pass(DataSource.ALPACA_API)
+    response = await race._patch(store, dataset_id, {'expiry': RETIRE_AT.isoformat()})
+    await ingest.deliver_all()
 
-        async def date_then_serve(query, *args, **kwargs):
-            responses.append(await race._patch(store, dataset_id, {'expiry': RETIRE_AT.isoformat()}))
-            return await served(query, *args, **kwargs)
-
-        reader.get_bars = date_then_serve
-        result = await DailyRefresher(client, clock=clock).run_pass(DataSource.ALPACA_API)
-
-    (response,) = responses
     assert response.status_code == 200, response.text
     assert result == PassResult(behind=1, refreshed=1)
     entry = _entries(scratch_db.engine)[dataset_id]
@@ -391,19 +534,27 @@ async def test_a_deletion_date_set_during_the_vendor_call_drops_nothing_on_postg
 
 
 # ---------------------------------------------------------------------------------------------
-# tj-grna9p.167: a newest bar written before its period closed is the vendor's part-way bar. The pass re-fetches FROM
-# that bar (inclusive), and the real INSERT ... ON CONFLICT DO UPDATE rewrites it: new OHLCV and an updated_at past
-# the close, so the catalog's write time (the crud's newest-bar subquery, here on Postgres) then reads it final.
-# Only this tier runs the upsert: on SQLite it is a recorder, so nothing there shows updated_at really moving.
+# tj-grna9p.167: a newest bar written before its period closed is the vendor's part-way bar. The pass re-requests FROM
+# that bar (inclusive), and the delivery's real INSERT ... ON CONFLICT DO UPDATE rewrites it: new OHLCV and an
+# updated_at past the close, so the catalog's write time (the crud's newest-bar subquery, here on Postgres) then reads
+# it final. Only this tier runs the upsert: on SQLite it is a recorder, so nothing there shows updated_at really moving.
 #
-# FakeRead stamps a daily bar at UTC midnight, the previous evening in New York: 7 Oct 00:00Z is the 6th's session
-# (close 20:00Z). At 7 Oct 01:00Z the expected session is the 6th, the newest bar IS the 6th's, and it was written at
-# 16:16Z, mid-session: LATE, not FRESH. FakeRead serves nothing past its clock, so the tail is that one bar.
+# The bars here are stamped as the real vendor stamps a daily bar, at the session's LOCAL midnight (04:00Z under EDT),
+# as the SQLite twin (server/data/store/tests/test_provisional_bar.py) does, and the double delivers the same
+# stamps (vendor_stamps). FakeRead's UTC-midnight grid cannot carry this case: a bar at 7 Oct 00:00Z is the 6th's
+# session but stamped AFTER its close, so a write before that close is a write before its own stamp, which the
+# refresh judges by the lost-anchor rule (decision tj-7zjov1.120 addendum 1: the tail starts at the local midnight of
+# the write time's period), not by the provisional reach-back this test pins.
+#
+# 6 Oct 04:00Z is the 6th's session (close 20:00Z). At 7 Oct 01:00Z the expected session is the 6th, the newest bar
+# IS the 6th's, and it was written at 16:16Z, after its stamp and mid-session: LATE, not FRESH. The tail reaches back
+# to that bar inclusively; the double serves nothing past its clock, so the tail is that one bar.
 
 PROVISIONAL_NOW = datetime(2026, 10, 7, 1, 0, tzinfo=UTC)
-PROVISIONAL_BAR = datetime(2026, 10, 7, 0, 0, tzinfo=UTC)
+PROVISIONAL_BAR = datetime(2026, 10, 6, 4, 0, tzinfo=UTC)
 MID_SESSION = datetime(2026, 10, 6, 16, 16, tzinfo=UTC)
 OCT6_CLOSE = datetime(2026, 10, 6, 20, 0, tzinfo=UTC)
+assert PROVISIONAL_BAR < MID_SESSION < OCT6_CLOSE, 'the provisional bar must be written after its stamp, before close'
 
 
 def _bar_row(engine: sa.Engine, dataset_id: uuid.UUID, timestamp: datetime) -> sa.Row:
@@ -433,12 +584,12 @@ async def _health(scratch_async: AsyncEngine, dataset_id: uuid.UUID, now: dateti
 
 
 @pytest.mark.asyncio
-async def test_a_provisional_newest_bar_is_re_fetched_and_rewritten_final_on_postgres(
+async def test_a_provisional_newest_bar_is_re_requested_and_rewritten_final_on_postgres(
     scratch_db, scratch_async, point_refresh, entry_values, bar_values, run_identity
 ):
     scratch_db.must('upgrade', _head())
-    times = [START + DAY * k for k in range(10)]  # 28 Sep .. 7 Oct 00:00Z
-    assert times[-1] == PROVISIONAL_BAR
+    times = vendor_stamps(START, PROVISIONAL_BAR + DAY)  # 28 Sep .. 6 Oct 04:00Z, New York local midnights
+    assert (len(times), times[-1]) == (9, PROVISIONAL_BAR)
     with scratch_db.engine.begin() as conn:
         row = conn.execute(
             sa.insert(ENTRY_TABLE)
@@ -448,6 +599,7 @@ async def test_a_provisional_newest_bar_is_re_fetched_and_rewritten_final_on_pos
                     update_type=UpdateType.DAILY.value,
                     expiry_type=ExpiryType.ROLLING.value,
                     granularity=Granularity.ONE_DAY,
+                    feed=SERVED_FEED,
                     start=START,
                     end=NullableDateTime.EPOCH,
                 )
@@ -468,33 +620,97 @@ async def test_a_provisional_newest_bar_is_re_fetched_and_rewritten_final_on_pos
     # The real Postgres subquery reads the newest bar's write time, and the dataset is LATE, not FRESH.
     catalog_row, health = await _health(scratch_async, dataset_id, PROVISIONAL_NOW)
     assert (catalog_row.last_bar, catalog_row.last_bar_written_at) == (PROVISIONAL_BAR, MID_SESSION)
-    assert health.status is FreshnessStatus.LATE
+    assert health.status is DatasetHealthStatus.LATE
 
     clock = Clock(PROVISIONAL_NOW)
-    async with _ingest(clock) as (client, reader):
-        result = await DailyRefresher(client, clock=clock).run_pass(DataSource.ALPACA_API)
-        assert result == PassResult(behind=1, refreshed=1)
-        assert _asked(reader) == [(FAKE_FEED, PROVISIONAL_BAR)], 'the tail did not start at the provisional bar'
+    ingest = _ingest(clock, vendor_stamps)
+    result = await DailyRefresher(ingest, clock=clock).run_pass(DataSource.ALPACA_API)
+    assert result == PassResult(behind=1, refreshed=1)
+    assert ingest.asked() == [(FAKE_FEED, PROVISIONAL_BAR)], 'the tail did not start at the provisional bar'
+    await ingest.deliver_all()
 
-        # Rewritten in place by ON CONFLICT DO UPDATE: the same row, the vendor's values, updated_at moved past the
-        # close (the database's now(), the real wall clock), created_at untouched. No second bar.
-        after = _bar_row(scratch_db.engine, dataset_id, PROVISIONAL_BAR)
-        served = fake_bar(row.asset_symbol, PROVISIONAL_BAR)
-        assert after.id == before.id
-        assert (after.volume, after.close) == (served.volume, served.close)
-        assert after.created_at == MID_SESSION
-        assert after.updated_at > OCT6_CLOSE
-        assert after.updated_at > before.updated_at
-        assert _bar_times(scratch_db.engine, dataset_id) == times
-        (run,) = _runs(scratch_db.engine)
-        assert (run.requested_start, run.bars_written) == (PROVISIONAL_BAR, 1)
+    # Rewritten in place by ON CONFLICT DO UPDATE: the same row, the vendor's values, updated_at moved past the close
+    # (the database's now(), the real wall clock), created_at untouched. No second bar.
+    after = _bar_row(scratch_db.engine, dataset_id, PROVISIONAL_BAR)
+    served = fake_bar(row.asset_symbol, PROVISIONAL_BAR)
+    assert after.id == before.id
+    assert (after.volume, after.close) == (served.volume, served.close)
+    assert after.created_at == MID_SESSION
+    assert after.updated_at > OCT6_CLOSE
+    assert after.updated_at > before.updated_at
+    assert _bar_times(scratch_db.engine, dataset_id) == times
+    (run,) = _runs(scratch_db.engine)
+    assert (run.requested_start, run.bars_written) == (PROVISIONAL_BAR, 1)
 
-        # Final now: FRESH, and the next pass at the same clock asks for nothing.
-        catalog_row, health = await _health(scratch_async, dataset_id, PROVISIONAL_NOW)
-        assert catalog_row.last_bar_written_at == after.updated_at
-        assert health.status is FreshnessStatus.FRESH
-        reader.queries.clear()
-        second = await DailyRefresher(client, clock=clock).run_pass(DataSource.ALPACA_API)
+    # Final now: FRESH, and the next pass at the same clock asks for nothing.
+    catalog_row, health = await _health(scratch_async, dataset_id, PROVISIONAL_NOW)
+    assert catalog_row.last_bar_written_at == after.updated_at
+    assert health.status is DatasetHealthStatus.FRESH
+    ingest.submitted.clear()
+    second = await DailyRefresher(ingest, clock=clock).run_pass(DataSource.ALPACA_API)
 
     assert second == PassResult()
-    assert reader.queries == []
+    assert ingest.submitted == []
+
+
+# ADR tj-rwoasb (panel Bar Interval), architect's gate addition (6): a 1 Minute panel's dataset is DAILY at 1min, and
+# the refresh, which reads the work from the database, owes it ONE request per pass AT 1min: the granularity is the
+# entry's own, never the 1day every panel dataset had before the column existed. A second pass while that request is
+# open owes nothing more (an open request is not owed again).
+MINUTE_BARS = [datetime(2026, 10, 2, 19, 57, tzinfo=UTC) + timedelta(minutes=k) for k in range(3)]
+
+
+@pytest.mark.asyncio
+async def test_a_1min_panel_dataset_gets_one_daily_refresh_request_at_1min_on_postgres(
+    scratch_db, point_refresh, entry_values, bar_values, run_identity
+):
+    scratch_db.must('upgrade', _head())
+    with scratch_db.engine.begin() as conn:
+        row = conn.execute(
+            sa.insert(ENTRY_TABLE)
+            .values(
+                entry_values(
+                    asset_symbol=run_identity.alt_symbol('dr1m'),
+                    owner=PANEL_OWNER,
+                    update_type=UpdateType.DAILY.value,
+                    expiry_type=ExpiryType.ROLLING.value,
+                    granularity=Granularity.ONE_MINUTE,
+                    feed=SERVED_FEED,
+                    start=START,
+                    end=NullableDateTime.EPOCH,
+                )
+            )
+            .returning(ENTRY_TABLE)
+        ).one()
+        for timestamp in MINUTE_BARS:
+            conn.execute(sa.insert(BAR_TABLE).values(bar_values(row, timestamp=timestamp)))
+    clock = Clock(NOW)
+    ingest = _ingest(clock)
+
+    result = await DailyRefresher(ingest, clock=clock).run_pass(DataSource.ALPACA_API)
+
+    assert result == PassResult(behind=1, refreshed=1)
+    (sent,) = ingest.submitted
+    assert (sent.bars.granularity, sent.bars.update_type, sent.bars.asset_symbol) == (
+        Granularity.ONE_MINUTE,
+        UpdateType.DAILY,
+        row.asset_symbol,
+    )
+    assert sent.bars.start > MINUTE_BARS[-1], 'the tail did not start after the newest stored 1min bar'
+    (request,) = _requests(scratch_db.engine).values()
+    assert (request.dataset_id, request.granularity, request.update_type) == (
+        row.id,
+        Granularity.ONE_MINUTE,
+        UpdateType.DAILY.value,
+    )
+    assert (request.trigger, request.client_label, request.requested_start) == (
+        IngestRunTrigger.SCHEDULE,
+        SCHEDULER_ACTOR,
+        sent.bars.start,
+    )
+    assert request.state == IngestRequestState.QUEUED
+
+    second = await DailyRefresher(ingest, clock=clock).run_pass(DataSource.ALPACA_API)
+
+    assert second.refreshed == 0, second
+    assert len(ingest.submitted) == 1, 'an open 1min refresh request was owed again'

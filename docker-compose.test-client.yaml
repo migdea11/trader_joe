@@ -71,6 +71,11 @@ services:
       - ./tests/system:/code/tests/system:ro
       - ./tests/fakes:/code/tests/fakes:ro
       - ./pytest.ini:/code/pytest.ini:ro
+      # The dev seed export's Postgres round trip (tests/system/dev_seed_export_pg.py, tj-7zjov1.313)
+      # imports tools.dev_datasets.dev_seed. Exactly these two, stdlib-only: the package marker and
+      # the one subpackage. The rest of tools/ (agent_mcp) stays out of the client.
+      - ./tools/__init__.py:/code/tools/__init__.py:ro
+      - ./tools/dev_datasets:/code/tools/dev_datasets:ro
     # THE ENV CONTRACT: exactly the twelve names tests/system/conftest.py reads, and one extra.
     environment:
       # Compose SERVICE names, literal: they resolve on store_db and store_api respectively.

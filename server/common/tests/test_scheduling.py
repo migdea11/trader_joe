@@ -35,7 +35,7 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
-from common.scheduling import AfterTradingEvent, Every, Once, TradingEvent, run_periodic
+from common.scheduling import AfterTradingEvent, Every, Once, TradingEvent, add_calendar_months, run_periodic
 from common.tests.roots import SERVER_ROOT
 
 
@@ -832,6 +832,34 @@ async def test_after_a_restart_an_interval_schedule_runs_once_not_once_per_misse
     assert sleep.delays == [3600.0, 3600.0]
 
 
+@pytest.mark.asyncio
+async def test_a_long_every_fires_on_every_restart_not_once_per_interval():
+    """The hazard documented on Every and run_periodic (tj-7zjov1.192): neither the runner nor Every keeps state.
+
+    A 30-day Every runs at T0 and the runner sleeps toward T0 + 30 days. The process is killed an hour later; the new
+    runner, given the same schedule object, fires at once without sleeping, then 30 days after the restart. That is
+    two runs an hour apart on a "monthly" job, which is why a long cadence must be derived from database state.
+    """
+    clock = FakeClock()
+    monthly = Every(timedelta(days=30))
+
+    before = Job(clock, block_after=1)
+    blocked = BlockingSleep()
+    task = start(monthly, before, clock, blocked)
+    await until(lambda: blocked.delays, 'the first runner sleeps toward its next fire')
+    assert before.starts == [T0]
+    assert blocked.delays == [timedelta(days=30).total_seconds()]
+    await stop(task)
+
+    clock.advance(3600)
+    restarted = T0 + HOUR
+    after = Job(clock, block_after=2)
+    sleep = AdvancingSleep(clock)
+    await finished(start(UpTo(monthly, after, 2), after, clock, sleep))
+    assert after.starts == [restarted, restarted + timedelta(days=30)]
+    assert sleep.delays == [timedelta(days=30).total_seconds()]
+
+
 # The test above passes while either of Every's two replay guards holds, so it cannot tell when one of them breaks
 # (the architect's finding 4 on tj-grna9p.130). Each test below takes the OTHER guard away and pins the one left:
 #   guard 1, the runner: last_run is the clock at the start of the run, never the instant the schedule named;
@@ -912,3 +940,43 @@ async def test_a_wake_during_the_retry_wait_asks_again_and_does_not_force_a_run(
     assert job.calls == 0
     assert len(schedule.asks) == 2
     await stop(task)
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# add_calendar_months (tj-7zjov1.181 build item 3; validator tj-7zjov1.182)
+
+
+@pytest.mark.parametrize(
+    'instant, months, expected',
+    [
+        pytest.param('2026-01-31T10:15:00Z', 1, '2026-02-28T10:15:00Z', id='31 Jan + 1 clamps to 28 Feb'),
+        pytest.param('2028-01-31T10:15:00Z', 1, '2028-02-29T10:15:00Z', id='leap year: 31 Jan + 1 is 29 Feb'),
+        pytest.param('2028-02-29T00:00:00Z', 12, '2029-02-28T00:00:00Z', id='29 Feb + 12 clamps'),
+        pytest.param('2026-03-31T23:59:59.123456Z', 1, '2026-04-30T23:59:59.123456Z', id='31 Mar + 1 is 30 Apr'),
+        pytest.param('2026-12-15T08:00:00Z', 1, '2027-01-15T08:00:00Z', id='Dec + 1 rolls the year'),
+        pytest.param('2026-10-14T12:00:00Z', 12, '2027-10-14T12:00:00Z', id='+12 is a year'),
+        pytest.param('2026-10-14T12:00:00Z', 27, '2029-01-14T12:00:00Z', id='+27 rolls two years'),
+        pytest.param('2026-10-14T12:00:00Z', 0, '2026-10-14T12:00:00Z', id='zero'),
+        pytest.param('2026-03-31T10:00:00Z', -1, '2026-02-28T10:00:00Z', id='31 Mar - 1 clamps to 28 Feb'),
+        pytest.param('2026-01-15T10:00:00Z', -1, '2025-12-15T10:00:00Z', id='Jan - 1 rolls back the year'),
+        pytest.param('2026-01-15T10:00:00Z', -13, '2024-12-15T10:00:00Z', id='-13'),
+        pytest.param('2028-03-31T10:00:00Z', -1, '2028-02-29T10:00:00Z', id='back into a leap February'),
+    ],
+)
+def test_add_calendar_months_clamps_to_the_month_end_and_keeps_the_utc_time(instant, months, expected):
+    moved = add_calendar_months(z(instant), months)
+    assert moved == z(expected)
+    assert moved.utcoffset() == timedelta(0)
+
+
+def test_add_calendar_months_keeps_the_utc_time_of_day_across_a_dst_change():
+    """31 Oct 09:30 EDT is 13:30Z; a month on is 30 Nov 13:30Z, which is 08:30 EST in New York, not 09:30."""
+    moved = add_calendar_months(datetime(2026, 10, 31, 9, 30, tzinfo=NEW_YORK), 1)
+    assert moved == z('2026-11-30T13:30:00Z')
+    assert moved.utcoffset() == timedelta(0)
+    assert moved.astimezone(NEW_YORK).hour == 8
+
+
+def test_add_calendar_months_refuses_a_naive_instant():
+    with pytest.raises(ValueError, match='naive datetime names no instant'):
+        add_calendar_months(NAIVE, 1)

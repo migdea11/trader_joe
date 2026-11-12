@@ -1,7 +1,11 @@
+import functools
 import importlib
+import re
 import uuid
+from collections.abc import Mapping
 from datetime import UTC, datetime
-from typing import Any, NamedTuple
+from types import MappingProxyType, SimpleNamespace
+from typing import Any, ClassVar, NamedTuple
 
 import pytest
 from fastapi.testclient import TestClient
@@ -10,11 +14,14 @@ from starlette.routing import NoMatchFound
 
 from common.database.postgres_tools import PostgresSessionFactory
 from common.enums.data_stock import DataSource, Granularity, UpdateType
-from data.store.app.app_depends import get_ingest_fetch_client
+from common.errors.vocabulary import ExogenousError, Reason
+from common.tests.roots import REPO_ROOT
+from data.store.app.app_depends import get_ingest_submit_client
 from data.store.app.database.database import async_db
+from data.store.app.database.models.ingest_request import IngestRequest
+from data.store.app.database.models.panel import Panel, PanelSettingsVersion, PanelSourceSettingsVersion
 from data.store.app.database.models.store_dataset_entry import StoreDatasetEntry
 from data.store.app.main import app
-from data.store.tests.fetch_double import RecordingFetchClient
 from data.store.tests.problem_body import problem, validation_errors
 from routers.common.instance_secret import (
     INSTANCE_SECRET_ENV_VAR,
@@ -49,8 +56,9 @@ from routers.tests.test_interface_surface import SEPARATOR, load_manifest
 #      the client without `with` dispatches requests without ever running it. If you add a `with`
 #      here to make something work, you have just made this file need a database.
 #   2. Both injected dependencies are replaced through app.dependency_overrides -- async_db and
-#      get_ingest_fetch_client -- rather than by monkeypatching module globals, because the
-#      handlers take them as Depends() and that is the seam FastAPI gives you.
+#      get_ingest_submit_client (the FetchDataset client's getter until the push path, tj-7zjov1.28) --
+#      rather than by monkeypatching module globals, because the handlers take them as Depends()
+#      and that is the seam FastAPI gives you.
 # test_the_routes_are_driven_without_a_lifespan asserts both halves instead of trusting them.
 #
 # THE FAKES ARE DELIBERATELY FAITHFUL, NOT PERMISSIVE. FakeSession.add is SYNCHRONOUS because
@@ -110,6 +118,10 @@ GUARDED_ADDRESSES = frozenset(
         'DELETE /ui/v1/datasets/{dataset_id}',
         # The collecting write (tj-grna9p.175).
         'PATCH /ui/v1/datasets/{dataset_id}/collecting',
+        # The panel writes (tj-7zjov1.36, W1 to W3); the eight panel reads beside them are open.
+        'POST /ui/v1/panels',
+        'POST /ui/v1/panels/{panel_id}/settings-versions',
+        'POST /ui/v1/panel-sources/{source}/settings-versions',
     }
 )
 
@@ -155,6 +167,10 @@ class Case(NamedTuple):
             call could corrupt and the malformed half is skipped as a case that does not exist (pytest.ini rule).
         reads_one_row: The route reads one row by id, which the empty fake table does not hold, so a well-formed
             call reaches the handler and is answered 404 NOT_FOUND by it. See READ-BY-ID ROUTES below.
+        submits: The route submits a request to ingest (POST /store since tj-7zjov1.28): a well-formed call
+            reaches the Submit seam, whose double answers 503 PEER_UNAVAILABLE. See FakeSubmitClient.
+        body_only: The route's only input is a ProtoBody (POST /ui/v1/panels), whose refusal names the message
+            type, never a field: the malformed half sends a body that is not the message and asserts that refusal.
     """
 
     path_params: dict[str, str]
@@ -164,6 +180,8 @@ class Case(NamedTuple):
     malformed_field: str
     reads_one_row: bool = False
     takes_no_input: bool = False
+    submits: bool = False
+    body_only: bool = False
 
 
 ASSET_PATH = {'asset_type': 'stock', 'data_type': 'market-activity'}
@@ -172,7 +190,7 @@ SYMBOL_PATH = {**ASSET_PATH, 'asset_symbol': 'AAPL'}
 # A complete StockDataMarketActivityCreate. Written out rather than minimised: the point of the
 # well-formed half is that nothing about the PAYLOAD can be blamed when a route misbehaves.
 #
-# SHAPE AS OF eec8f88a7443, and both halves of that change are visible here (tj-1njw7c). feed is a
+# SHAPE SINCE THE PER-DATASET IDENTITY (tj-1njw7c), and both halves of that change are visible here. feed is a
 # TOP-LEVEL key, a sibling of source, because it is declared on AssetDataCreate rather than on the
 # per-bar data model -- putting it inside `data` gets an extra_forbidden on the way in and a
 # missing-field error at the same time, which reads like two problems and is one. And expiry,
@@ -256,6 +274,7 @@ CASES: dict[str, Case] = {
         malformed_path_params=SYMBOL_PATH,
         malformed_request={'json': {**DATASET_REQUEST, 'source': 'not-a-data-source'}},
         malformed_field='source',
+        submits=True,
     ),
     'DELETE /store/{id}': Case(
         path_params={'id': str(DELETE_ID)},
@@ -426,6 +445,115 @@ CASES: dict[str, Case] = {
         malformed_request={'params': {'client_id': 'storage-takes-no-client'}},
         malformed_field='client_id',
     ),
+    # The panel routes (tj-7zjov1.36, P24; P24v tj-7zjov1.241). Over the empty fake table every read of one panel or
+    # dataset is the handler's 404 NOT_FOUND; the list and a source's versions are empty pages. W1 writes (the fake
+    # session answers the inserts, see InsertedPanelRow) and then re-reads its detail, which the empty table does not
+    # hold: the handler's 404 after the write, as the PATCH above. W3 writes and answers 201. Their real rows are
+    # test_panel_ui_reads.py's and test_ui_panel_writes_route.py's, over SQLite, and tests/system/test_panel_routes_pg.py's.
+    'GET /ui/v1/panels': Case(
+        path_params={},
+        request={},
+        malformed_path_params={},
+        malformed_request={'params': {'limit': 5}},  # R1 takes no parameter: a stray one is refused by name
+        malformed_field='limit',
+    ),
+    'GET /ui/v1/panels/{panel_id}': Case(
+        path_params={'panel_id': str(DELETE_ID)},
+        request={},
+        malformed_path_params={'panel_id': 'not-a-uuid'},
+        malformed_request={},
+        malformed_field='panel_id',
+        reads_one_row=True,
+    ),
+    'GET /ui/v1/panels/{panel_id}/settings-versions': Case(
+        path_params={'panel_id': str(DELETE_ID)},
+        request={},
+        malformed_path_params={'panel_id': str(DELETE_ID)},
+        malformed_request={'params': {'limit': 0}},
+        malformed_field='limit',
+        reads_one_row=True,
+    ),
+    'GET /ui/v1/panel-sources/{source}/settings-versions': Case(
+        path_params={'source': 'DATA_SOURCE_ALPACA_API'},
+        request={},
+        malformed_path_params={'source': 'not-a-source'},
+        malformed_request={},
+        malformed_field='source',
+    ),
+    'GET /ui/v1/panels/{panel_id}/boundaries': Case(
+        path_params={'panel_id': str(DELETE_ID)},
+        request={'params': {'start': '2026-01-02T00:00:00Z', 'end': '2026-01-03T00:00:00Z'}},
+        malformed_path_params={'panel_id': str(DELETE_ID)},
+        malformed_request={'params': {'start': '2026-01-02T00:00:00', 'end': '2026-01-03T00:00:00Z'}},
+        malformed_field='start',
+        reads_one_row=True,
+    ),
+    'GET /ui/v1/panels/{panel_id}/members': Case(
+        path_params={'panel_id': str(DELETE_ID)},
+        request={},
+        malformed_path_params={'panel_id': str(DELETE_ID)},
+        malformed_request={'params': {'limit': 501}},
+        malformed_field='limit',
+        reads_one_row=True,
+    ),
+    'GET /ui/v1/panels/{panel_id}/asset-list-history': Case(
+        path_params={'panel_id': str(DELETE_ID)},
+        request={'params': {'start': '2026-01-02T00:00:00Z', 'end': '2026-01-03T00:00:00Z'}},
+        malformed_path_params={'panel_id': str(DELETE_ID)},
+        malformed_request={'params': {'start': '2026-01-02T00:00:00Z', 'end': '2026-01-03T00:00:00'}},
+        malformed_field='end',
+        reads_one_row=True,
+    ),
+    'GET /ui/v1/datasets/{dataset_id}/corporate-actions': Case(
+        path_params={'dataset_id': str(DELETE_ID)},
+        request={},
+        malformed_path_params={'dataset_id': str(DELETE_ID)},
+        malformed_request={'params': {'limit': 0}},
+        malformed_field='limit',
+        reads_one_row=True,
+    ),
+    'POST /ui/v1/panels': Case(
+        path_params={},
+        request={
+            'json': {
+                'name': 'smoke',
+                'source': 'DATA_SOURCE_ALPACA_API',
+                'granularity': 'GRANULARITY_ONE_DAY',
+                'enabled': False,
+                'reason': 'smoke',
+                'rampDatasetsPerHour': 1,
+                'requestCapPerHour': 2,
+            }
+        },
+        malformed_path_params={},
+        malformed_request={'json': {'name': 'smoke', 'source': 'not-a-source'}},
+        malformed_field='',
+        reads_one_row=True,
+        body_only=True,
+    ),
+    'POST /ui/v1/panels/{panel_id}/settings-versions': Case(
+        path_params={'panel_id': str(DELETE_ID)},
+        request={'json': {'enabled': True, 'cadence': 'PANEL_CADENCE_DAILY', 'reason': 'smoke'}},
+        malformed_path_params={'panel_id': 'not-a-uuid'},
+        malformed_request={'json': {'enabled': True, 'cadence': 'PANEL_CADENCE_DAILY', 'reason': 'smoke'}},
+        malformed_field='panel_id',
+        reads_one_row=True,
+    ),
+    'POST /ui/v1/panel-sources/{source}/settings-versions': Case(
+        path_params={'source': 'DATA_SOURCE_ALPACA_API'},
+        request={
+            'json': {
+                'rampDatasetsPerHour': 1,
+                'requestCapPerHour': 2,
+                'corporateActionWindowPreDays': 3,
+                'corporateActionWindowPostDays': 4,
+                'reason': 'smoke',
+            }
+        },
+        malformed_path_params={'source': 'not-a-source'},
+        malformed_request={'json': {'rampDatasetsPerHour': 1, 'reason': 'smoke'}},
+        malformed_field='source',
+    ),
 }
 
 
@@ -493,6 +621,76 @@ class FakeResult:
         )
 
 
+class InsertedRequest:
+    """The RETURNING row of the POST's request insert (tj-7zjov1.28): the values inserted plus the server defaults.
+
+    POST /store writes its ingest_request row on the request's own session BEFORE it submits, so the fake session
+    has to answer that one statement the way Postgres would: one row, every column, the defaults filled. Answering
+    it with FakeResult's audit-probe tuple made the handler die on an AttributeError, a failure no real deployment
+    can produce. The values are not asserted; the Submit the fake client receives is.
+    """
+
+    _DEFAULTS: ClassVar[Mapping[str, Any]] = MappingProxyType(
+        {
+            'instance_id': None,
+            'attempts': 0,
+            'spent_calls': 0,
+            'spent_pages': 0,
+            'spent_throttled_429': 0,
+            'spent_retries': 0,
+            'spend_unknown_attempts': 0,
+            'failure_cause': None,
+            'failure_detail': None,
+            'finished_at': None,
+        }
+    )
+
+    def __init__(self, statement: Any) -> None:
+        values = {column.name: None for column in IngestRequest.__table__.c}
+        values.update(self._DEFAULTS, created_at=datetime.now(UTC))
+        values.update(statement.compile().params)
+        self._row = SimpleNamespace(**values)
+
+    def one(self) -> SimpleNamespace:
+        return self._row
+
+
+PANEL_TABLES = frozenset({Panel.__table__, PanelSettingsVersion.__table__, PanelSourceSettingsVersion.__table__})
+
+
+class InsertedPanelRow:
+    """The RETURNING row of a panel, settings or source settings insert (tj-7zjov1.36): the values plus the defaults.
+
+    The panel writes INSERT ... RETURNING every column and map the row to a record, so the fake answers with the values
+    the statement bound and the columns the database fills (id, created_at, saved_at), as InsertedRequest does.
+    """
+
+    def __init__(self, statement: Any) -> None:
+        values = {column.name: None for column in statement.table.c}
+        values.update(statement.compile().params)
+        now = datetime.now(UTC)
+        values['id'] = values['id'] or uuid.uuid4()
+        for column in ('created_at', 'saved_at'):
+            if column in values and values[column] is None:
+                values[column] = now
+        self._row = SimpleNamespace(**values)
+
+    def one(self) -> SimpleNamespace:
+        return self._row
+
+
+class VersionMax:
+    """The numbering read of a version write (COALESCE(MAX(version_no), 0)) over the empty table: 0."""
+
+    def scalar_one(self) -> int:
+        return 0
+
+
+def _is_version_max(statement: Any) -> bool:
+    columns = list(statement.selected_columns)
+    return len(columns) == 1 and 'version_no' in str(columns[0]) and 'max' in str(columns[0]).lower()
+
+
 class FakeSession:
     """Stands in for AsyncSession, matching its sync/async split exactly.
 
@@ -508,7 +706,13 @@ class FakeSession:
         # architect gate reviewing this file, not by a failure.
         self._added: list[int] = []
 
-    async def execute(self, statement: Any) -> FakeResult:
+    async def execute(self, statement: Any) -> 'FakeResult | InsertedRequest | InsertedPanelRow | VersionMax':
+        if getattr(statement, 'is_insert', False) and getattr(statement, 'table', None) is IngestRequest.__table__:
+            return InsertedRequest(statement)
+        if getattr(statement, 'is_insert', False) and getattr(statement, 'table', None) in PANEL_TABLES:
+            return InsertedPanelRow(statement)
+        if getattr(statement, 'is_select', False) and _is_version_max(statement):
+            return VersionMax()
         return FakeResult()
 
     async def commit(self) -> None:
@@ -548,29 +752,33 @@ class FakeSession:
                 setattr(instance, column, value)
 
 
-def fake_fetch_client() -> RecordingFetchClient:
-    """An IngestFetchClient double answering with an accepted, empty, completed stream.
+class FakeSubmitClient:
+    """An IngestSubmitClient double: records the Submit it is handed and answers that ingest is not there.
 
-    REPOINTED FROM THE KAFKA RPC FAKE (validator, gating tj-3mk3u5.10). POST /store now takes an
-    ``IngestFetchClient`` through ``get_ingest_fetch_client``, so the override below has to supply
-    one; the old ``FakeRpcClients`` answered a dependency the route no longer declares, and the
-    POST case failed with ``'NoneType' object has no attribute 'fetch'`` -- the real
-    ``get_ingest_fetch_client`` returning its un-initialised module global, which is itself
-    evidence that the lifespan never ran.
+    REPOINTED FROM THE FetchDataset DOUBLE (validator, tj-7zjov1.28, P35). POST /store no longer holds a stream: it
+    writes the request row, SUBMITS it, then waits for the delivery intake to finish it, reading the request row on
+    sessions of its own (own_session), which are not a dependency this file can override. A double that accepted
+    the Submit would send the handler on to those sessions, that is to Postgres, which this file must never need.
 
-    THE STREAM IS ACK-THEN-DONE WITH NO PAGES, which is the same decision the Kafka fake's empty
-    ``dataset`` made and for the same reason: the handler stores nothing and reports 0 data points,
-    because what a populated stream stores is tj-19qp1q's tier and would need a database to store
-    into. An empty window is a legitimate success here, not a degenerate one (ADR tj-fa1rpu D2).
-
-    The ack still carries a resolved feed, as the Kafka fake's batch did (tj-1njw7c): ingest is the
-    only party entitled to decide the tape, and a fake that omitted it would be more permissive
-    than the thing it stands in for.
-
-    Returns:
-        RecordingFetchClient: A fresh double per request, matching the old fake's per-call shape.
+    SO THE DOUBLE ANSWERS WHAT THIS ENVIRONMENT REALLY IS: no data_ingest. The seam raises PEER_UNAVAILABLE, the
+    typed error the real client raises for an unreachable peer, and the handler lets it through to the edge (D6).
+    The POST case therefore asserts MORE than "under 500": that exact problem+json (503, PEER_UNAVAILABLE) AND one
+    Submit for the requested symbol, which can only exist if the handler ran the overlap check, wrote the request
+    row and reached the seam. A route that never ran its handler produces neither.
     """
-    return RecordingFetchClient()
+
+    def __init__(self) -> None:
+        self.submitted: list[Any] = []
+
+    async def submit(self, request: Any) -> Any:
+        self.submitted.append(request)
+        raise ExogenousError(Reason.PEER_UNAVAILABLE, 'no data_ingest in the smoke tier')
+
+    async def instance(self) -> Any:
+        raise ExogenousError(Reason.PEER_UNAVAILABLE, 'no data_ingest in the smoke tier')
+
+
+SUBMIT_CLIENT = FakeSubmitClient()
 
 
 def manifest_entries(kind: str, *, allow_empty: bool = False) -> list[list[str]]:
@@ -758,7 +966,7 @@ def client():
     because `app` is a module-level singleton other test modules import.
     """
     app.dependency_overrides[async_db] = FakeSession
-    app.dependency_overrides[get_ingest_fetch_client] = fake_fetch_client
+    app.dependency_overrides[get_ingest_submit_client] = lambda: SUBMIT_CLIENT
     try:
         # raise_server_exceptions defaults to True and is left that way: an unhandled exception in
         # a handler reaches the test as its own traceback instead of an opaque 500, which is the
@@ -866,11 +1074,22 @@ def test_a_well_formed_request_reaches_the_handler(address: str, client: TestCli
     method = address.split(' ', 1)[0]
     url = app_url_for(address, symbol_for(address), case.path_params)
 
+    submitted_before = len(SUBMIT_CLIENT.submitted)
     response = client.request(method, url, headers=secret_headers(address), **case.request)
 
     if case.reads_one_row:
         # The handler ran and looked the id up: only it names NOT_FOUND (see READ-BY-ID ROUTES above CASES).
         problem(response, status=404, reason='NOT_FOUND')
+        return
+    if case.submits:
+        # The handler ran to the Submit seam: exactly one Submit, for the symbol in the path, and the seam's own
+        # typed answer rendered at the edge. Nothing else produces both (see FakeSubmitClient). Since P51 a POST's
+        # first Submit is the name_change clamp's corporate-actions query, and it FAILS CLOSED: the seam's refusal
+        # fails the POST before any bars request is sent (ADR tj-26jt9w addendum 19 (5)), so the one Submit is it.
+        problem(response, status=503, reason='PEER_UNAVAILABLE')
+        (submitted,) = SUBMIT_CLIENT.submitted[submitted_before:]
+        assert submitted.bars is None, 'a bars request was sent after the name_change query failed'
+        assert submitted.corporate_actions is not None and submitted.corporate_actions.asset_symbol == 'AAPL'
         return
     assert response.status_code not in UNREACHABLE_STATUSES, (
         f'{method} {url} returned {response.status_code}: the manifest declares this route but the '
@@ -904,6 +1123,11 @@ def test_a_malformed_request_is_rejected_with_422(address: str, client: TestClie
     # assertion to "401 or 422" instead would have made it pin neither.
     response = client.request(method, url, headers=secret_headers(address), **case.malformed_request)
 
+    if case.body_only:
+        # ProtoBody's refusal names the message type, never a field, and never the body (D8).
+        body = problem(response, status=422, reason='INVALID_REQUEST')
+        assert 'not valid protobuf JSON for trader_joe.proto.ui.v1.' in body['detail'], body
+        return
     # problem+json since TE-6 (tj-3mk3u5.37.8): the per-field list is `errors`, not `detail`.
     complained_about = [error['loc'][-1] for error in validation_errors(response)]
     assert case.malformed_field in complained_about, (
@@ -991,6 +1215,173 @@ def test_a_guarded_route_answers_401_before_it_validates_anything(address: str, 
     assert response.json()['detail'] == INSTANCE_SECRET_REJECTION_DETAIL
 
 
+# ---------------------------------------------------------------------------------------------
+# THE CI STEP "Instance Secret Lifecycle", REPLAYED OFFLINE (tj-7zjov1.381)
+#
+# .github/workflows/trader_joe_testing.yml (System Testing job) recreates data_store with
+# INSTANCE_WRITE_SECRET blank and sends every write route four requests -- no header, an empty
+# header, an arbitrary value and the secret that was valid a minute earlier -- each with
+# Content-Type application/json and, on POST and PATCH, the body {}. Each must answer 401 with the
+# fixed detail, and the body must not carry the former secret. That step needs the stack and runs
+# only in CI, after the whole system suite, so a route that answers 422 there is found late. The
+# cases below send the same requests to the same app, in process.
+#
+# The two cases above leave the secret CONFIGURED and omit the header. These BLANK it, which is the
+# state the step creates and the template ships: a guard that only failed closed when a value was
+# configured would pass both of those and fail the step.
+#
+# THE PATHS ARE THE STEP'S LITERALS, copied, not built from CASES: the point is to send what the
+# step sends, zero UUIDs and DATA_SOURCE_ALPACA_API included. server/common/tests/test_ci_invariants.py
+# pins the list in the workflow; test_the_lifecycle_probes_resolve_to_the_guarded_routes below pins
+# that these nine resolve to exactly GUARDED_ADDRESSES, so a tenth guarded route fails here until the
+# step (and this list) carries it.
+#
+# NOT PROVEN HERE: that compose really blanks the variable in the recreated container, the step's
+# health wait, and its scan of the container logs (uvicorn's access log does not run under
+# TestClient). The caplog assertion covers the application's own log records only.
+# ---------------------------------------------------------------------------------------------
+
+LIFECYCLE_PROBES = (
+    'POST /store/stock/market-activity/LIFECYCLE',
+    'DELETE /store/00000000-0000-0000-0000-000000000000?owner=ci-secret-lifecycle',
+    'POST /internal/asset-data/stock/market-activity',
+    'PATCH /ui/v1/datasets/00000000-0000-0000-0000-000000000000/expiry',
+    'PATCH /ui/v1/datasets/00000000-0000-0000-0000-000000000000/collecting',
+    'DELETE /ui/v1/datasets/00000000-0000-0000-0000-000000000000',
+    'POST /ui/v1/panels',
+    'POST /ui/v1/panels/00000000-0000-0000-0000-000000000000/settings-versions',
+    'POST /ui/v1/panel-sources/DATA_SOURCE_ALPACA_API/settings-versions',
+)
+
+# The step's former secret is the value the stack ran with; the arbitrary one is `openssl rand -hex
+# 32`. Fixtures here, deliberately unlike a real secret, but the same SHAPE as the arbitrary one.
+LIFECYCLE_FORMER_SECRET = 'lifecycle-former-instance-secret-not-real'
+LIFECYCLE_ARBITRARY_SECRET = '0123456789abcdef' * 4
+
+# None is curl with no -H; '' is curl's `-H 'X-Instance-Secret;'`, a header present with no value.
+LIFECYCLE_HEADERS = {
+    'no header': None,
+    'empty header': '',
+    'arbitrary header': LIFECYCLE_ARBITRARY_SECRET,
+    'former secret': LIFECYCLE_FORMER_SECRET,
+}
+
+
+# THE STEP MATCHES BYTES, NOT JSON. It sets want_detail='"detail":"..."' (single quotes: a shell
+# literal, no expansion) and refuses a body unless `[[ "${body}" != *"${want_detail}"* ]]` is false.
+# The quoted operand makes that a plain substring test, so the step depends on how the body is
+# RENDERED -- no space after the colon, these separators, no escaped character -- which a parsed
+# response.json()['detail'] comparison cannot see. Both the literal and the comparison are read from
+# the workflow rather than copied, so the step and this test cannot drift apart silently.
+LIFECYCLE_WORKFLOW = REPO_ROOT / '.github' / 'workflows' / 'trader_joe_testing.yml'
+LIFECYCLE_STEP_COMPARISON = '[[ "${body}" != *"${want_detail}"* ]]'
+
+
+@functools.cache
+def lifecycle_step_want_detail() -> bytes:
+    """The exact bytes the Instance Secret Lifecycle step requires in every 401 body.
+
+    Returns:
+        bytes: The value of the step's single-quoted want_detail assignment, UTF-8 encoded.
+    """
+    workflow = LIFECYCLE_WORKFLOW.read_text(encoding='utf-8')
+    found = re.findall(r"^\s*want_detail='([^']*)'\s*$", workflow, flags=re.MULTILINE)
+    assert len(found) == 1, f'expected one want_detail assignment in {LIFECYCLE_WORKFLOW}, found {found}'
+    assert LIFECYCLE_STEP_COMPARISON in workflow, (
+        f'the step no longer matches with {LIFECYCLE_STEP_COMPARISON}; re-derive how this test must match'
+    )
+    return found[0].encode('utf-8')
+
+
+def lifecycle_address(probe: str) -> str:
+    """Name the one manifest address a literal request of the step falls on.
+
+    Matched against EVERY manifest address, open reads included, so a probe that could also be
+    served by another route is refused here rather than counted for the guarded one. A template
+    segment matches one path segment, as Starlette's default path convertor does.
+
+    Args:
+        probe (str): 'METHOD /path?query', as the step writes it.
+
+    Returns:
+        str: The manifest address, 'METHOD /template'.
+    """
+    method, target = probe.split(' ', 1)
+    path = target.split('?', 1)[0]
+    matching = [
+        address
+        for address in http_addresses()
+        if address.split(' ', 1)[0] == method
+        and re.fullmatch(re.sub(r'\\\{[^/]+?\\\}', '[^/]+', re.escape(mount_prefix() + address.split(' ', 1)[1])), path)
+    ]
+    assert len(matching) == 1, f'{probe} matches {matching}, not exactly one manifest address'
+    return matching[0]
+
+
+def test_the_lifecycle_probes_resolve_to_the_guarded_routes():
+    """The nine requests the step sends land on the nine guarded routes, each once, and no other."""
+    resolved = [lifecycle_address(probe) for probe in LIFECYCLE_PROBES]
+
+    assert sorted(resolved) == sorted(GUARDED_ADDRESSES), (
+        'the Instance Secret Lifecycle step does not probe exactly the guarded write routes: '
+        f'{sorted(set(resolved) ^ set(GUARDED_ADDRESSES))}'
+    )
+
+
+@pytest.mark.parametrize('blank', ['empty', 'unset'])
+@pytest.mark.parametrize('header', list(LIFECYCLE_HEADERS))
+@pytest.mark.parametrize('probe', LIFECYCLE_PROBES)
+def test_a_blank_secret_refuses_every_lifecycle_probe(
+    probe: str,
+    header: str,
+    blank: str,
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+):
+    """The step's request, exactly: 401, the fixed detail, and no secret in the body or a log record.
+
+    'empty' is what the step's sed leaves in the env file; 'unset' is the other reading of a blank
+    the step's own check (`os.environ.get(...)` falsy) accepts.
+
+    Args:
+        probe: 'METHOD /path' as the step writes it.
+        header: Which of the step's four header variants to send.
+        blank: Whether INSTANCE_WRITE_SECRET is set empty or absent.
+        client: The store app with its database and RPC clients replaced.
+        monkeypatch: Blanks the secret over the module's autouse fixture.
+        caplog: Captures the application's log records.
+    """
+    if blank == 'empty':
+        monkeypatch.setenv(INSTANCE_SECRET_ENV_VAR, '')
+    else:
+        monkeypatch.delenv(INSTANCE_SECRET_ENV_VAR, raising=False)
+    method, path = probe.split(' ', 1)
+    headers = {'Content-Type': 'application/json'}
+    if LIFECYCLE_HEADERS[header] is not None:
+        headers[INSTANCE_SECRET_HEADER] = LIFECYCLE_HEADERS[header]
+    content = '{}' if method in ('POST', 'PATCH') else None
+
+    with caplog.at_level('DEBUG'):
+        response = client.request(method, path, headers=headers, content=content)
+
+    assert response.status_code == 401, (
+        f'{method} {path} ({header}, secret {blank}) answered {response.status_code}: {response.text}. '
+        f'The CI step expects 401 here; a 422 means body or path validation ran before the guard.'
+    )
+    assert response.json()['detail'] == INSTANCE_SECRET_REJECTION_DETAIL
+    assert lifecycle_step_want_detail() in response.content, (
+        f'the CI step requires the literal bytes {lifecycle_step_want_detail()!r} in the body, as a '
+        f'substring; the app rendered {response.content!r}'
+    )
+    for value in (LIFECYCLE_FORMER_SECRET, LIFECYCLE_ARBITRARY_SECRET):
+        assert value not in response.text, 'a presented secret reached the response body'
+    assert caplog.records, 'nothing was logged, so the scan below is vacuous'
+    logged = '\n'.join(record.getMessage() for record in caplog.records)
+    for value in (LIFECYCLE_FORMER_SECRET, LIFECYCLE_ARBITRARY_SECRET):
+        assert value not in logged, 'a presented secret reached a log record'
+
+
 @pytest.mark.parametrize('address', unbound_path_addresses())
 def test_nothing_serves_an_unbound_path(address: str):
     # The manifest records these as declared-but-not-implemented: a path some interface enum in
@@ -1039,14 +1430,13 @@ def test_the_routes_are_driven_without_a_lifespan(client: TestClient):
         'driving a route opened a Postgres engine, so the database dependency override is not '
         'taking effect or the lifespan ran'
     )
-    # THE gRPC GLOBAL, and it is the right one to ask. This pinned both globals between tj-3mk3u5.10
-    # and tj-3mk3u5.32: the Kafka one, get_rpc_clients(), and this one. The Kafka half went with the
-    # client tj-3mk3u5.12 unwires, and nothing is lost by its going -- the lifespan builds the gRPC
-    # channel to data_ingest and the IngestFetchClient over it, and that is the half the POST route
-    # actually depends on, so an override that stopped taking effect is caught here rather than by a
-    # confusing AttributeError inside the handler. It was the Kafka global that could have gone on
-    # passing against a half-run lifespan, not this one.
-    assert get_ingest_fetch_client() is None, (
+    # THE gRPC GLOBAL, and it is the right one to ask. The lifespan builds the gRPC channel to
+    # data_ingest and the IngestSubmitClient over it, the POST route's seam since the push path
+    # (tj-7zjov1.28), so an override that stopped taking effect is caught here rather than by a
+    # confusing AttributeError inside the handler. Until tj-7zjov1.272 this also asked the
+    # FetchDataset client's global; that client is no longer built, so the Submit one is the whole
+    # of what the lifespan sets.
+    assert get_ingest_submit_client() is None, (
         'the store app lifespan ran in this process: it is the only thing that sets the module '
-        'global get_ingest_fetch_client() reads, and it opens a channel to data_ingest'
+        'global get_ingest_submit_client() reads, and it opens a channel to data_ingest'
     )

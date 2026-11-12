@@ -9,7 +9,7 @@ Every call goes through the REAL AgentStack with the fake-docker rig, so the ord
 verbs run, and a refusal is shown to run nothing after it by the steps the fake recorded:
 
     D7 prod guard (one `docker ps`)  ->  D6 symlink check (restart only)
-        ->  steering guard  ->  budget charge  ->  the ONE compose step
+        ->  steering guard  ->  the ONE compose step
 
 Expected values are literals, never read from stack.py.
 """
@@ -26,7 +26,16 @@ from typing import Any
 import pytest
 
 from tools.agent_mcp import runner, stack
-from tools.agent_mcp.tests.harness import REPO_ROOT, FakeDocker, Rig, default_response, make_rig
+from tools.agent_mcp.tests.harness import (
+    CALL_VOLUME,
+    OLD_BUDGET_REFUSAL,
+    REPO_ROOT,
+    FakeDocker,
+    Rig,
+    assert_no_call_counter,
+    default_response,
+    make_rig,
+)
 
 
 pytestmark = pytest.mark.build_infra
@@ -100,9 +109,7 @@ MIXED_REFUSAL = (
 # What make system-launch's containers carry: the base file and the fake overlay (TEST mode).
 TEST_LINE = b'/r/docker-compose.yaml,/r/docker-compose.fake.yaml\n'
 GUARD_FAILED = 'could not list the containers of project trader_joe_dev, so nothing was changed'
-BUDGET_REFUSAL = '12 state-changing dev verbs in the last hour is the budget; wait, or run the make target yourself'
 SERVICE_REFUSAL = 'service must be one of: data_store, data_ingest, web'
-BUDGET = 12
 
 VERBS = {'down': {}, 'restart': {'service': 'data_store'}}
 EXPECTED_STEP = {'down': DOWN, 'restart': restart('data_store')}
@@ -658,23 +665,22 @@ def test_not_a_directory_reads_as_not_there(tmp_path: Path, monkeypatch: pytest.
 
 
 # ===============================================================================================
-# THE ORDER: guard -> symlink (restart) -> steering -> budget -> step
+# THE ORDER: guard -> symlink (restart) -> steering -> step
 # ===============================================================================================
 
 
-def _exhaust(rig: Rig) -> None:
-    for index in range(BUDGET):
+def _many_admitted(rig: Rig, count: int = CALL_VOLUME) -> None:
+    """COUNT admitted calls alternating restart and down, each running its one compose step."""
+    for index in range(count):
         verb = 'down' if index % 2 else 'restart'
-        assert rig.call(verb, VERBS[verb])['status'] == 'ok'
+        result, argvs = _call(rig, verb, VERBS[verb])
+        assert result['status'] == 'ok', result
+        assert argvs[-1] == EXPECTED_STEP[verb], argvs
 
 
-def _charged(rig: Rig) -> int:
-    return len(rig.agent.dev_budget._calls)
-
-
-def test_the_guard_runs_before_the_symlink_steering_and_budget_checks(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+def test_the_guard_runs_before_the_symlink_and_steering_checks(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     rig, responder = _rig(tmp_path, monkeypatch)
-    _exhaust(rig)
+    _many_admitted(rig)
     _symlink_a_bind_source(rig)
     (rig.layout.stack_dir / '.env').write_text('x\n')
     responder.guard_stdout = PROD_LINE
@@ -684,9 +690,9 @@ def test_the_guard_runs_before_the_symlink_steering_and_budget_checks(tmp_path: 
         assert argvs == [GUARD]
 
 
-def test_the_symlink_check_runs_before_the_steering_and_budget_checks(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+def test_the_symlink_check_runs_before_the_steering_check(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     rig, _ = _rig(tmp_path, monkeypatch)
-    _exhaust(rig)
+    _many_admitted(rig)
     _symlink_a_bind_source(rig)
     (rig.layout.stack_dir / '.env').write_text('x\n')
     result, argvs = _call(rig, 'restart', {'service': 'web'})
@@ -694,9 +700,9 @@ def test_the_symlink_check_runs_before_the_steering_and_budget_checks(tmp_path: 
     assert argvs == [GUARD]
 
 
-def test_the_steering_check_runs_before_the_budget(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+def test_the_steering_check_runs_before_the_step(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     rig, _ = _rig(tmp_path, monkeypatch)
-    _exhaust(rig)
+    _many_admitted(rig)
     (rig.layout.stack_dir / '.env').write_text('x\n')
     for verb in VERBS:
         result, argvs = _call(rig, verb, VERBS[verb])
@@ -705,32 +711,43 @@ def test_the_steering_check_runs_before_the_budget(tmp_path: Path, monkeypatch: 
 
 
 # ===============================================================================================
-# THE BUDGET (S10): 12 admitted state-changing calls an hour, both verbs, only admitted ones charged
+# NO BUDGET (ADR tj-4rr0la addendum 33): the S10 limit of 12 calls an hour is withdrawn, so no
+# admitted call is ever refused for volume, and nothing is counted
 # ===============================================================================================
 
 
 @pytest.mark.parametrize('verb', sorted(VERBS))
-def test_the_thirteenth_admitted_call_refuses_after_only_the_guard(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, verb: str
-):
-    """Both verbs draw on one budget: six of each, then either refuses."""
+def test_the_thirteenth_admitted_call_runs_its_step(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, verb: str):
+    """Twelve admitted calls of both verbs, then either verb is still admitted and runs guard then step."""
     rig, _ = _rig(tmp_path, monkeypatch)
-    _exhaust(rig)
+    _many_admitted(rig, CALL_VOLUME - 1)
     result, argvs = _call(rig, verb, VERBS[verb])
-    assert result['status'] == 'refused' and result['message'] == BUDGET_REFUSAL, result
-    assert argvs == [GUARD]
-    assert _charged(rig) == BUDGET
+    assert result['status'] == 'ok', result
+    assert result['message'] != OLD_BUDGET_REFUSAL
+    assert argvs[0] == GUARD and argvs[-1] == EXPECTED_STEP[verb], argvs
+    assert_no_call_counter(rig)
 
 
-def test_twelve_of_one_verb_exhaust_the_other(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+def test_many_of_one_verb_do_not_limit_the_other(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     rig, _ = _rig(tmp_path, monkeypatch)
-    for _ in range(BUDGET):
+    for _ in range(CALL_VOLUME):
         assert rig.call('down', {})['status'] == 'ok'
-    assert rig.call('restart', {'service': 'web'})['message'] == BUDGET_REFUSAL
+    result, argvs = _call(rig, 'restart', {'service': 'web'})
+    assert result['status'] == 'ok', result
+    assert argvs[-1] == restart('web')
 
 
-def test_refused_calls_are_never_charged(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    """Refusals at every check, then twelve admitted calls still fit, and the thirteenth refuses."""
+def test_fifty_admitted_calls_of_both_verbs_all_run_their_step(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    rig, _ = _rig(tmp_path, monkeypatch)
+    _many_admitted(rig, 50)
+    steps = [argv for argv in _argvs(rig) if argv in (DOWN, restart('data_store'))]
+    assert len(steps) == 50
+    assert steps.count(DOWN) == 25
+    assert_no_call_counter(rig)
+
+
+def test_refused_calls_leave_nothing_that_refuses_the_admitted_ones(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """Refusals at every check, then CALL_VOLUME admitted calls all run their step."""
     rig, responder = _rig(tmp_path, monkeypatch)
     for _ in range(3):
         responder.guard_stdout = PROD_LINE
@@ -747,33 +764,31 @@ def test_refused_calls_are_never_charged(tmp_path: Path, monkeypatch: pytest.Mon
         (rig.layout.stack_dir / 'compose.yaml').unlink()
         assert rig.call('restart', {'service': 'postgres'})['message'] == SERVICE_REFUSAL
         assert rig.call('down', {'volumes': True})['status'] == 'refused'
-    assert _charged(rig) == 0
-    _exhaust(rig)
-    assert _charged(rig) == BUDGET
-    assert rig.call('down', {})['message'] == BUDGET_REFUSAL
-    assert _charged(rig) == BUDGET
+    _many_admitted(rig)
+    assert_no_call_counter(rig)
 
 
-def test_a_budget_refusal_is_not_charged_either(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    rig, _ = _rig(tmp_path, monkeypatch)
-    _exhaust(rig)
-    for _ in range(5):
-        assert rig.call('down', {})['message'] == BUDGET_REFUSAL
-    assert _charged(rig) == BUDGET
-
-
-def test_an_admitted_call_whose_compose_step_fails_is_charged(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    """It was admitted and its step ran (and may have changed state), so it counts."""
+def test_an_admitted_call_whose_compose_step_fails_leaves_the_next_call_admitted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """A failed step answers failed and leaves no state: CALL_VOLUME failing calls, then one that works."""
     rig, responder = _rig(tmp_path, monkeypatch)
     responder.step_exit = 1
-    assert rig.call('down', {})['status'] == 'failed'
-    assert _charged(rig) == 1
+    for _ in range(CALL_VOLUME):
+        result, argvs = _call(rig, 'down', {})
+        assert result['status'] == 'failed', result
+        assert argvs[-1] == DOWN
+    responder.step_exit = 0
+    assert rig.call('down', {})['status'] == 'ok'
+    assert_no_call_counter(rig)
 
 
-def test_read_only_dev_verbs_are_not_charged(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+def test_read_only_dev_verbs_then_state_changing_ones_are_all_admitted(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     rig, _ = _rig(tmp_path, monkeypatch)
-    for _ in range(BUDGET + 1):
+    for _ in range(CALL_VOLUME):
         assert rig.call('ps', {})['status'] == 'ok'
-    assert _charged(rig) == 0
-    _exhaust(rig)
-    assert rig.call('down', {})['message'] == BUDGET_REFUSAL
+    for _ in range(CALL_VOLUME):
+        result, argvs = _call(rig, 'down', {})
+        assert result['status'] == 'ok', result
+        assert argvs[-1] == DOWN
+    assert_no_call_counter(rig)

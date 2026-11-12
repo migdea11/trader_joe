@@ -14,7 +14,7 @@ Shared library imported by both services: the gRPC channel, server and client la
 
 | Helper | Use |
 |---|---|
-| `scheduling.py`: `run_periodic` with `Once`, `AfterTradingEvent`, `Every` | All periodic and timed work in both services. No stored jobs and no replay of missed runs: catch-up is the caller's, from database state. The calendar is passed in (`SessionCalendar`), never imported. A schedule whose `next_fire` raises is retried every `retry_delay` (default 5 min), never ends the task. |
+| `scheduling.py`: `run_periodic` with `Once`, `AfterTradingEvent`, `Every` | All periodic and timed work in both services. No stored jobs and no replay of missed runs: catch-up is the caller's, from database state. The calendar is passed in (`SessionCalendar`), never imported. A schedule whose `next_fire` raises is retried every `retry_delay` (default 5 min), never ends the task. A long interval written as a timer (`Every(timedelta(days=30))`) fires on every restart, because the runner keeps no state: derive row-based due times from database state (`add_calendar_months` for monthly ones) and tick often. Do not hand-roll polling loops; use `run_periodic`. |
 
 ## Key invariants
 

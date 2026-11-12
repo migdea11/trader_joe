@@ -141,9 +141,9 @@ async def write_market_activity_in_transaction(
     """Upsert a batch of bars INSIDE A TRANSACTION THE CALLER OWNS, chunked under the bind-parameter limit.
 
     THIS FUNCTION NEVER COMMITS AND NEVER ROLLS BACK (tj-vz1eta s2, carried onto tj-3mk3u5.10).
-    It is the one shared bar writer: the dataset fetch calls it once per page as the page arrives
-    (data/store/app/ingest/data_action_request.py), inside the single transaction that also holds
-    that fetch's entry upsert, and nothing is committed until the stream's FetchDone. The ledger
+    It is the one shared bar writer: the delivery intake calls it for an attempt's bars
+    (data/store/app/ingest/delivery_intake.py), inside the single transaction that also holds
+    that delivery's entry upsert, and nothing is committed until the delivery ends. The ledger
     work (tj-3mk3u5.34) moves that commit to once per page against this same function, and the
     external stream reuses it -- which is why the commit is the caller's and not buried here.
     batch_create_market_activity_data below is the committing wrapper.

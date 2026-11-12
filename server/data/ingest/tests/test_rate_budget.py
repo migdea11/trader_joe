@@ -1,12 +1,10 @@
-import os
 import time
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
-from unittest.mock import patch
 
 import pytest
 
-from common.enums.data_stock import DataSource, UpdateType
+from common.enums.data_stock import UpdateType
 from common.errors.vocabulary import REASONS, ExogenousError, Outcome, Reason
 from data.ingest.app.brokers import rate_budget
 from data.ingest.app.brokers.rate_budget import RateBudget, RequestPriority, priority_for_update_type
@@ -133,17 +131,6 @@ async def test_acquire_waits_for_the_next_token():
     await budget.acquire(RequestPriority.LIVE)
 
     assert time.monotonic() - start >= 0.0005
-
-
-def test_from_env_reads_the_vendor_specific_names():
-    env = {'ALPACA_RATE_LIMIT_PER_SEC': '3', 'ALPACA_RATE_BURST': '6', 'ALPACA_BACKFILL_RESERVE': '2'}
-    with patch.dict(os.environ, env, clear=False):
-        budget = RateBudget.from_env(DataSource.ALPACA_API)
-
-    assert budget.tokens == 6.0
-    for _ in range(4):
-        assert budget.try_acquire(RequestPriority.BACKFILL)
-    assert not budget.try_acquire(RequestPriority.BACKFILL)
 
 
 # The whole table, written out rather than derived from the function under test, with the

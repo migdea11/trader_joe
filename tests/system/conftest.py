@@ -27,6 +27,12 @@ run's symbol survives in either table. Nothing is truncated, and nothing is dele
 did not create, so the suite is safe to point at a database that holds other data and passes on
 a second consecutive run (the symbol and owner are new each time).
 
+THE INGEST RECORDS ARE CLEANED LAST, by pattern (tj-7zjov1.380). Every POST /store writes ingest_request rows (the
+bars request and the name_change clamp's corporate-actions request) and, per attempt, ingest_run rows, none of which
+any entry cascade reaches. `ingest_records_cleanup` deletes, at the very end of the session, every ingest_request,
+ingest_run and corporate_action row carrying this run's symbol (bare or scenario-prefixed) or owner, and fails if
+one survives. CI's Seed Dump runs straight after the suite on the same database and refuses any such row.
+
 NO DOCKER, NO MIGRATION, NO DOWNGRADE is driven from here. The stack is already up and migrated
 when the suite starts; the make target says so and does neither.
 
@@ -58,11 +64,15 @@ from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
 from common.enums.data_select import AssetType, DataType
 from common.enums.data_stock import DataSource, ExpiryType, Feed, Granularity, UpdateType
+from data.store.app.database.models.corporate_action import CorporateAction
+from data.store.app.database.models.ingest_request import IngestRequest
+from data.store.app.database.models.ingest_run import IngestRun
 from data.store.app.database.models.stock_market_activity import StockMarketActivity
 from data.store.app.database.models.store_dataset_entry import StoreDatasetEntry
 from routers.common.app_endpoints import InterfaceRest
 from routers.common.instance_secret import INSTANCE_SECRET_HEADER
 from tests.fakes.market_data import SCENARIO_PREFIXES
+from tests.system.live_instances import note_live_instances, restore_live_instances
 
 
 # ---------------------------------------------------------------------------------------------
@@ -265,11 +275,12 @@ def entry_values(run_identity: RunIdentity) -> Callable[..., dict[str, Any]]:
     INSERT entirely, so its server default applies.
 
     "COMPLETE" IS A CLAIM THIS FIXTURE HAS TO KEEP EARNING, and it stopped being true once
-    (tj-xhcoyc). feed joined the entry as NOT NULL with no server default in migration
-    c4a1f7b2e905, and this dict did not gain it, so every test that inserts an entry through here
+    (tj-xhcoyc). feed joined the entry as NOT NULL with no server default (tj-3mk3u5.31, a
+    revision since folded into the alpha baseline), and this dict did not gain it, so every test that inserts an entry through here
     died on a NotNullViolation -- two whole files and most of a third. It went unnoticed at that
     migration's gate because the only end-to-end check run there drove the HTTP route, which takes
-    its tape from the FetchDataset ack; nothing that reaches THIS fixture was run. A column added
+    its tape from the ack (the FetchDataset one then, the Submit ack since P35; the stream is gone, P37);
+    nothing that reaches THIS fixture was run. A column added
     to store_dataset_entry without a default has to be added here in the same change.
     """
 
@@ -295,7 +306,7 @@ def entry_values(run_identity: RunIdentity) -> Callable[..., dict[str, Any]]:
         unknown = (set(overrides) | set(omit)) - set(ENTRY_TABLE.c.keys())
         assert not unknown, f'not columns of {ENTRY_TABLE.name}: {sorted(unknown)}'
         values.update(overrides)
-        # collect (tj-grna9p.176, migration e5c8b1d4f703): its CHECK wants NULL exactly for STATIC, which the
+        # collect (tj-grna9p.176): its CHECK wants NULL exactly for STATIC, which the
         # column's NULL default already gives, so only a subscription gets a value: TRUE, collecting, unless the
         # test passes collect=False to stop it. Never derived from the expiry (decision tj-hhy3dk, tj-grna9p.175):
         # the expiry is the deletion date only, and a fixture coupling the two would hide an expiry that retires
@@ -319,7 +330,7 @@ def bar_values() -> Callable[..., dict[str, Any]]:
 
     feed IS NOW COPIED FROM THE ENTRY TOO, and it is the sentence above that required the change
     (tj-xhcoyc). feed is a natural-key column of the bar, so "copied from the entry row" always
-    covered it in intent -- but until c4a1f7b2e905 the entry HAD no feed to copy, so it was
+    covered it in intent -- but until tj-3mk3u5.31 the entry HAD no feed to copy, so it was
     hardcoded to IEX and the docstring was true only by coincidence. Now that the entry records
     its resolved tape, hardcoding would let a SIP entry own IEX bars, which is exactly the
     coverage lie tj-f2qz44 was filed about, one table over. The IEX default lives on the entry
@@ -405,6 +416,27 @@ def pg_conn(pg_engine: Engine) -> Iterator[Connection]:
     """A read connection for catalogue queries and read-backs."""
     with pg_engine.connect() as conn:
         yield conn
+
+
+@pytest.fixture
+def live_instances_kept(pg_engine: Engine, run_identity: RunIdentity) -> Iterator[None]:
+    """The running ingest instance is live again after a test that sights a minted instance id (tj-7zjov1.233).
+
+    A first sighting supersedes every other instance, the stack's real ingest included, and nothing restores it, so a
+    later POST in the session would run against a superseded instance (tests/system/live_instances.py says how). Every
+    module that can sight an instance applies this to all its tests through
+    `pytestmark = [..., pytest.mark.usefixtures('live_instances_kept')]`; server/data/store/tests/
+    test_system_live_instances.py fails when one does not. A usefixtures fixture is set up before the test's own
+    fixtures, so it is torn down after their cleanups, once the minted ids are deleted; the restore does not rely on
+    that order (a minted id carries the run id, and the restore never reads one as a real ingest).
+    """
+    with pg_engine.connect() as conn:
+        before = note_live_instances(conn)
+    try:
+        yield
+    finally:
+        with pg_engine.begin() as conn:
+            restore_live_instances(conn, before, minted_marker=run_identity.run_id)
 
 
 @pytest_asyncio.fixture
@@ -689,11 +721,21 @@ class DataStoreHttp:
         auth: WriteAuth = WriteAuth.ABSENT,
         params: dict[str, Any] | None = None,
         json: Any = None,
+        read_timeout_ok: bool = False,
     ) -> httpx.Response:
-        """Send one request. A data_store that does not answer FAILS the test, naming the URL; never a skip."""
+        """Send one request. A data_store that does not answer FAILS the test, naming the URL; never a skip.
+
+        read_timeout_ok, for a caller that expects the store to take longer than HTTP_TIMEOUT_SECONDS to answer
+        (P26 Zc, whose POST waits about a minute for its verdict; tj-7zjov1.353): an httpx.ReadTimeout is re-raised
+        for the caller to catch instead of failing the test. Only a READ timeout: the request was sent and the store
+        accepted the connection. A ConnectTimeout, a PoolTimeout, a WriteTimeout and every other transport error mean
+        the request may never have reached the store, and still fail here.
+        """
         try:
             return self._client.request(method, path, params=params, json=json, headers=self._headers(auth))
         except httpx.TransportError as exc:
+            if read_timeout_ok and isinstance(exc, httpx.ReadTimeout):
+                raise
             reason = self.redact(f'{type(exc).__name__}: {exc}')
         pytest.fail(
             f'system suite: data_store at {self.base_url} did not answer {method} {path}: {reason}. '
@@ -704,8 +746,8 @@ class DataStoreHttp:
     def get(self, path: str, *, params: dict[str, Any] | None = None, auth: WriteAuth = WriteAuth.ABSENT):
         return self.request('GET', path, params=params, auth=auth)
 
-    def post(self, path: str, *, json: Any, auth: WriteAuth) -> httpx.Response:
-        return self.request('POST', path, json=json, auth=auth)
+    def post(self, path: str, *, json: Any, auth: WriteAuth, read_timeout_ok: bool = False) -> httpx.Response:
+        return self.request('POST', path, json=json, auth=auth, read_timeout_ok=read_timeout_ok)
 
     def patch(self, path: str, *, json: Any, auth: WriteAuth) -> httpx.Response:
         return self.request('PATCH', path, json=json, auth=auth)
@@ -848,6 +890,80 @@ def scenario_entries(pg_engine: Engine, run_identity: RunIdentity) -> Iterator[C
         pytest.fail(
             f'system suite cleanup: {entries_left} entries and {bars_left} bars with a scenario-prefixed '
             f"{run_identity.symbol}* symbol survived the delete of this run's {len(ids)} scenario entries",
+            pytrace=False,
+        )
+
+
+REQUEST_TABLE = IngestRequest.__table__
+RUN_TABLE = IngestRun.__table__
+CORPORATE_ACTION_TABLE = CorporateAction.__table__
+
+
+def run_symbol_prefixes(run_identity: RunIdentity) -> list[str]:
+    """Every symbol prefix this run writes under: its own symbol, and that symbol behind each FakeRead scenario prefix."""
+    return [run_identity.symbol, *(f'{prefix}{run_identity.symbol}' for prefix in SCENARIO_PREFIXES)]
+
+
+def _this_runs_rows(table: sa.Table, symbol_column: str, owner_column: str | None, run_identity: RunIdentity):
+    """The WHERE clause that matches a row of `table` this run wrote: by its symbol prefix, or by its owner prefix.
+
+    startswith(autoescape=True), so the underscore in a scenario prefix (EMPTY_, FAIL_) is literal, not LIKE's wildcard.
+    The owner prefix takes alt_owner's suffixes (system-test-<run>-overlap, -identity) too; it is never a prefix of
+    another run's owner, because the run id is a fixed eight hex characters.
+    """
+    symbol = table.c[symbol_column]
+    clauses = [symbol.startswith(prefix, autoescape=True) for prefix in run_symbol_prefixes(run_identity)]
+    if owner_column is not None:
+        clauses.append(table.c[owner_column].startswith(run_identity.owner, autoescape=True))
+    return sa.or_(*clauses)
+
+
+@pytest.fixture(scope='session', autouse=True)
+def ingest_records_cleanup(pg_settings: PgSettings, run_identity: RunIdentity) -> Iterator[None]:
+    """Delete every ingest request, attempt row and corporate action this run wrote, at the END of the session.
+
+    Autouse and session-scoped, so it is set up ahead of the fixtures the tests request and torn down after them: the
+    entry registries have deleted this run's entries (so the DAILY refresh can no longer owe one of them a request)
+    before this runs, and nothing a test reads mid-suite is gone early. Matched by pattern, never by a recorded id,
+    because the rows are written by the store, not by the suite: ingest_request by asset_symbol or client_label (the
+    POST's owner; a DAILY refresh request carries the scheduler's label and the run's symbol), ingest_run by
+    asset_symbol or actor, corporate_action by requesting_symbol, and the attempt rows and observations of every matched
+    request by request_id as well. Then it counts what still matches and fails naming the counts, as the entry
+    registries do: CI's Seed Dump runs straight after the suite on this database and refuses every such row.
+
+    It takes pg_settings, not pg_engine, and opens its own engine only here at the end, so a test that needs no
+    Postgres is not made to connect at setup.
+    """
+    yield
+    engine = sa.create_engine(
+        pg_settings.url(), connect_args={'connect_timeout': pg_settings.connect_timeout}, pool_pre_ping=True
+    )
+    requests = _this_runs_rows(REQUEST_TABLE, 'asset_symbol', 'client_label', run_identity)
+    runs = _this_runs_rows(RUN_TABLE, 'asset_symbol', 'actor', run_identity)
+    actions = _this_runs_rows(CORPORATE_ACTION_TABLE, 'requesting_symbol', None, run_identity)
+    request_ids = sa.select(REQUEST_TABLE.c.id).where(requests).scalar_subquery()
+    try:
+        with engine.begin() as conn:
+            # Children of the matched requests first, while the subquery can still find them; no foreign key orders it.
+            conn.execute(sa.delete(RUN_TABLE).where(sa.or_(runs, RUN_TABLE.c.request_id.in_(request_ids))))
+            conn.execute(
+                sa.delete(CORPORATE_ACTION_TABLE).where(
+                    sa.or_(actions, CORPORATE_ACTION_TABLE.c.request_id.in_(request_ids))
+                )
+            )
+            conn.execute(sa.delete(REQUEST_TABLE).where(requests))
+        with engine.connect() as conn:
+            left = {
+                table.name: conn.execute(sa.select(sa.func.count()).select_from(table).where(clause)).scalar_one()
+                for table, clause in ((REQUEST_TABLE, requests), (RUN_TABLE, runs), (CORPORATE_ACTION_TABLE, actions))
+            }
+    finally:
+        engine.dispose()
+    if any(left.values()):
+        counts = ', '.join(f'{count} {name}' for name, count in left.items())
+        pytest.fail(
+            f'system suite cleanup: {counts} row(s) with symbol {run_identity.symbol}* (bare or scenario-prefixed) '
+            f"or owner {run_identity.owner}* survived the delete of this run's ingest records",
             pytrace=False,
         )
 

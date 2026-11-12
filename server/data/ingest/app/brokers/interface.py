@@ -26,6 +26,7 @@ from common.enums.data_select import AssetType
 from common.enums.data_stock import Feed, Granularity
 from common.errors.vocabulary import InvalidRequestError, Reason, TraderJoeError
 from data.ingest.app.brokers.rate_budget import RequestPriority
+from schemas.data_ingest.submit import AssetListStatus
 
 
 # The reasons a broker can give for not serving what was asked of it (TE-4).
@@ -42,7 +43,7 @@ class BrokerUnsupportedError(InvalidRequestError):
     PR (decision tj-j4wknb addendum 4 item 8). A reader RETURNS it inside a BarsFailure.
 
     It carries UNSUPPORTED_INSTRUMENT (a currency, exchange or adjustment the broker cannot serve),
-    UNSUPPORTED_ASSET_TYPE (not a stock) or FEED_NOT_AVAILABLE (a feed this deployment cannot serve). The
+    UNSUPPORTED_ASSET_TYPE (not a stock) or FEED_NOT_AVAILABLE (a feed this account cannot serve). The
     detail names the field and the value that could not be served.
 
     Args:
@@ -84,6 +85,53 @@ class Instrument:
     currency: str | None = None
 
 
+@dataclass
+class CallTally:
+    """The vendor calls one attempt actually made, counted by the adapter as it spends its quota.
+
+    A call that was collapsed onto another caller's in flight, or refused before the vendor, is not counted: it
+    spent nothing. The attempt's report to the store carries these numbers.
+
+    Attributes:
+        calls (int): HTTP requests that reached the vendor: every page and every retry, whatever the answer.
+        pages (int): Good pages the vendor answered.
+        retries (int): Requests made again after a failed one inside the attempt.
+        throttled_429 (int): Requests the vendor answered 429.
+        first_call_at (datetime | None): When the first was made, timezone aware.
+        last_call_at (datetime | None): When the last was made, timezone aware.
+    """
+
+    calls: int = 0
+    pages: int = 0
+    retries: int = 0
+    throttled_429: int = 0
+    first_call_at: datetime | None = None
+    last_call_at: datetime | None = None
+
+    def record(self, at: datetime) -> None:
+        """Count one vendor call made at the given instant.
+
+        Args:
+            at (datetime): When the call was made, timezone aware.
+        """
+        self.calls += 1
+        if self.first_call_at is None:
+            self.first_call_at = at
+        self.last_call_at = at
+
+    def record_page(self) -> None:
+        """Count one good page the vendor answered."""
+        self.pages += 1
+
+    def record_retry(self) -> None:
+        """Count one request made again after a failed one."""
+        self.retries += 1
+
+    def record_throttled(self) -> None:
+        """Count one request the vendor answered 429."""
+        self.throttled_429 += 1
+
+
 @dataclass(frozen=True)
 class BarsQuery:
     """One request for historical bars.
@@ -96,12 +144,13 @@ class BarsQuery:
         adjustment (str): Price adjustment. Only 'raw' today: bars are stored raw and adjusted
             on read (tj-vhboky.1 section 6).
         priority (RequestPriority): The platform's fetch priority; the adapter's rate budget uses it.
-        feed (Feed | None): The tape the caller names, or None to leave it to the deployment. A reader
-            serves a named feed only if its deployment can, and otherwise refuses before any vendor
+        feed (Feed | None): The tape the caller names, or None to leave it to the account. A reader
+            serves a named feed only if its account can, and otherwise refuses before any vendor
             call (FEED_NOT_AVAILABLE).
         deadline (datetime | None): When the caller stops waiting, timezone aware, or None for no
             bound. A rate budget that cannot admit the call before it fails fast (RATE_BUDGET)
             instead of sleeping past it (ADR tj-fa1rpu U4).
+        tally (CallTally | None): Counts the vendor calls this query makes, for the attempt's report.
     """
 
     instrument: Instrument
@@ -114,6 +163,8 @@ class BarsQuery:
     # Keyword only: a feed or a deadline passed positionally would be a silent mistake.
     feed: Feed | None = field(default=None, kw_only=True)
     deadline: datetime | None = field(default=None, kw_only=True)
+    # Where the adapter counts the vendor calls this query makes, or None when nobody reads them.
+    tally: CallTally | None = field(default=None, kw_only=True)
 
 
 @dataclass(frozen=True)
@@ -146,7 +197,8 @@ class ServedRange(NamedTuple):
 
     Attributes:
         start (datetime): Inclusive start, timezone aware.
-        end (datetime): Exclusive end, timezone aware. Never open: an open request end is served as as_of.
+        end (datetime): Exclusive end, timezone aware. The end actually sent, never open: an open request end is served up to
+            the reader's servable edge for the resolved feed (as_of when the feed has none), never past as_of.
     """
 
     start: datetime
@@ -165,8 +217,9 @@ class BarsResponse:
         bars (AsyncIterator[Bar]): The bars, ascending by timestamp, unique, within [start, end):
             a bar stamped exactly at end is never included, for every broker.
         served_range (ServedRange): The range the vendor ANSWERED for. Its end is the query's end
-            clamped to as_of, because a vendor cannot have answered for time after it answered, and
-            an open end is as_of.
+            clamped to as_of, because a vendor cannot have answered for time after it answered. It is the
+            end actually sent: an open end is the reader's servable edge for the resolved feed
+            (as_of when the feed has none).
         as_of (datetime): When the vendor answered, timezone aware, UTC.
     """
 
@@ -195,8 +248,258 @@ class BarsFailure:
     error: TraderJoeError
 
 
+@dataclass(frozen=True)
+class AssetListQuery:
+    """One request for a broker's asset list, one list per request.
+
+    Attributes:
+        asset_type (AssetType): What kind of instrument to list. A broker that lists only some kinds refuses the rest.
+        status (AssetListStatus): Which list: the active one or the inactive one. Never both, never "all".
+        priority (RequestPriority): The platform's priority class for the vendor call.
+        deadline (datetime | None): When the caller stops waiting, timezone aware, or None for no bound. A rate
+            budget that cannot admit the call before it fails fast (RATE_BUDGET) instead of sleeping past it.
+        tally (CallTally | None): Counts the vendor calls this query makes, for the attempt's report.
+    """
+
+    asset_type: AssetType
+    status: AssetListStatus
+    priority: RequestPriority = field(kw_only=True)
+    deadline: datetime | None = field(default=None, kw_only=True)
+    tally: CallTally | None = field(default=None, kw_only=True)
+
+
+@dataclass(frozen=True)
+class AssetLookupQuery:
+    """One request for the broker's record of one symbol.
+
+    The lookup is by SYMBOL only. The broker's own asset id is data a lookup returns and never an argument.
+
+    Attributes:
+        symbol (str): The ticker to look up, as the caller holds it.
+        priority (RequestPriority): The platform's priority class for the vendor call.
+        deadline (datetime | None): When the caller stops waiting, timezone aware, or None for no bound.
+    """
+
+    symbol: str
+    priority: RequestPriority = field(kw_only=True)
+    deadline: datetime | None = field(default=None, kw_only=True)
+
+
+@dataclass(frozen=True)
+class Asset:
+    """One broker asset, carried RAW: a few neutral fields beside the broker's own record, untouched.
+
+    Nothing here is a judgement. active and tradable are None when the broker said nothing, which is never
+    read as inactive or untradable; the store judges what an asset is worth.
+
+    Attributes:
+        vendor_asset_id (str): The broker's id for the asset, OPAQUE: nothing parses or compares it.
+        symbol (str): The ticker the broker lists it under now.
+        raw_payload (bytes): The broker's record as served, byte for byte.
+        active (bool | None): Whether the broker's status says active, or None when it gave no status.
+        tradable (bool | None): The broker's tradable flag, or None when it gave none.
+        exchange (str): The broker's venue wording as given, empty when it gave none.
+        name (str): The broker's name for the asset as given, empty when it gave none.
+    """
+
+    vendor_asset_id: str
+    symbol: str
+    raw_payload: bytes
+    active: bool | None = None
+    tradable: bool | None = None
+    exchange: str = ''
+    name: str = ''
+
+
+@dataclass(frozen=True)
+class AssetListResponse:
+    """The SERVED outcome of an asset list: every asset the broker listed, which may be none.
+
+    Attributes:
+        assets (Sequence[Asset]): The assets in the order the broker served them.
+        as_of (datetime): When the broker answered, timezone aware, UTC.
+    """
+
+    assets: Sequence[Asset]
+    as_of: datetime
+
+
+@dataclass(frozen=True)
+class AssetListFailure:
+    """A failure get_assets RETURNS rather than raises.
+
+    Attributes:
+        error (TraderJoeError): The typed error; the caught vendor exception, where there is one, is its __cause__.
+    """
+
+    error: TraderJoeError
+
+
+@dataclass(frozen=True)
+class AssetResponse:
+    """The SERVED outcome of a lookup: the broker's record for the symbol.
+
+    Attributes:
+        asset (Asset): The record. Its symbol is the broker's own and may differ from the one asked for.
+        as_of (datetime): When the broker answered, timezone aware, UTC.
+    """
+
+    asset: Asset
+    as_of: datetime
+
+
+@dataclass(frozen=True)
+class AssetNotFound:
+    """The broker answered that it has no asset for the symbol. An outcome, not a failure.
+
+    A caller that holds a vendor id for the symbol reads this as the id having gone, not as an error.
+
+    Attributes:
+        symbol (str): The symbol that was asked for.
+        as_of (datetime): When the broker answered, timezone aware, UTC.
+    """
+
+    symbol: str
+    as_of: datetime
+
+
+@dataclass(frozen=True)
+class AssetLookupFailure:
+    """A failure get_asset RETURNS rather than raises: anything but an answer, found or not found.
+
+    Attributes:
+        error (TraderJoeError): The typed error, with reset_at where a rate limit names one.
+    """
+
+    error: TraderJoeError
+
+
+@dataclass(frozen=True)
+class CorporateActionsQuery:
+    """One request for a broker's corporate actions for one symbol over an explicit window.
+
+    Attributes:
+        symbol (str): The ticker to read, as the caller holds it. The broker may match it on either side of an action
+            (a name change is found by its old and its new symbol).
+        start (datetime): Inclusive start of the window, timezone aware.
+        end (datetime): Exclusive end of the window, timezone aware.
+        priority (RequestPriority): The platform's priority class for the vendor calls.
+        deadline (datetime | None): When the caller stops waiting, timezone aware, or None for no bound.
+        tally (CallTally | None): Counts the vendor calls this query makes, for the attempt's report.
+    """
+
+    symbol: str
+    start: datetime
+    end: datetime
+    priority: RequestPriority = field(kw_only=True)
+    deadline: datetime | None = field(default=None, kw_only=True)
+    tally: CallTally | None = field(default=None, kw_only=True)
+
+
+@dataclass(frozen=True)
+class CorporateAction:
+    """One broker corporate action, carried RAW: a few neutral fields beside the broker's own record, untouched.
+
+    Nothing here is a judgement and no type is filtered: the store decides what an action is worth. A date the broker
+    did not give is None.
+
+    Attributes:
+        vendor_action_id (str): The broker's id for the action, OPAQUE.
+        action_type (str): The broker's own wording of the type (its group name), uninterpreted.
+        raw_payload (bytes): The broker's record as served, byte for byte.
+        ex_date (datetime | None): The broker's ex date, midnight UTC of the day it gave.
+        record_date (datetime | None): The broker's record date, likewise.
+        payable_date (datetime | None): The broker's payable date, likewise.
+        process_date (datetime | None): The broker's process date, likewise.
+        effective_date (datetime | None): The broker's effective date, likewise.
+        identifiers (Mapping[str, str]): Every instrument identifier the broker gave (symbols, CUSIPs, ISINs, role-named
+            ones included), keyed by the broker's own field name.
+    """
+
+    vendor_action_id: str
+    action_type: str
+    raw_payload: bytes
+    ex_date: datetime | None = None
+    record_date: datetime | None = None
+    payable_date: datetime | None = None
+    process_date: datetime | None = None
+    effective_date: datetime | None = None
+    identifiers: Mapping[str, str] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class CorporateActionsResponse:
+    """The SERVED outcome of a corporate-actions read: every action the broker returned for the window, maybe none.
+
+    Attributes:
+        actions (Sequence[CorporateAction]): The actions in the order the broker served them, every page followed.
+        as_of (datetime): When the last page was answered, timezone aware, UTC.
+    """
+
+    actions: Sequence[CorporateAction]
+    as_of: datetime
+
+
+@dataclass(frozen=True)
+class CorporateActionsFailure:
+    """A failure get_corporate_actions RETURNS rather than raises.
+
+    Attributes:
+        error (TraderJoeError): The typed error; the caught vendor exception, where there is one, is its __cause__.
+    """
+
+    error: TraderJoeError
+
+
 class BrokerRead(Protocol):
     """What data_ingest reads from a broker."""
+
+    async def get_corporate_actions(
+        self, query: CorporateActionsQuery
+    ) -> CorporateActionsResponse | CorporateActionsFailure:
+        """Fetch a broker's corporate actions for one symbol over a window, every page, nothing filtered.
+
+        Returns a CorporateActionsFailure, and never raises, for a failure that is expected: a missing credential or
+        configuration, a rate budget that cannot admit a call before query.deadline, and a vendor that refuses or
+        cannot answer. A failure on any page fails the whole read: never a partial list. A bug still raises.
+
+        Args:
+            query (CorporateActionsQuery): The symbol and the window.
+
+        Returns:
+            CorporateActionsResponse | CorporateActionsFailure: Every action served, or the typed failure.
+        """
+        ...
+
+    async def get_assets(self, query: AssetListQuery) -> AssetListResponse | AssetListFailure:
+        """Fetch one of the broker's asset lists, whole.
+
+        Returns an AssetListFailure, and never raises, for a failure that is expected: a kind of asset the broker
+        does not list (BrokerUnsupportedError), a missing credential or configuration, a rate budget that cannot admit
+        the call before query.deadline, and a vendor that refuses or cannot answer. A bug still raises.
+
+        Args:
+            query (AssetListQuery): Which list to fetch.
+
+        Returns:
+            AssetListResponse | AssetListFailure: Every asset of the list, or the typed failure.
+        """
+        ...
+
+    async def get_asset(self, query: AssetLookupQuery) -> AssetResponse | AssetNotFound | AssetLookupFailure:
+        """Look up the broker's record for one symbol.
+
+        The broker saying it has no such asset is AssetNotFound, an answer. Every other expected failure is an
+        AssetLookupFailure: a rate limit carries its reset_at. This paces on the broker's asset-API scope and is
+        not counted in any bars attempt's spend.
+
+        Args:
+            query (AssetLookupQuery): The symbol to look up.
+
+        Returns:
+            AssetResponse | AssetNotFound | AssetLookupFailure: The record, the not-found answer, or the failure.
+        """
+        ...
 
     async def get_bars(self, query: BarsQuery) -> BarsResponse | BarsFailure:
         """Fetch historical bars for one instrument.

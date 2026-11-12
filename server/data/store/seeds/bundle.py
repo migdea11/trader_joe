@@ -35,7 +35,8 @@ untouched. A failure before the renames leaves neither target and no temporary.
 Host half: `python -m data.store.seeds.bundle --out DIR [--allow-tests-dir]` reads the producer's
 stdout on stdin and writes the two files. A directory inside the repository's tests/ is refused
 unless --allow-tests-dir is passed, because the make target and the MCP write into a git-ignored
-directory and a person copies a reviewed seed into tests/system/seeds/ (tj-vhboky.56).
+directory; no committed seed directory exists now (tests/system/seeds is gone), so a seed is kept
+only where its maker puts it (tj-vhboky.56).
 
 This module imports the standard library only.
 """

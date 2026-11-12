@@ -6,12 +6,39 @@ ONE compose project, the owner's own (stack.DEV_PROJECT, trader_joe_dev), in its
 is no second, isolated stack: the separate agent stack (its own compose project, generated env files
 and data directory, and its own verbs stack_up, stack_down and stack_wipe, plus its separate
 logs and ps, which the one-project logs and ps below replace) was retired in favour of modes of
-the one project (addenda 26-28). The fifteen verbs:
+the one project (addenda 26-28). The twenty-two verbs:
 
     ps()  logs(service, tail)  db_tables()  http_get(name)  migrate_status()
     down()  restart(service)  build()  up()  tools()
     migrate()  test_build()  test_up()
-    run_system_tests(worktree, paths)  seed_dump(worktree, date)
+    run_system_tests(worktree, paths)  seed_dump(worktree, date)  test_reset()
+    test_stop(service)  test_start(service)  test_env(service, overrides)
+    stack_session_open_test(bead, verbs, purpose, minutes)
+    stack_session_open_dev(bead, verbs, purpose, minutes)  stack_session_close()
+
+THE SESSION GRANT (ADR tj-4rr0la addendum 34; owner rulings 2026-11-06). Every STATE-CHANGING verb needs an
+open, unexpired grant that covers it; the READ verbs (ps, logs, migrate_status, db_tables, http_get) and the
+three session verbs need none. A grant is one approval per bead under test, held in THIS PROCESS'S MEMORY
+only (a server restart, such as make agent-mcp-rebuild, closes it; a client reconnect does not):
+    BEAD      the id of whatever is under test (a test-collection bead, a feature or bug bead, an epic);
+              free-form, never checked against the task store, which this server cannot read.
+    MODE      in the tool NAME, so a client's settings can treat the dev opener differently.
+    VERBS     a list from the mode's closed set. TEST: test_build, test_up, test_stop, test_start, test_env,
+              test_reset, run_system_tests, seed_dump, migrate, restart, down; or the string 'test-campaign',
+              all of them but down (down is named in a list on its own). DEV: build, up, down, restart,
+              migrate, tools, each named; there is no preset.
+    MINUTES   TEST: default 240, at most 480. DEV: default 60, at most 120. Over the maximum is REFUSED,
+              never trimmed, so the grant that exists is the one that was approved.
+    PURPOSE   one sentence, at most 200 printable characters: what is tested and what it will touch.
+Opening a grant replaces the open one. stack_session_close ends it and is free. Both bypass the verb lock and
+touch no docker. ENFORCED: mode, verb list and expiry. Recorded and echoed only: the purpose, and the bead's
+identity or status. The check is at ADMISSION: after 'unknown verb' and 'busy', before the argument check and
+before every rail of the verb, and a verb already admitted runs to its own timeout whatever happens to the
+grant. migrate, restart and down take the mode the mode guard resolves (an empty project counts as DEV), so
+their mode is checked right after that guard. A grant is an extra condition only; it never skips, reorders
+or relaxes a rail, and there is no counter or rate limit anywhere (addendum 33). A refusal names the open
+grant, or says none is open, and what to ask the owner to approve. ps ends with one line,
+`session: <bead> <MODE> [verbs] expires <UTC> - <purpose>` or `session: none`.
 
 TWO READ-ONLY VERBS (ADR tj-4rr0la addendum 18; tj-kzy7w2, approved on tj-wpnr7o (b)):
 
@@ -42,7 +69,7 @@ volume, an image or an orphan (the database is a host bind and survives). restar
 existing container. Neither loads a compose file or an env file. Each refuses, running nothing after
 the refusal, unless the D7 guard finds every project container started from the dev files; restart
 also refuses a symlinked bind source (D6); both refuse a compose file or dotenv file in the stack
-directory or a parent (compose would search there) and are limited to 12 state-changing dev calls an hour.
+directory or a parent (compose would search there).
 
 and ONE FILE-BASED BUILD VERB over it (tj-iee6sn.8):
 
@@ -54,7 +81,7 @@ build is make dev-build's build: the three :dev images from the checkout, as one
 placeholder step environment, COMPOSE_ENV_FILES=/dev/null), and stamps the images with digests from
 the baked source_digest.sh run with --context over the checkout. It starts no container, so it has no
 prod guard; it refuses a stale baked copy (stack.check_trusted_copies_current) and missing or old
-generated code, and is limited by the same hourly budget.
+generated code.
 
 and ONE MORE STATE-CHANGING VERB, make dev-up (tj-iee6sn.9):
 
@@ -78,7 +105,7 @@ docker-compose.tools.yaml (stack.dev_tools_prefix), in up's secret wrapper under
 environment. A plain call of up to 5 minutes; it never builds, stops or removes anything. PGADMIN_EMAIL
 and PGADMIN_PASS are read by compose from the root env file: this server neither reads nor passes them,
 so no credential reaches an argv, the audit line or the output; when one is unset compose refuses before
-creating the container. The D7, S6, D6 and D5 checks and the budget are up's. down removes pgAdmin
+creating the container. The D7, S6, D6 and D5 checks are up's. down removes pgAdmin
 with the rest of the project (label-only).
 
 and TWO MIGRATION VERBS over whichever mode of the one project is up (tj-iee6sn.10; owner ruling: ONE
@@ -98,7 +125,7 @@ DEV mode; the permission for it is the owner's client setting, not this server's
 nothing is up, under a PROD container or both modes, with no or several postgres or several data_store
 containers, with no revision file in the checkout, without the mode's data_store image, and on the
 S6/D6/D5 checks of up; it builds nothing. migrate_status is read-only: alembic current and history by
-exec in the running data_store of whichever mode is up, charging no budget. alembic check is not offered:
+exec in the running data_store of whichever mode is up. alembic check is not offered:
 make migrate-check covers it on the host.
 
 and TWO TEST-MODE VERBS over the same project (tj-iee6sn.24; ADR tj-4rr0la addenda 26-27):
@@ -113,6 +140,35 @@ system-launch: it stops the project, then starts postgres, data_store and data_i
 fake files with DATA_DIR pinned to ./volume_data/test in the step environment (never the owner's dev
 data), data_ingest on the fake broker. It never builds: both :test images must exist and carry a source
 stamp equal to the checkout's digest (stack.check_dev_image_stamp), else it is refused naming test_build.
+
+and THREE TEST-MODE SERVICE VERBS, in test_reset's lineage (ADR tj-4rr0la addendum 32; tj-7zjov1.268):
+
+    test_stop(service)  test_start(service)  test_env(service, overrides)
+
+SERVICE is data_store or data_ingest and nothing else (postgres, test_client and web are refused).
+test_stop is `compose stop <service>`: the container is kept, with its environment. test_start is
+`up -d --wait --wait-timeout 300 --no-deps --no-recreate <service>`: a stopped container comes back
+as it was. test_env replaces that service's WHOLE override set ({} clears it), writes it, and recreates
+only that service (`up ... --no-deps --force-recreate <service>`). Overrides survive restart,
+test_stop/test_start and a test_env on the other service; a plain test_up deletes them.
+THE ALLOW-LIST (stack.AGENT_ENV_ALLOW, a literal) is the security property: per service, each name
+has a full-match value grammar (decimal digits only) checked BEFORE its range, and values only lower a
+default; at most stack.AGENT_ENV_MAX_NAMES names per call; the never-allowed names and patterns
+(stack.env_name_never_allowed: KEY, SECRET, PASS, TOKEN, CREDENTIAL, DATABASE_*, POSTGRES_*, ...) are
+refused first and the literal is checked against them at import. A refusal names the variable, never the
+value. HOW IT REACHES COMPOSE: this server renders ONE overlay, stack.AGENT_ENV_FILE
+(docker-compose.agent-env.yaml), in its own stack directory (never the repository, never an env file)
+from a dict by yaml.dump with a SafeDumper subclass and a fixed argument set (pyyaml, in the agent-mcp group; read back byte-identical),
+mode 0600, written to a temporary name and renamed; it carries services.<service>.environment and the
+labels trader_joe.agent.env_generation and trader_joe.agent.env_names. It is LAST in the TEST file set
+(stack.testmode_prefix with a stack directory) only when it exists, stack.check_dev_lifecycle_argv
+accepts exactly that one path there, and the dev file sets never name it. The rails run in test_reset's
+spirit and all BEFORE the act: steering files and trusted copies current, only TEST mode,
+the postgres mount exactly <repo>/volume_data/test/postgres, every data_store and data_ingest
+container's source stamp (running or stopped) equal to the checkout's digest, and exactly one
+container of the named service in the state the verb needs. ps reports the active overrides: the names from the containers' labels, the generation and the
+values from this server's own file, and 'pending' when they differ; it never reads a container's
+environment. The permission for all three stays 'ask' (the owner's client setting).
 
 THE MODE GUARD. Every state-changing verb that acts on the project first lists its non-one-off containers
 and classifies each by the basename of its compose files (stack.classify_mode, run_migrations.sh's
@@ -152,6 +208,7 @@ prefix and a fixed tail, built in stack.py and re-checked as built:
     system-test client (run_system_tests, seed_dump): stack.testclient_prefix(), the snapshot as the
         project directory and the root env file as --env-file.
     exec (db_tables, http_get, migrate_status): `docker exec` into a container found by label.
+    exec (test_reset): the same `docker exec`, the one row as user postgres without the read-only option.
 No argv ever carries a repository path an agent chose.
 Subprocesses take argument lists, never a shell, with a fixed environment (runner.DOCKER_ENV).
 Before the first step of a verb that can build (stack.builds: `build`, any `--build`, `up`, or a `run`
@@ -174,13 +231,13 @@ every mount it has come from the snapshot of the named worktree, so a worktree's
 reach the client. Rails, in order and each refusing before anything runs: only TEST mode is up (the
 mode guard), the running postgres's data mount is <repo host path>/volume_data/test/postgres
 (stack.check_test_postgres_mount), every running data_store and data_ingest container's source stamp
-equals the checkout's digest; then the snapshot and one charge of the state-changing budget. The
+equals the checkout's digest; then the snapshot. The
 compose command is stack.check_testclient_argv's. The client reads the instance write secret from the
 root env file through compose (--env-file), exactly as data_store does; this server never opens that
 file, and the secret is on no command line.
 
-THE STACK DIRECTORY (settings.stack_dir, AGENT_MCP_STACK_DIR) holds the snapshot and the audit log and
-nothing else: there are no generated env files and no data directory. The project's data is the
+THE STACK DIRECTORY (settings.stack_dir, AGENT_MCP_STACK_DIR) holds the snapshot, the audit log and the
+one generated overrides overlay (test_env) and nothing else: there are no env files and no data directory. The project's data is the
 checkout's ./volume_data (dev) and ./volume_data/test (test mode).
 
 WHAT ELSE HOLDS
@@ -190,8 +247,10 @@ WHAT ELSE HOLDS
     Output: exit status plus stdout/stderr per step, each cut to its last runner.OUTPUT_CAP_BYTES
         with the cut stated. No env file is printed, and none is read by this server's Python.
     Audit: one JSON line per call in <stack dir>/audit.log -- UTC time, verb, known, validated
-        arguments, status, exit status, duration; an unknown verb by its name cut to 64 characters,
-        known: false. No output, no env value, and never the token.
+        arguments, status, exit status, duration, grant ({bead, mode, verbs, expires_at, purpose}, or
+        null); an unknown verb by its name cut to 64 characters, known: false. An opened, replaced
+        (session_replaced), closed or expired (session_expired) grant each writes a line. No output, no
+        env value, and never the token.
     Auth: auth.BearerTokenMiddleware refuses any request without the token, before the MCP app.
 
 DOCKER API SECTIONS THE VERBS NEED -- the socket proxy (tj-c4mosr.4) enables exactly these, as

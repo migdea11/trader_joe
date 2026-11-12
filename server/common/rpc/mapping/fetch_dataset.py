@@ -1,4 +1,4 @@
-"""The internal FetchDataset contract, message by message: proto <-> domain, both directions.
+"""The internal ingest request and ack, message by message: proto <-> domain, both directions.
 
 ONE FUNCTION PER MESSAGE, AND NO CATCH-ALL. ADR tj-8konfu D1 keeps proto/trader_joe/proto/... and
 schemas/data_ingest/fetch_dataset.py as two source-of-truth artefacts with this mapping written by hand
@@ -6,21 +6,17 @@ between them. A loop over DESCRIPTOR fields would make that mapping total by con
 review surface: the point of writing it out is that adding a field to the .proto and forgetting it here is
 VISIBLE -- and tj-3mk3u5.29's descriptor-driven control turns that from visible into red.
 
-WHAT IS MAPPED AND WHAT IS NOT. Every message of the contract has a pair of functions here, except
-FetchDatasetResponse: the stream's envelope is pure transport, it has no domain twin by design (the domain
-module says so), and the oneof arm is dispatched by the client seam and by the server-side encoder. The
-module-level ENVELOPE_MESSAGES in this package's __init__ records that exclusion so a control can assert
-the table is otherwise total.
+WHAT IS HERE: the fetch request (Quote's argument and the shape Submit's bars kind restates), the Submit
+ack (FetchAck, FetchAccepted, FetchRefused) and the Bar. The PR 4 FetchDataset stream is gone (P37), and
+with it the page, done and served-range messages of ingest.proto; the store's result path maps its own in
+delivery.py.
 
 FIELD NAMES ARE IDENTICAL ON BOTH SIDES, deliberately, so there is no name table to keep. The domain
 module's own docstring commits to that: a field renamed to read better in Python would cost an entry in a
 translation table that does not exist today.
 
-THE STREAM-LEVEL RULES ARE NOT HERE. A Bar maps its own feed faithfully in both directions, because
-market/v1 is shared vocabulary and a bar reaching the UI or an external stream has no fetch envelope to read
-a feed from. That every bar of ONE FETCH carries the ack's resolved feed is a rule about the stream, not
-about the message, and it lives one layer up: on the encode side in fetch_stream.py, on the decode side in
-common/rpc/clients/ingest_fetch.py.
+A Bar maps its own feed faithfully in both directions, because market/v1 is shared vocabulary and a bar
+reaching the UI or an external stream has no envelope to read a feed from.
 """
 
 from pydantic import BaseModel, ValidationError
@@ -177,36 +173,6 @@ def bar_to_domain(message: bar_pb2.Bar) -> domain.Bar:
     )
 
 
-def page_to_proto(page: domain.BarPage) -> ingest_pb2.BarPage:
-    """Encode one page of bars.
-
-    Args:
-        page: The domain page.
-
-    Returns:
-        ingest_pb2.BarPage: The page on the wire.
-
-    Raises:
-        ProtoMappingError: If a bar cannot be put on the wire.
-    """
-    return ingest_pb2.BarPage(bars=[bar_to_proto(bar) for bar in page.bars])
-
-
-def page_to_domain(message: ingest_pb2.BarPage) -> domain.BarPage:
-    """Decode one page of bars.
-
-    Args:
-        message: The page as it arrived.
-
-    Returns:
-        domain.BarPage: The domain page.
-
-    Raises:
-        ProtoMappingError: If a bar cannot be mapped.
-    """
-    return _built(domain.BarPage, bars=[bar_to_domain(bar) for bar in message.bars])
-
-
 def accepted_to_proto(accepted: domain.FetchAccepted) -> ingest_pb2.FetchAccepted:
     """Encode the accepted arm of the ack: the resolved feed.
 
@@ -315,79 +281,3 @@ def ack_to_domain(message: ingest_pb2.FetchAck) -> domain.FetchAck:
     if arm == 'refused':
         return _built(domain.FetchAck, refused=refused_to_domain(message.refused))
     raise ProtoMappingError('a FetchAck arrived with neither accepted nor refused set; its oneof holds one arm')
-
-
-def served_range_to_proto(served_range: domain.ServedRange) -> ingest_pb2.ServedRange:
-    """Encode the served window.
-
-    Args:
-        served_range: The domain window.
-
-    Returns:
-        ingest_pb2.ServedRange: The window on the wire.
-
-    Raises:
-        ProtoMappingError: If either bound cannot be put on the wire.
-    """
-    message = ingest_pb2.ServedRange()
-    message.start.CopyFrom(to_timestamp(served_range.start))
-    message.end.CopyFrom(to_timestamp(served_range.end))
-    return message
-
-
-def served_range_to_domain(message: ingest_pb2.ServedRange) -> domain.ServedRange:
-    """Decode the served window.
-
-    Args:
-        message: The window as it arrived.
-
-    Returns:
-        domain.ServedRange: The domain window, both bounds aware UTC.
-
-    Raises:
-        ProtoMappingError: If either bound is unset -- the served window is never open -- or unmappable.
-    """
-    return _built(domain.ServedRange, start=timestamp_field(message, 'start'), end=timestamp_field(message, 'end'))
-
-
-def done_to_proto(done: domain.FetchDone) -> ingest_pb2.FetchDone:
-    """Encode the terminator of an accepted stream, with its served provenance.
-
-    Args:
-        done: The domain terminator.
-
-    Returns:
-        ingest_pb2.FetchDone: The terminator on the wire.
-
-    Raises:
-        ProtoMappingError: If a value cannot be put on the wire.
-    """
-    message = ingest_pb2.FetchDone(bar_count=done.bar_count, served_range=served_range_to_proto(done.served_range))
-    message.as_of.CopyFrom(to_timestamp(done.as_of))
-    return message
-
-
-def done_to_domain(message: ingest_pb2.FetchDone) -> domain.FetchDone:
-    """Decode the terminator of an accepted stream.
-
-    Args:
-        message: The terminator as it arrived.
-
-    Returns:
-        domain.FetchDone: The domain terminator.
-
-    Raises:
-        ProtoMappingError: If served_range or as_of is unset, or a value cannot be mapped. A served window
-            is what ADR tj-fa1rpu D2's provenance IS, so a done without one is not a done.
-    """
-    if not message.HasField('served_range'):
-        raise ProtoMappingError(
-            'a FetchDone arrived with no served_range; the window actually served is the provenance the '
-            'message exists to carry (ADR tj-fa1rpu D2)'
-        )
-    return _built(
-        domain.FetchDone,
-        bar_count=message.bar_count,
-        served_range=served_range_to_domain(message.served_range),
-        as_of=timestamp_field(message, 'as_of'),
-    )

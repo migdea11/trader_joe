@@ -1,4 +1,4 @@
-// Status, freshness and trading-group label and colour maps: the one module every badge reads
+// Status, health and trading-group label and colour maps: the one module every badge reads
 // (tj-mujie8, tj-grna9p.60). Words and colours are from the design canvas Data boards and the
 // architect's mapping on tj-grna9p.60.
 //
@@ -13,59 +13,59 @@ export interface BadgeSpec {
   color: string
 }
 
-// --- Status (FreshnessStatus) -------------------------------------------------------
+// --- Status (DatasetHealthStatus) -------------------------------------------------------
 
-export const FRESHNESS_STATUS_VALUES = [
-  'FRESHNESS_STATUS_UNSPECIFIED',
-  'FRESHNESS_STATUS_FRESH',
-  'FRESHNESS_STATUS_LATE',
-  'FRESHNESS_STATUS_OVERDUE',
-  'FRESHNESS_STATUS_COMPLETE',
-  'FRESHNESS_STATUS_GAPS',
-  'FRESHNESS_STATUS_RETIRED',
+export const DATASET_HEALTH_STATUS_VALUES = [
+  'DATASET_HEALTH_STATUS_UNSPECIFIED',
+  'DATASET_HEALTH_STATUS_FRESH',
+  'DATASET_HEALTH_STATUS_LATE',
+  'DATASET_HEALTH_STATUS_OVERDUE',
+  'DATASET_HEALTH_STATUS_COMPLETE',
+  'DATASET_HEALTH_STATUS_GAPS',
+  'DATASET_HEALTH_STATUS_RETIRED',
 ] as const
 
-export type FreshnessStatusName = (typeof FRESHNESS_STATUS_VALUES)[number]
+export type DatasetHealthStatusName = (typeof DATASET_HEALTH_STATUS_VALUES)[number]
 
 const HEALTHY: BadgeSpec = { label: 'Healthy', color: colors.status.ok }
 const LATE: BadgeSpec = { label: 'Late', color: colors.status.warn }
 const FAILED: BadgeSpec = { label: 'Failed', color: colors.status.fail }
 const RETIRED: BadgeSpec = { label: 'Stopped', color: colors.status.retired }
 // A dataset can have no health at all (e.g. a source without a calendar): the server leaves
-// freshness, or its status, unset. That is shown as its own state, never as Healthy. The spec
+// health, or its status, unset. That is shown as its own state, never as Healthy. The spec
 // gives no word or colour for it; "Unknown" in the neutral text3 token is the provisional choice
 // (open question on tj-grna9p.60).
 const UNKNOWN: BadgeSpec = { label: 'Unknown', color: colors.text3 }
 
-// Freshness to UI label (architect choice, tj-grna9p.60): FRESH and COMPLETE are Healthy, LATE is
+// Health to UI label (architect choice, tj-grna9p.60): FRESH and COMPLETE are Healthy, LATE is
 // Late, OVERDUE and GAPS are Failed, RETIRED is Stopped (collect off), unset is Unknown.
-export const FRESHNESS_BADGES: Readonly<Record<FreshnessStatusName, BadgeSpec>> = {
-  FRESHNESS_STATUS_UNSPECIFIED: UNKNOWN,
-  FRESHNESS_STATUS_FRESH: HEALTHY,
-  FRESHNESS_STATUS_LATE: LATE,
-  FRESHNESS_STATUS_OVERDUE: FAILED,
-  FRESHNESS_STATUS_COMPLETE: HEALTHY,
-  FRESHNESS_STATUS_GAPS: FAILED,
-  FRESHNESS_STATUS_RETIRED: RETIRED,
+export const HEALTH_BADGES: Readonly<Record<DatasetHealthStatusName, BadgeSpec>> = {
+  DATASET_HEALTH_STATUS_UNSPECIFIED: UNKNOWN,
+  DATASET_HEALTH_STATUS_FRESH: HEALTHY,
+  DATASET_HEALTH_STATUS_LATE: LATE,
+  DATASET_HEALTH_STATUS_OVERDUE: FAILED,
+  DATASET_HEALTH_STATUS_COMPLETE: HEALTHY,
+  DATASET_HEALTH_STATUS_GAPS: FAILED,
+  DATASET_HEALTH_STATUS_RETIRED: RETIRED,
 }
 
-function isFreshnessStatusName(value: string): value is FreshnessStatusName {
-  return Object.hasOwn(FRESHNESS_BADGES, value)
+function isHealthStatusName(value: string): value is DatasetHealthStatusName {
+  return Object.hasOwn(HEALTH_BADGES, value)
 }
 
-// The badge for a dataset's freshness status. An unset status (null, undefined, empty, or
+// The badge for a dataset's health status. An unset status (null, undefined, empty, or
 // UNSPECIFIED) is Unknown. A value this build does not know renders as Unknown too, rather than
 // guessing a health.
-export function freshnessBadge(status: string | null | undefined): BadgeSpec {
-  if (status == null || !isFreshnessStatusName(status)) return UNKNOWN
-  return FRESHNESS_BADGES[status]
+export function healthBadge(status: string | null | undefined): BadgeSpec {
+  if (status == null || !isHealthStatusName(status)) return UNKNOWN
+  return HEALTH_BADGES[status]
 }
 
 // Needs Attention = LATE, OVERDUE or GAPS (data.proto DatasetFacets.needs_attention).
-const NEEDS_ATTENTION: ReadonlySet<string> = new Set<FreshnessStatusName>([
-  'FRESHNESS_STATUS_LATE',
-  'FRESHNESS_STATUS_OVERDUE',
-  'FRESHNESS_STATUS_GAPS',
+const NEEDS_ATTENTION: ReadonlySet<string> = new Set<DatasetHealthStatusName>([
+  'DATASET_HEALTH_STATUS_LATE',
+  'DATASET_HEALTH_STATUS_OVERDUE',
+  'DATASET_HEALTH_STATUS_GAPS',
 ])
 
 export function needsAttention(status: string | null | undefined): boolean {
@@ -79,7 +79,7 @@ export function collectionBadge(
   status: string | null | undefined,
   options: { running?: boolean } = {},
 ): BadgeSpec {
-  return options.running ? RUNNING_BADGE : freshnessBadge(status)
+  return options.running ? RUNNING_BADGE : healthBadge(status)
 }
 
 // --- Usage staleness ---------------------------------------------------------------------------

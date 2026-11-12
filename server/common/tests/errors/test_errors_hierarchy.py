@@ -25,8 +25,9 @@ pytestmark = pytest.mark.common
 BRANCHES = (ExogenousError, InvalidRequestError)
 BRANCH_IDS = [branch.__name__ for branch in BRANCHES]
 
-# The two reasons the bead says ALWAYS carry reset_at; every other reason builds without one.
-RESET_AT_REQUIRED = frozenset({'RATE_BUDGET', 'VENDOR_RATE_LIMITED'})
+# The reasons whose rows ALWAYS carry reset_at (the two rate limits, and RANGE_TOO_RECENT, tj-7zjov1.315); every
+# other reason builds without one. test_errors_fields.py pins this set against the table's requires_reset_at column.
+RESET_AT_REQUIRED = frozenset({'RATE_BUDGET', 'VENDOR_RATE_LIMITED', 'RANGE_TOO_RECENT'})
 RESET_AT = datetime(2001, 2, 3, 4, 5, 6, tzinfo=UTC)
 
 

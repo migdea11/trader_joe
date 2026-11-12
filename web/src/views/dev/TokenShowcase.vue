@@ -7,11 +7,11 @@ import { Database, Settings } from '@lucide/vue'
 import StatusBadge from '@/components/StatusBadge.vue'
 import {
   ACCOUNT_GROUP_VALUES,
-  FRESHNESS_STATUS_VALUES,
+  DATASET_HEALTH_STATUS_VALUES,
   GROUP_SPECS,
   STALE_BADGE,
   RUNNING_BADGE,
-  freshnessBadge,
+  healthBadge,
   type AccountGroupName,
 } from '@/theme/semantics'
 import { colors, fonts } from '@/theme/tokens'
@@ -149,15 +149,15 @@ const liveSelected: AccountGroupName = 'ACCOUNT_GROUP_LIVE'
       <h2>Health Badges</h2>
       <div class="row">
         <span
-          v-for="status in FRESHNESS_STATUS_VALUES"
+          v-for="status in DATASET_HEALTH_STATUS_VALUES"
           :key="status"
           class="badge-cell"
         >
-          <StatusBadge :badge="freshnessBadge(status)" />
-          <code>{{ status.replace('FRESHNESS_STATUS_', '') }}</code>
+          <StatusBadge :badge="healthBadge(status)" />
+          <code>{{ status.replace('DATASET_HEALTH_STATUS_', '') }}</code>
         </span>
         <span class="badge-cell">
-          <StatusBadge :badge="freshnessBadge(undefined)" />
+          <StatusBadge :badge="healthBadge(undefined)" />
           <code>(unset)</code>
         </span>
         <span class="badge-cell">

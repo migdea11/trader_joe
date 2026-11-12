@@ -23,7 +23,7 @@ one per chunk. The engine's commit event is counted as well.
 THE FAILURE ON CHUNK k. The whole-batch guard refuses two bars at one timestamp, and dataset_id,
 symbol, source, feed and granularity are one value per batch, so neither a natural-key collision
 nor a foreign-key violation can be placed on a LATER chunk only. The failing row is therefore the
-batch's last bar, carrying a volume one past the int4 range of stock_market_activity.volume.
+batch's last bar, carrying a volume one past the int8 range of stock_market_activity.volume (BIGINT).
 asyncpg refuses it while binding that chunk's statement, after the earlier chunks' INSERTs have
 already executed on the server inside the open transaction; the test observes both counts
 through the engine's cursor events rather than assuming them. If those rows survive, the batch
@@ -87,8 +87,10 @@ ABOVE_CEILING_CHUNK = CEILING_ROWS * 3
 # 32_767 here, which could only agree with itself. The literal in production is pinned against the
 # installed driver's own source and version in data/store/tests/test_bar_batch_chunking.py.
 
-# One past the int4 range of stock_market_activity.volume (Integer). The poison for chunk k.
-INT4_OVERFLOW = 2**31
+# One past the int8 range of stock_market_activity.volume (BigInteger since bug tj-1ov1p2, in the alpha baseline, ADR
+# tj-kg521d). The poison for chunk k. It was 2**31, one past int4, until the column widened: a volume above int32 is
+# now a valid bar (PG13 of test_delivery_intake_pg.py), so the poison moved to the next range asyncpg refuses.
+INT8_OVERFLOW = 2**63
 
 BAR_DATA = StockDataMarketActivityData(open=10.0, high=12.5, low=9.25, close=11.0, volume=1_000, trade_count=42)
 
@@ -324,7 +326,7 @@ async def test_a_failure_on_a_later_chunk_leaves_nothing_in_the_database(
 ) -> None:
     """Chunks 1..k-1 execute on the server, chunk k fails: not one row survives, and nothing commits.
 
-    Four chunks of SMALL_CHUNK // 5 rows, the last bar's volume outside int4. The earlier chunks'
+    Four chunks of SMALL_CHUNK // 5 rows, the last bar's volume outside int8. The earlier chunks'
     completion is observed, not assumed, so a pass cannot come from a batch that failed before
     writing anything.
     """
@@ -332,7 +334,7 @@ async def test_a_failure_on_a_later_chunk_leaves_nothing_in_the_database(
     bar_count = chunk * 3 + chunk // 2
     layout = _chunk_layout(bar_count, chunk)
     entry = insert_entry(asset_symbol=own_symbol)
-    batch = _batch_for(entry, bar_count, last_volume=INT4_OVERFLOW)
+    batch = _batch_for(entry, bar_count, last_volume=INT8_OVERFLOW)
 
     async with _session(pg_async_engine) as session:
         with pytest.raises(sa.exc.DBAPIError) as raised:

@@ -3,9 +3,9 @@
 The UI: a static single-page app. Vue 3, TypeScript and Vite, with PrimeVue 5 for components, Pinia,
 Vue Router, AG Grid Community for tables, Lightweight Charts and Apache ECharts for charts, and Lucide
 for icons. It shows the Data section: the dataset catalog (**Datasets**), a per-dataset **Dataset
-detail** (overview, coverage and gaps, run history) and a **Viewer** with a candle chart, paged in
-1,000-bar pages, a paged bar table and a CSV export. Requests, Health and Usage are placeholders:
-their tabs render disabled ("Not built yet") until their routes exist.
+detail** (overview, coverage and gaps, run history, retention and usage), a **Viewer** with a candle chart, paged in
+1,000-bar pages, a paged bar table and a CSV export, a **Panels** tab (a panel has one Bar Interval, 1 Minute, 1 Hour or 1 Day, chosen on the New Panel form, which starts on 1 Day, and shown in the panel picker and the panel's header; it cannot be changed later, so another interval is another panel, and the settings form has no interval control) and a **Usage** tab. Requests and Health are
+placeholders: their tabs render disabled ("Not built yet") until their routes exist.
 
 ## Why the UI lives in this public repo
 
@@ -27,8 +27,10 @@ Strategy-specific metrics are add-ons, and only the add-ons are private.
 - **The browser calls `/api/store/...`.** data_store serves the same route without the prefix, so
   `/api/store/ui/v1/datasets` reaches `/ui/v1/datasets`. In production Caddy strips the prefix,
   forwards only GET and HEAD under `/api/store/ui/v1/` plus exactly `PATCH .../datasets/{uuid}/expiry`,
-  `PATCH .../datasets/{uuid}/collecting` and `DELETE .../datasets/{uuid}`, and adds the instance secret to the proxied request; the browser
-  never holds it. The dev server (`vite.config.ts`) mirrors those four rules and adds the secret from
+  `PATCH .../datasets/{uuid}/collecting`, `DELETE .../datasets/{uuid}` and `POST` on `.../panels`,
+  `.../panels/{uuid}/settings-versions` and `.../panel-sources/DATA_SOURCE_*/settings-versions`, and adds the
+  instance secret to the proxied request; the browser never holds it. The dev server (`vite.config.ts`)
+  mirrors those seven rules and adds the secret from
   its own process environment (`INSTANCE_WRITE_SECRET`, never a `VITE_` name), so a write works in dev
   and a request the production proxy would refuse is refused here too.
 
@@ -123,15 +125,19 @@ reconnects the same way.
 | Screen | Route | Holds |
 |---|---|---|
 | Datasets | `/data/datasets` | the catalog grid. The **Status** column reads Running while the dataset's latest run is in flight and otherwise Healthy, Late, Failed or Stopped; the **Coverage** column is a strip fetched lazily for the rows in view, with the details icon after its numbers. The sidebar's Status group has Running as its own toggle (`?running=true`), combinable with one status choice. The whole row opens the Viewer; the symbol is a real link (keyboard, new tab) styled as plain text, and the details icon opens the detail |
-| Dataset detail | `/data/datasets/:id` | **Overview** (owner, range, bars, last bar), **Coverage** (a strip of at most 20 blocks, fewer for a short dataset, and the exact gap list), **History** (the dataset's runs, newest first, Load More by cursor) and **Retention**, which is read-only: the expiry type and time, with no control. The sidebar holds these sections, All Datasets and a disabled Usage; it has no Rows item, since the breadcrumb's symbol crumb is the link to the Viewer (the Overview has none) |
+| Dataset detail | `/data/datasets/:id` | **Overview** (owner, range, bars, last bar), **Coverage** (a strip of at most 20 blocks, fewer for a short dataset, and the exact gap list), **History** (the dataset's runs, newest first, Load More by cursor) and **Retention** (the expiry type, locked; the deletion date with Set Expiry; Start or Stop Collecting for a subscription; and Delete Now behind a typed confirmation, each write through the edge rules above) and **Usage**. The sidebar holds these sections and All Datasets; it has no Rows item, since the breadcrumb's symbol crumb is the link to the Viewer (the Overview has none) |
 | Viewer | `/data/datasets/:id/viewer` | candles, volume, a paged bar table and Export CSV; see [The Viewer](#the-viewer) |
 
 - **Gap and strip dates are UTC days.** The client is not told the calendar's time zone, so a
   boundary, which is the calendar's local midnight, is read as a UTC date, whatever the display zone
   setting says. That is right for calendars west of UTC, and the only calendar mapped is NYSE.
-- **Running appears only once ingest has acknowledged the fetch**, so a first-time request is not
-  shown as Running while the vendor is still answering.
-- **Not built:** Requests, Health and Usage (disabled tabs; their routes show a not-built page); any retention control; Request the Gap
+- **The Running toggle and facet work; the Status cell's Running badge does not.** The toggle (`?running=true`) reads
+  the store's open requests (`PENDING`, `QUEUED`, `NOT_DELIVERED`) that name a dataset, plus any legacy `RUNNING` run
+  row (`running_dataset_ids` in `server/data/store/app/database/crud/ingest_run.py`). The Status cell's badge reads only the
+  latest run's state (`isRunning` in `src/catalog/rows.ts`), and the push path writes no `RUNNING` row, so the cell
+  shows Running only for a row an earlier release left. So a row inside the Running filter can show another status, such
+  as Healthy or Late. This is a known regression.
+- **Not built:** Requests and Health (disabled tabs; their routes show a not-built page); Request the Gap
   and All Runs; a Quota Key column, since the server does not record one.
 
 ## The Viewer
@@ -195,8 +201,7 @@ click outside closes it except while an export runs).
 - Averages start late on the earliest page, because nothing precedes it.
 - A reconnect returns the Viewer's chart to the newest page.
 - A CSV export of a long window is long, and the popover cannot say how large before it runs.
-- Longer ranges drawn coarser (aggregation, a line view) are deferred, not built: decision
-  `tj-4rj52w`.
+- Longer ranges drawn coarser (aggregation, a line view) are not built.
 
 ## Layout
 

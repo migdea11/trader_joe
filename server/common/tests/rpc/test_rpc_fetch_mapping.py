@@ -24,9 +24,9 @@ one per-file-ignore, and ``common/tests/test_ci_invariants.py`` pins that by run
 spelling of the import -- absolute, relative and namespace-relative -- and asserting TID251 fires, plus a
 guard that it fires because of the BAN and not because ruff flags every import.
 
-WHAT IS NOT HERE. The feed-equality invariant is a CROSS-MESSAGE STREAM rule that no per-message round
-trip can express, and the stream's grammar is the client seam's: both live beside this file, in
-``test_rpc_fetch_feed_equality.py`` and ``test_rpc_fetch_seam.py``.
+WHAT IS NOT HERE. The feed-equality invariant is a CROSS-MESSAGE rule that no per-message round trip can
+express. With the PR 4 FetchDataset stream gone (P37, tj-7zjov1.280) it lives on the result path: the store
+refuses a delivered bar whose tape is not the header's (server/data/store/tests/test_delivery_intake.py).
 """
 
 import itertools
@@ -40,6 +40,7 @@ from google.protobuf.message import Message
 from pydantic import BaseModel
 
 from common.enums.data_stock import Feed
+from common.errors.vocabulary import Reason
 from common.rpc.mapping import (
     CONTRACT_FILES,
     CONTRACT_MESSAGES,
@@ -57,13 +58,15 @@ from common.rpc.mapping import (
 )
 from common.tests.domain_fields import aware_datetime_fields
 from common.tests.proto_descriptors import PROTO_ROOT
+from schemas.data_ingest import delivery as delivery_domain
 from schemas.data_ingest import fetch_dataset as domain
 from schemas.data_ingest import quote as quote_domain
+from schemas.data_ingest import submit as submit_domain
 
 
 pytestmark = pytest.mark.common
 
-CONTRACT = 'trader_joe/proto/internal/ingest/v1/ingest.proto'
+STORE_CONTRACT = 'trader_joe/proto/internal/store/v1/store.proto'
 
 # The instant every generated Timestamp is offset from. Aware UTC, and far from the epoch so a mapper
 # that silently produced a default would not land on it.
@@ -78,38 +81,62 @@ GOOGLE = 'google.protobuf'
 INGEST = 'trader_joe.proto.internal.ingest.v1'
 
 # THE ONLY FIELDS A ROUND TRIP MAY LOSE, each a ruled deferral and not an oversight. tj-grna9p.44's
-# re-baseline (architect, 2026-10-11, item 8 FOLLOW-UP) put quota_key on the ack and vendor_stats on the
-# done into the .proto now and left mapping them into the domain models and the encoder to a follow-up
-# needed before tj-grna9p.48, .24 and .49. Until it lands, they are dropped on the way in. Every other
-# field still has to survive, and test_each_deferred_field_is_declared_and_still_dropped goes red the
-# moment one of these IS mapped, so this table cannot outlive the deferral it names.
+# re-baseline (architect, 2026-10-11, item 8 FOLLOW-UP) put quota_key on the ack into the .proto and left
+# mapping it into the domain model to a follow-up. Until it lands it is dropped on the way in by the
+# FetchAck mapper. Every other field still has to survive, and test_each_deferred_field_is_declared_and_still_dropped
+# goes red the moment it IS mapped, so this table cannot outlive the deferral it names. (FetchDone.vendor_stats
+# was the second entry; it left with the FetchDataset stream, P37.)
 DEFERRED_FIELDS: Mapping[tuple[str, str], str] = {
-    (f'{INGEST}.FetchAccepted', 'quota_key'): 'tj-grna9p.44 FOLLOW-UP: the ack quota_key is not mapped yet',
-    (f'{INGEST}.FetchDone', 'vendor_stats'): 'tj-grna9p.44 FOLLOW-UP: the done vendor_stats are not mapped yet',
+    (f'{INGEST}.FetchAccepted', 'quota_key'): 'tj-grna9p.44 FOLLOW-UP: the ack quota_key is not mapped yet'
 }
 
 
-def _deferred_on(descriptor: Descriptor) -> set[str]:
-    return {field for (message, field) in DEFERRED_FIELDS if message == descriptor.full_name}
+# A DEFERRAL IS A FACT ABOUT ONE MAPPER, NOT ABOUT A MESSAGE TYPE. FetchAccepted.quota_key is still dropped
+# by the FetchAck mapper, but SubmitResponse reaches the same FetchAccepted through its own mapper, which
+# maps quota_key into SubmitAccepted (tj-7zjov1.15). Under these roots the deferral does not apply, so the
+# round trip must keep the field -- and test_a_lifted_deferral_is_one_its_root_actually_maps holds the entry
+# to that.
+DEFERRAL_LIFTED_UNDER: Mapping[str, frozenset[tuple[str, str]]] = {
+    f'{INGEST}.SubmitResponse': frozenset({(f'{INGEST}.FetchAccepted', 'quota_key')})
+}
+
+
+# STRING FIELDS WHOSE VALUE IS A CLOSED VOCABULARY ON THE DOMAIN SIDE. The builder's generic 'name-N' string is
+# not a member, and DeliveryTrailer.reason maps an unknown value to None by design (version skew never refuses a
+# delivery, tj-7zjov1.345), so the generic value would be dropped and the round trip would prove nothing about
+# the field. These fields get a real member instead, rotated by the counter so the value is still distinct.
+# test_each_vocabulary_string_is_a_declared_string_field keeps this table from naming a field that is gone.
+VOCABULARY_STRINGS: Mapping[tuple[str, str], tuple[str, ...]] = {
+    ('trader_joe.proto.internal.store.v1.DeliveryTrailer', 'reason'): tuple(str(reason) for reason in Reason)
+}
+
+
+def _deferred_on(descriptor: Descriptor, lifted: frozenset[tuple[str, str]] = frozenset()) -> set[str]:
+    return {
+        field
+        for (message, field) in DEFERRED_FIELDS
+        if message == descriptor.full_name and (message, field) not in lifted
+    }
 
 
 def _without_deferred(message: Message) -> Message:
     # A copy with every deferred field cleared, at whatever depth its message type appears: FetchAck
-    # carries FetchAccepted under its `accepted` arm, so the ack's quota_key is reached through it.
+    # carries FetchAccepted under its `accepted` arm, so the ack's quota_key is reached through it --
+    # unless the ROOT's mapper is one that maps the field (DEFERRAL_LIFTED_UNDER).
     stripped = type(message)()
     stripped.CopyFrom(message)
-    _clear_deferred(stripped)
+    _clear_deferred(stripped, DEFERRAL_LIFTED_UNDER.get(message.DESCRIPTOR.full_name, frozenset()))
     return stripped
 
 
-def _clear_deferred(message: Message) -> None:
-    for field in _deferred_on(message.DESCRIPTOR):
+def _clear_deferred(message: Message, lifted: frozenset[tuple[str, str]]) -> None:
+    for field in _deferred_on(message.DESCRIPTOR, lifted):
         message.ClearField(field)
     for field, value in message.ListFields():
         if field.message_type is None or _is_map(field) or _is_well_known(field.message_type):
             continue
         for sub in value if field.is_repeated else [value]:
-            _clear_deferred(sub)
+            _clear_deferred(sub, lifted)
 
 
 # ---------------------------------------------------------------------------------------------
@@ -142,6 +169,9 @@ def _is_well_known(descriptor: Descriptor) -> bool:
 
 def _scalar(field: FieldDescriptor, values: _Values) -> object:
     issued = values.next()
+    vocabulary = VOCABULARY_STRINGS.get((field.containing_type.full_name, field.name))
+    if vocabulary is not None:
+        return vocabulary[issued % len(vocabulary)]
     if field.type == FieldDescriptor.TYPE_STRING:
         return f'{field.name}-{issued}'
     if field.type == FieldDescriptor.TYPE_BYTES:
@@ -341,6 +371,47 @@ def test_each_deferred_field_is_declared_and_still_dropped(message_name: str, fi
     )
 
 
+def _values_of(message: Message, message_name: str, field: str) -> list[object]:
+    # Every value FIELD holds on a MESSAGE_NAME message anywhere inside MESSAGE, at any depth.
+    found = []
+    # ListFields and not HasField: quota_key is a plain proto3 scalar, which has no presence to ask about.
+    if message.DESCRIPTOR.full_name == message_name and field in {f.name for f, _ in message.ListFields()}:
+        found.append(getattr(message, field))
+    for set_field, value in message.ListFields():
+        if set_field.message_type is None or _is_map(set_field) or _is_well_known(set_field.message_type):
+            continue
+        for sub in value if set_field.is_repeated else [value]:
+            found.extend(_values_of(sub, message_name, field))
+    return found
+
+
+@pytest.mark.parametrize(
+    ('root', 'deferred'),
+    [(root, entry) for root, entries in sorted(DEFERRAL_LIFTED_UNDER.items()) for entry in sorted(entries)],
+    ids=lambda part: part.rsplit('.', 1)[-1] if isinstance(part, str) else part[1],
+)
+def test_a_lifted_deferral_is_one_its_root_actually_maps(root: str, deferred: tuple[str, str]):
+    """The lift's own tripwire: an entry is valid only while the deferral exists AND the root keeps the field.
+
+    Without this, a lift could silently outlive a regression in which SubmitResponse stopped mapping
+    quota_key -- the round trip would still compare, but only because the builder never reached the field.
+
+    Args:
+        root: The mapper under which the deferral does not apply.
+        deferred: The (message, field) pair that stays deferred elsewhere.
+    """
+    assert deferred in DEFERRED_FIELDS, f'{deferred} is lifted under {root} but is not deferred anywhere'
+    mapper = MESSAGE_MAPPERS[root]
+    for choices in _cases(mapper.proto_type.DESCRIPTOR):
+        message = _built(mapper, choices)
+        sent = _values_of(message, *deferred)
+        if not sent:
+            continue
+        assert _values_of(mapper.to_proto(mapper.to_domain(message)), *deferred) == sent
+        return
+    pytest.fail(f'no case of {root} sets {deferred}, so the lift names a field the root does not carry')
+
+
 @pytest.mark.parametrize(('name', 'mapper', 'choices'), CASES, ids=CASE_IDS)
 def test_the_domain_side_receives_a_value_for_every_field_the_case_sets(name: str, mapper: MessageMapper, choices):
     """THE REVERSE SET CHECK, on the domain side: every twin field actually got the wire's value.
@@ -453,6 +524,8 @@ def test_the_unspecified_zero_is_refused_rather_than_decoded(mapping: EnumMappin
         ('trader_joe.proto.internal.ingest.v1.FetchDatasetRequest', 'asset_type'),
         ('trader_joe.proto.internal.ingest.v1.FetchDatasetRequest', 'granularity'),
         ('trader_joe.proto.internal.ingest.v1.FetchDatasetRequest', 'update_type'),
+        # tj-7zjov1.105: an old sender knows no status and sends the zero; it is refused, never guessed at.
+        ('trader_joe.proto.internal.ingest.v1.AssetListRequest', 'status'),
     ],
 )
 def test_a_required_enum_left_unset_makes_the_whole_message_unmappable(message_name: str, field: str):
@@ -500,6 +573,27 @@ def _twins_at(when: datetime) -> dict[type[BaseModel], BaseModel]:
     # One instance of every twin that HAS an aware field, with all of them at `when`. The tripwire below
     # asserts this covers exactly those twins and exactly those fields.
     served = domain.ServedRange(start=when, end=when + timedelta(hours=1))
+    bars = submit_domain.BarsRequest(
+        source='ALPACA',
+        asset_symbol='VFV',
+        asset_type='stock',
+        data_types=['market-activity'],
+        granularity='1day',
+        start=when,
+        end=when + timedelta(hours=1),
+        update_type=2,
+        feed=Feed.IEX,
+    )
+    reported = delivery_domain.VendorReported(limit=200, remaining=150, reset_at=when + timedelta(minutes=1))
+    stats = delivery_domain.VendorCallStats(
+        calls=3,
+        pages=2,
+        throttled_429=1,
+        retries=1,
+        first_call_at=when,
+        last_call_at=when + timedelta(seconds=5),
+        vendor_reported=reported,
+    )
     return {
         domain.FetchDatasetRequest: domain.FetchDatasetRequest(
             owner='rebalancer',
@@ -515,10 +609,38 @@ def _twins_at(when: datetime) -> dict[type[BaseModel], BaseModel]:
             ready_by=when + timedelta(hours=2),
         ),
         domain.Bar: domain.Bar(bar_start=when, open=1.0, high=2.0, low=0.5, close=1.5, volume=10.0, feed=Feed.IEX),
+        # Mapped by the result path's restated store.proto ServedRange since ingest.proto's left with FetchDataset.
         domain.ServedRange: served,
-        domain.FetchDone: domain.FetchDone(bar_count=3, served_range=served, as_of=when),
         quote_domain.ScopeCapacity: quote_domain.ScopeCapacity(
             quota_key='alpaca-a', cap=200, remaining=150, window_seconds=60, reset_at=when
+        ),
+        # The Submit and Instance contract (tj-7zjov1.15).
+        submit_domain.BarsRequest: bars,
+        submit_domain.SubmitRequest: submit_domain.SubmitRequest(
+            request_id='req-1', owner='rebalancer', ready_by=when + timedelta(hours=2), bars=bars
+        ),
+        submit_domain.CorporateActionsRequest: submit_domain.CorporateActionsRequest(
+            source='ALPACA', asset_symbol='VFV', start=when, end=when + timedelta(days=1)
+        ),
+        submit_domain.InstanceResponse: submit_domain.InstanceResponse(instance_id='ingest-1', started_at=when),
+        # The store's result path (tj-7zjov1.16).
+        delivery_domain.VendorReported: reported,
+        delivery_domain.VendorCallStats: stats,
+        delivery_domain.DeliveryTrailer: delivery_domain.DeliveryTrailer(
+            outcome=delivery_domain.DeliveryOutcome.SUCCEEDED, vendor_stats=stats, served_range=served, as_of=when
+        ),
+        delivery_domain.CorporateActionRecord: delivery_domain.CorporateActionRecord(
+            vendor_action_id='ca-1',
+            action_type='cash_dividend',
+            ex_date=when,
+            record_date=when + timedelta(days=1),
+            payable_date=when + timedelta(days=2),
+            process_date=when + timedelta(days=3),
+            effective_date=when + timedelta(days=4),
+            raw_payload=b'{}',
+        ),
+        delivery_domain.RegisterInstanceRequest: delivery_domain.RegisterInstanceRequest(
+            instance_id='ingest-1', started_at=when
         ),
     }
 
@@ -539,6 +661,23 @@ def test_the_offsets_sweep_drives_every_aware_field_of_every_twin():
     }
 
     assert driven == declared
+
+
+def test_the_offsets_sweep_sets_every_aware_field_it_drives():
+    """The type-level tripwire above passes for a twin whose new date is merely left at its None default.
+
+    A None field crosses the wire as unset and back as None, so it proves nothing about an offset. Every
+    aware field of every twin in the sweep must therefore carry an instant (tj-7zjov1.106: the two
+    corporate-action dates of tj-7zjov1.105 arrived unset in this fixture, and only an AttributeError said so).
+    """
+    unset = [
+        f'{type(model).__name__}.{field}'
+        for model in _twins_at(EPOCH_BASE).values()
+        for field in aware_datetime_fields(type(model))
+        if getattr(model, field) is None
+    ]
+
+    assert not unset, unset
 
 
 @pytest.mark.parametrize('offset', OFFSETS, ids=OFFSET_IDS)
@@ -659,10 +798,11 @@ def test_a_sub_microsecond_timestamp_is_refused_rather_than_rounded():
 def test_an_unset_required_timestamp_is_refused_rather_than_read_as_the_epoch():
     """1970-01-01 is a real instant, and an unset field is not it.
 
-    Every Timestamp on this contract but ``FetchDatasetRequest.end`` is required, so the absence is a
-    message this release cannot read rather than a default worth decoding.
+    A served window is never open, so an unset bound is a message this release cannot read rather than a
+    default worth decoding. Read on the result path's ServedRange (store.proto), the one the KEPT domain
+    ServedRange maps to since ingest.proto's copy left with FetchDataset (P37).
     """
-    mapper = MESSAGE_MAPPERS['trader_joe.proto.internal.ingest.v1.ServedRange']
+    mapper = MESSAGE_MAPPERS['trader_joe.proto.internal.store.v1.ServedRange']
     message = _built(mapper, {})
     message.ClearField('start')
 
@@ -673,11 +813,116 @@ def test_an_unset_required_timestamp_is_refused_rather_than_read_as_the_epoch():
 def test_the_exported_page_size_is_the_number_the_contract_states():
     """MAX_PAGE_BARS exists because the page size is the SERVER's to honour and the wire cannot express it.
 
-    The number lives in a .proto comment, where no Python caller can reach it, so the servicer that
-    chunks a fetch (tj-3mk3u5.9) reads it from ``common.rpc.mapping`` instead. Two copies of a number
-    that must agree is exactly the drift this reads the .proto to prevent.
-    """
-    stated = re.search(r'THE PAGE SIZE IS (\d+) BARS', (PROTO_ROOT / CONTRACT).read_text(encoding='utf-8'))
+    The number lives in a .proto comment, where no Python caller can reach it, so whoever chunks bars
+    (ingest's attempt runners, the delivery splitter) reads it from ``common.rpc.mapping`` instead. Two
+    copies of a number that must agree is exactly the drift this reads the .proto to prevent.
 
-    assert stated is not None, 'ingest.proto no longer states its page size, which is the only place it is written'
+    The contract that carries a BarPage is store.proto's DeliverAttempt since FetchDataset and
+    ingest.proto's BarPage were removed (P37, tj-7zjov1.280), so the statement belongs on store.proto's
+    BarPage. RED at a3727e1: the removal deleted the only statement with ingest.proto's BarPage
+    (CHANGES NEEDED on tj-7zjov1.280).
+    """
+    stated = re.search(r'THE PAGE SIZE IS (\d+) BARS', (PROTO_ROOT / STORE_CONTRACT).read_text(encoding='utf-8'))
+
+    assert stated is not None, 'store.proto does not state its page size, which a .proto comment is the only place for'
     assert int(stated.group(1)) == MAX_PAGE_BARS
+
+
+# ---------------------------------------------------------------------------------------------
+# THE TRAILER'S TYPED REASON (tj-7zjov1.345): a closed vocabulary carried as a plain string
+
+TRAILER = 'trader_joe.proto.internal.store.v1.DeliveryTrailer'
+DELIVERY_LOGGER = 'common.rpc.mapping.delivery'
+
+
+@pytest.mark.parametrize(
+    ('message_name', 'field'), sorted(VOCABULARY_STRINGS), ids=lambda part: part.rsplit('.', 1)[-1]
+)
+def test_each_vocabulary_string_is_a_declared_string_field(message_name: str, field: str):
+    """The vocabulary table's own tripwire: an entry must name a string field the contract still declares.
+
+    Without it a renamed field would fall back to the generic 'name-N' value, the mapper would drop it as an
+    unknown member, and the round trip would go red for the wrong reason -- or, for a field that moved, the
+    table would silently stop applying.
+
+    Args:
+        message_name: The proto message carrying the field.
+        field: The string field whose domain twin is a closed vocabulary.
+    """
+    descriptor = MESSAGE_MAPPERS[message_name].proto_type.DESCRIPTOR
+    assert field in descriptor.fields_by_name, f'{message_name}.{field} is no longer declared'
+    assert descriptor.fields_by_name[field].type == FieldDescriptor.TYPE_STRING
+
+
+def _trailer(**update: object) -> delivery_domain.DeliveryTrailer:
+    # A fully populated domain trailer (every field set, by reflection), with UPDATE applied.
+    mapper = MESSAGE_MAPPERS[TRAILER]
+    return mapper.to_domain(_built(mapper, {})).model_copy(update=update)
+
+
+@pytest.mark.parametrize('reason', list(Reason), ids=str)
+def test_every_vocabulary_reason_survives_the_trailer_both_ways(reason: Reason):
+    """Each member travels as its own string and comes back as the same member, not a lookalike string.
+
+    The reflective round trip rotates through members by its counter and so reaches only one per run; this
+    is the whole vocabulary, so a member the mapper cannot read back (a renamed value, a lower-cased one) is red.
+
+    Args:
+        reason: One vocabulary Reason.
+    """
+    mapper = MESSAGE_MAPPERS[TRAILER]
+
+    message = mapper.to_proto(_trailer(reason=reason))
+    assert message.reason == reason.value
+
+    decoded = mapper.to_domain(message)
+    assert decoded.reason is reason
+
+
+def test_no_reason_is_the_empty_string_on_the_wire_and_none_back():
+    """Empty is "no reason", in both directions: None never becomes a string, and '' never becomes a member."""
+    mapper = MESSAGE_MAPPERS[TRAILER]
+
+    message = mapper.to_proto(_trailer(reason=None))
+    assert message.reason == ''
+    assert 'reason' not in {field.name for field, _ in message.ListFields()}
+    assert mapper.to_domain(message).reason is None
+
+
+def test_an_unknown_reason_from_the_wire_is_none_with_one_warning_and_the_trailer_still_maps(caplog):
+    """Version skew: a newer ingest names a Reason this store does not know.
+
+    The trailer must still decode, every other field intact, with the reason None and exactly ONE warning.
+    Refusing it would refuse the delivery, which is redelivered and lost at an ingest restart (store.proto,
+    DeliveryTrailer.reason). A second warning for one value would be log noise on every redelivery.
+
+    Args:
+        caplog: Captures the mapping's warning.
+    """
+    mapper = MESSAGE_MAPPERS[TRAILER]
+    message = mapper.to_proto(_trailer(reason=Reason.VENDOR_RATE_LIMITED))
+    message.reason = 'A_REASON_FROM_A_NEWER_BUILD'
+    expected = _trailer(reason=None)
+
+    with caplog.at_level('WARNING', logger=DELIVERY_LOGGER):
+        decoded = mapper.to_domain(message)
+
+    assert decoded == expected
+    warnings = [record for record in caplog.records if record.name == DELIVERY_LOGGER]
+    assert [record.levelname for record in warnings] == ['WARNING']
+    assert 'A_REASON_FROM_A_NEWER_BUILD' in warnings[0].getMessage()
+
+
+def test_a_known_or_empty_reason_logs_nothing(caplog):
+    """The warning is for skew only: a member or an empty reason decodes silently.
+
+    Args:
+        caplog: Captures anything the mapping logs.
+    """
+    mapper = MESSAGE_MAPPERS[TRAILER]
+
+    with caplog.at_level('DEBUG', logger=DELIVERY_LOGGER):
+        mapper.to_domain(mapper.to_proto(_trailer(reason=Reason.RANGE_TOO_RECENT)))
+        mapper.to_domain(mapper.to_proto(_trailer(reason=None)))
+
+    assert [record for record in caplog.records if record.name == DELIVERY_LOGGER] == []

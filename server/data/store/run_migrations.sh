@@ -5,6 +5,10 @@ set -euo pipefail
 #
 # Usage: run_migrations.sh [alembic-command...]   (default: upgrade head)
 #
+# A command that moves the schema (upgrade, downgrade, stamp) first dumps the database and, on the
+# production definition, asserts the deployment label is empty; see BACKUP BEFORE A MIGRATION below.
+# Set MIGRATE_BACKUP_DIR to choose where the dump goes (default: backups beside the postgres data mount).
+#
 # This is the single spelling of "apply the migrations": the make target and, later, the
 # deploy step call this script rather than repeating the compose invocation (tj-oiv075 —
 # a deploy-script step is the adopted long-term design, never the entrypoint and never a
@@ -13,20 +17,17 @@ set -euo pipefail
 # docker-compose.yaml has no migration service. A healthy stack has an EMPTY database
 # until this runs.
 #
-# THE REVISIONS ARE NOT IN THE IMAGE, AND THAT MATTERS. The Dockerfile copies pyproject.toml,
-# uv.lock, entrypoint.sh, common, routers, schemas, gen/proto/python and the service app dir —
-# and nothing else. alembic.ini and migrations/ reach the container as bind mounts from THIS
-# CHECKOUT (docker-compose.yaml:112-113). So the code that runs is whatever image is deployed,
-# but the revisions that get applied are whatever is checked out here, and the two can
-# disagree silently. Shipping the revisions inside the image is a build-infra change, not this
-# script's job — tj-y3sj8x.
+# THE REVISIONS ARE IN THE IMAGE. The Dockerfile copies alembic.ini and migrations/ into the data_store
+# image (/code/alembic.ini, /code/migrations), and no compose file bind-mounts them from the
+# checkout any more (tj-y3sj8x; bead tj-7zjov1.10). So the code that runs and the revisions that get
+# applied are the same image's: they cannot disagree, and this script needs NO copy of the revisions
+# in the host checkout. The one thing it still reads from the checkout is the source digest that
+# `check` compares against the image's stamp (see THE COMPARISON IMAGE IS VERIFIED below).
 #
-# THAT SPLIT EXISTS ON THE PRODUCTION AND TEST DEFINITIONS. TEST runs the :test image, built from
-# the production target, with only alembic.ini and migrations/ bind-mounted, so it has the split
-# too. On the dev definition the override bind-mounts app/, common/, routers/, schemas/ and
-# gen/proto/python over /code as well, so the models, the enums the revisions import and the
-# revisions themselves all come from this checkout: there is no image/revision split in dev.
-# Which definition runs is chosen from the running stack; see WHICH STACK below.
+# THE DEV DEFINITION STILL OVERLAYS /code. The dev override bind-mounts app/, common/, routers/,
+# schemas/ and gen/proto/python over /code, so there the models and enums come from this checkout and
+# the image's revisions are what alembic reads. Which definition runs is chosen from the running
+# stack; see WHICH STACK below. The test definition runs the :test image with nothing overlaid.
 #
 # "Run this from a checkout that matches the running image" is what this header used to say, and
 # saying it was all it did. On 2026-10-04 a careful operator did exactly what it warned against
@@ -36,7 +37,7 @@ set -euo pipefail
 # THE ALEMBIC COMMAND IS AN ARGUMENT because that silent disagreement needs a diagnostic, and
 # the diagnostic wants every check below unchanged: the repo root, the pinned compose file, the
 # postgres check, and above all the empty-versions guard, since `alembic history` reads the same
-# bind-mounted revision files whose absence is the symptom being looked for. The inspection
+# image revision files whose absence is the symptom being looked for. The inspection
 # targets call this script rather than spelling out a second compose invocation, which is exactly
 # what this script's existence is meant to prevent (tj-4yvsb2). The default is `upgrade head`, so
 # callers that pass nothing — `make migrate`, the deploy step — are unchanged. Nothing here
@@ -64,7 +65,8 @@ set -euo pipefail
 # REPO_ROOT and SERVER_ROOT, not one REPO_ROOT counted by distance (tj-2bsw0k; epic tj-iontkq
 # risk R-1). REPO_ROOT is the TRUE repository root -- the directory holding pytest.ini, Makefile,
 # the compose files and tools/. SERVER_ROOT is the directory holding common/, routers/, schemas/
-# and data/ -- the one MIGRATION_DIR below actually wants. The two are the same directory today,
+# and data/ -- which MIGRATION_DIR used to want (now only a layout check: the script refuses to run
+# outside the server tree). The two are the same directory today,
 # which is exactly why a single two-directories-up count read as correct: that count always lands
 # on the directory holding data/ (SERVER_ROOT's definition) no matter where this script itself
 # sits, so it was SERVER_ROOT computed under REPO_ROOT's name. Once the service trees move under
@@ -77,7 +79,7 @@ set -euo pipefail
 #
 # NEITHER SEARCH FALLS BACK: a marker search that quietly returned the filesystem root instead of
 # refusing would be the same vacuous-pass failure in a new place, since every path built from it
-# would exist nowhere -- the empty-versions guard just below exists to catch precisely that.
+# would exist nowhere, and the checks that follow would then fail on paths that were never real.
 find_repo_root() {
     local dir="$1"
     while true; do
@@ -112,8 +114,9 @@ find_server_root() {
 
 SCRIPT_DIR="$(realpath "$(dirname "$0")")"
 REPO_ROOT="$(find_repo_root "$SCRIPT_DIR")"
-SERVER_ROOT="$(find_server_root "$SCRIPT_DIR")"
-MIGRATION_DIR="$SERVER_ROOT/data/store/migrations/versions"
+find_server_root "$SCRIPT_DIR" > /dev/null  # layout check only; nothing below needs the path
+# Where the image keeps the revisions (Dockerfile; alembic.ini's script_location = migrations, run from /code).
+IMAGE_MIGRATION_DIR=/code/migrations/versions
 
 # "$@" is exempt from `set -u` when empty, so this is safe with no arguments; the array is
 # never empty afterwards, which keeps the expansions below safe too.
@@ -179,7 +182,9 @@ PROJECT_NAME=default
 #     malformed label, a failed inspect or ps, more than one postgres or data_store container, a dev
 #     postgres with a non-dev data_store (likewise a test postgres with a non-test one). Detection
 #     never exits by itself there: `upgrade head` is the remedy and a selection problem must not
-#     refuse it (tj-yb1bxj addendum 3 item 6, addendum 4 item 4).
+#     refuse it (tj-yb1bxj addendum 3 item 6, addendum 4 item 4). The production definition then also
+#     receives the label assertion (m6) and the pre-migrate dump (m4), either of which may refuse a
+#     schema-moving command by design (tj-yb1bxj addendum 5); see BACKUP BEFORE A MIGRATION below.
 #   * IN trader_joe_dev THE SAME OUTCOMES REFUSE (exit 1, naming the cause): only a positively DEV or
 #     TEST stack is accepted there, and a production-labelled container is refused. Nothing in that
 #     project is production by construction, so refusing costs a dev restart (tj-grna9p.173,
@@ -358,8 +363,8 @@ select_stack() {
 # THE COMPARISON IMAGE IS VERIFIED BEFORE `check` RUNS (decision tj-yb1bxj clauses 2-4; tj-ymsobh).
 #
 # WHY. migrations/env.py imports the models from /code. On the PRODUCTION definition /code is the
-# IMAGE's, and only alembic.ini and migrations/ are bind-mounted, so there `alembic check` compares
-# the IMAGE'S models against the live schema and never this checkout's, and nothing in its output
+# IMAGE's, and so are alembic.ini and migrations/ (nothing is bind-mounted over them), so there
+# `alembic check` compares the IMAGE'S models against the live schema and never this checkout's, and nothing in its output
 # says which image it used. On the DEV definition the override also bind-mounts app/, common/,
 # routers/, schemas/ and gen/proto/python over /code, so the models come from this checkout and
 # that image/revision split does not arise. The guard below still runs there, and deliberately:
@@ -389,14 +394,12 @@ select_stack() {
 # phantom-drift failure this guard exists to stop — a stale image's models reported as live-schema
 # drift — cannot happen on the upgrade path.
 #
-# What upgrade DOES do, and this is a real exposure rather than an absent one: it applies the
-# bind-mounted revision scripts, and a revision script may import image code and derive the DDL it
-# emits from it. Today exactly one statement does — FEED_TYPE.create() in
-# migrations/versions/eec8f88a7443_per_dataset_identity_and_feed.py, whose CREATE TYPE label list
-# is read off the IMAGE's common.enums.data_stock.Feed on the PRODUCTION definition (on the dev
-# definition common/ is bind-mounted, so it is read off this checkout). A stale image there emits
-# a different CREATE TYPE, with no ImportError, and alembic check cannot see it — enum labels are
-# one of the two blind spots this file's header already names.
+# What upgrade DOES do: it applies the image's revision scripts, and a revision script may import
+# image code and derive the DDL it emits from it. Today none does: the alpha baseline writes its
+# enum label lists as literals (ADR tj-kg521d), so a stale image cannot emit a different CREATE
+# TYPE. A later revision that reads labels off imported code would reopen that exposure, with no
+# ImportError and nothing in alembic check to see it — enum labels are one of the two blind spots
+# this file's header already names.
 #
 # IT IS STILL NOT GUARDED, and the reason is the COST OF REFUSING, not the absence of exposure.
 # migrate-check is advisory and re-runnable, so refusing it costs an operator one build.
@@ -591,20 +594,7 @@ EOF
 }
 # =================================================================================================
 
-echo "Running 'alembic ${ALEMBIC_ARGS[*]}' against the revisions in $MIGRATION_DIR"
-
-if [ ! -d "$MIGRATION_DIR" ]; then
-    echo "Migration directory does not exist: $MIGRATION_DIR" >&2
-    exit 1
-fi
-
-# An empty versions/ makes `alembic upgrade head` a successful no-op, which is
-# indistinguishable from a migration that worked. Given the bind mount above, that is
-# exactly the symptom of running from the wrong checkout, so fail loudly instead.
-if ! compgen -G "$MIGRATION_DIR/*.py" > /dev/null; then
-    echo "No revision files in $MIGRATION_DIR — wrong checkout?" >&2
-    exit 1
-fi
+echo "Running 'alembic ${ALEMBIC_ARGS[*]}' against the revisions in the data_store image ($IMAGE_MIGRATION_DIR)"
 
 # --no-deps, so the dependency check is ours to make. Without it compose starts BOTH
 # declared dependencies for a container that needs only the database, and kafka's 90s
@@ -665,6 +655,168 @@ for argument in "${ALEMBIC_ARGS[@]}"; do
         break
     fi
 done
+
+# THE EMPTY-VERSIONS GUARD READS THE IMAGE (tj-7zjov1.45). An empty versions/ makes `alembic upgrade head`
+# a successful no-op, indistinguishable from a migration that worked; with the revisions baked into the
+# image the thing to check is the image the one-off container will run, not the host checkout, which
+# is no longer consulted at all. The same one-off shape as the label read below (selected definition,
+# --no-deps, --entrypoint /bin/sh), so it sees exactly the image alembic will see.
+#
+# IT RUNS AFTER THE CHECK GUARD ABOVE, NOT BEFORE, and do not hoist it. data_store has a build
+# section, so a compose run against a missing image BUILDS it on the spot, unstamped; verify_comparison_image
+# refuses a missing image with NO SUCH IMAGE and a FIX line precisely so that nothing builds one.
+# Looking first would build an unstamped image before that refusal could speak, and the next check
+# would say CANNOT VERIFY instead.
+#
+# It still runs BEFORE the label read, the dump and any alembic call, so a refusal writes nothing.
+# Exit 3 is the container's own "no revision files"; anything else is a failure to look, and refuses
+# too: a guard that cannot look must not wave the migration through. Kept for the read-only commands
+# as well, since `history` and `heads` over an empty versions/ would print nothing and read as success.
+# Single quotes on purpose: the glob and $1 are the container's, expanded by its shell.
+# shellcheck disable=SC2016
+if "${COMPOSE[@]}" run --rm --no-deps -T --entrypoint /bin/sh data_store \
+    -c 'set -- '"$IMAGE_MIGRATION_DIR"'/*.py; [ -e "$1" ] || exit 3'; then
+    :
+else
+    guard_status=$?
+    if [ "$guard_status" -eq 3 ]; then
+        echo "No revision files in the data_store image ($IMAGE_MIGRATION_DIR) — a broken or wrong image. Nothing was migrated." >&2
+    else
+        echo "REFUSED: could not look for revision files in the data_store image ($IMAGE_MIGRATION_DIR). Nothing was migrated." >&2
+    fi
+    exit 1
+fi
+
+# =================================================================================================
+# BACKUP BEFORE A MIGRATION, AND THE PRODUCTION LABEL (migration-safety gate m4 and m6, epic tj-7zjov1,
+# bead P03; design tj-26jt9w addenda of 2026-10-24).
+#
+# Migrations are forward-only (m3): there is no downgrade to recover with, so the way back from a bad
+# revision is a restore. A restore needs a dump taken BEFORE the revision ran, which is what this does,
+# for every command that moves the schema (upgrade, downgrade, stamp; the default is `upgrade head`).
+# The read-only commands (current, history, heads, check) take no dump and assert nothing.
+#
+# A FAILED DUMP REFUSES THE MIGRATION. This is a deliberate exception to "a remedy may not be refused"
+# (the comparison-image guard above, tj-yb1bxj addendum 3): that rule protects a deploy that is already
+# wrong, where the escape is a rebuild; here the cost of proceeding is a schema change with no way back.
+# There is no escape hatch, and none is wanted -- a first run against an empty database dumps an empty
+# database and passes. The refusal happens BEFORE alembic starts, so nothing was written.
+#
+# WHAT THE DUMP IS. pg_dump in custom format, run INSIDE the postgres container (its own client matches
+# its own server, and the container already holds POSTGRES_USER and POSTGRES_DB, so no credential is
+# read, spelled or logged here) and streamed to a file on the host. It is written under a .partial name,
+# checked non-empty and read back with pg_restore --list, and only then renamed: a name without .partial
+# is a dump that was verified readable. It is NOT a verified RESTORE; restore_dump.sh and
+# rehearse_migration.sh are the ones that restore. The file is private (umask 077), named with the UTC
+# time and the compose project, and lives in $MIGRATE_BACKUP_DIR, default: the "backups" folder beside
+# the host directory mounted at the running postgres's data directory (the parent of that mount, so
+# it follows the database whatever DATA_DIR the stack was started with). If that mount cannot be found
+# and MIGRATE_BACKUP_DIR is unset, the migrate is refused. THAT IS THE SAME DISK AS THE DATABASE: getting a copy off the host is the
+# operator's step of the deploy procedure, not this script's. Messages go to stderr; stdout stays
+# alembic's.
+#
+# THE PRODUCTION LABEL (m6). Production's DEPLOYMENT_LABEL is EMPTY; only the dev override and the fake
+# overlay set it. When the PRODUCTION definition is the one selected, the label the data_store
+# container would run with is read (the same one-off container the migration uses, so it sees exactly
+# what the service sees) and anything but empty refuses: a non-empty label on the production definition
+# means the environment is not the one it claims to be, and a prod migrate must not proceed on that.
+# Dev and test definitions are not asserted: they are supposed to carry a label. Nothing in the service
+# branches on the label (it is display only); this is the deploy procedure's check, not the app's.
+is_mutating_command() {
+    local argument
+    for argument in "${ALEMBIC_ARGS[@]}"; do
+        case "$argument" in
+            upgrade | downgrade | stamp) return 0 ;;
+        esac
+    done
+    return 1
+}
+
+assert_production_label_is_empty() {
+    local label
+    # Single quotes on purpose: the variable is the container's, expanded by its shell.
+    # shellcheck disable=SC2016
+    if ! label="$("${COMPOSE[@]}" run --rm --no-deps -T --entrypoint /bin/sh data_store \
+        -c 'printf %s "${DEPLOYMENT_LABEL-}"')"; then
+        echo "REFUSED: could not read DEPLOYMENT_LABEL from the data_store container, so the production label cannot be asserted empty. Nothing was migrated." >&2
+        exit 1
+    fi
+    if [ -n "$label" ]; then
+        echo "REFUSED: the production definition would run data_store with DEPLOYMENT_LABEL set (non-empty); production's label is empty. This looks like a dev or test environment mislabelled as production, or a label leaked into the production environment. Nothing was migrated." >&2
+        exit 1
+    fi
+}
+
+# The default dump folder: the parent of the host directory bind-mounted at the running postgres's
+# /var/lib/postgresql/data, plus /backups. The mount is what the database actually uses, whatever
+# defined it (the dev or production env file, the test stack's command-line DATA_DIR), so no compose
+# interpolation is re-implemented here. Prints the folder; prints nothing and returns 1 when the mount
+# is not exactly one bind mount or the inspect fails.
+default_backup_dir() {
+    local sources source
+    if ! sources="$(docker inspect --format \
+        '{{ range .Mounts }}{{ if eq .Destination "/var/lib/postgresql/data" }}{{ if eq .Type "bind" }}{{ println .Source }}{{ end }}{{ end }}{{ end }}' \
+        "$postgres_container" 2> /dev/null)"; then
+        return 1
+    fi
+    sources="${sources%$'\n'}"
+    if [ "$(count_lines "$sources")" -ne 1 ]; then
+        return 1
+    fi
+    source="${sources%/}"
+    case "$source" in
+        /?*) ;;
+        *) return 1 ;;
+    esac
+    echo "$(dirname "$source")/backups"
+}
+
+backup_before_migration() {
+    local backup_dir stamp target partial
+    backup_dir="${MIGRATE_BACKUP_DIR:-}"
+    if [ -z "$backup_dir" ]; then
+        if ! backup_dir="$(default_backup_dir)"; then
+            echo "REFUSED: could not find the host directory mounted at the postgres data directory, so there is no default place for the dump. Set MIGRATE_BACKUP_DIR to choose a directory. Nothing was migrated." >&2
+            exit 1
+        fi
+    fi
+    stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+    target="$backup_dir/store-$stamp-$PROJECT_NAME-pre-migrate.dump"
+    partial="$target.partial"
+
+    if ! (umask 077 && mkdir -p "$backup_dir"); then
+        echo "REFUSED: cannot create the backup directory $backup_dir. Nothing was migrated." >&2
+        exit 1
+    fi
+    # The postgres container runs the shell, so $POSTGRES_USER and $POSTGRES_DB are ITS variables.
+    # shellcheck disable=SC2016
+    if ! (umask 077 && "${COMPOSE[@]}" exec -T postgres sh -c \
+        'exec pg_dump --format=custom --user "$POSTGRES_USER" --dbname "$POSTGRES_DB"' > "$partial"); then
+        rm -f "$partial"
+        echo "REFUSED: pg_dump failed, so the migration was not started (no dump, no migration)." >&2
+        exit 1
+    fi
+    if [ ! -s "$partial" ]; then
+        rm -f "$partial"
+        echo "REFUSED: pg_dump wrote an empty file, so the migration was not started." >&2
+        exit 1
+    fi
+    if ! "${COMPOSE[@]}" exec -T postgres pg_restore --list < "$partial" > /dev/null; then
+        rm -f "$partial"
+        echo "REFUSED: the dump does not read back (pg_restore --list failed), so the migration was not started." >&2
+        exit 1
+    fi
+    mv "$partial" "$target"
+    echo "run_migrations.sh: dump taken before the migration: $target (same disk as the database; copy it off the host)" >&2
+}
+
+if is_mutating_command; then
+    if [ "$BUILD_TARGET" = prod-build ]; then
+        assert_production_label_is_empty
+    fi
+    backup_before_migration
+fi
+# =================================================================================================
 
 # No pip install. alembic and psycopg2-binary are both in the data-store dependency group
 # the image syncs (pyproject.toml [dependency-groups], Dockerfile:29), so the venv already

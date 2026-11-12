@@ -23,6 +23,7 @@ import subprocess
 from pathlib import Path
 
 import pytest
+import yaml
 
 from common.tests.compose_model import BASE_FILE, FAKE_FILE, load
 from common.tests.test_ci_invariants import (
@@ -330,15 +331,42 @@ def test_the_system_launch_comment_says_it_refuses_without_the_images():
 
 
 def test_ci_tags_the_test_images_before_start_system_runs_make_system_launch():
-    """The 09:00 note: 'CI is unaffected: it tags the pulled images :test before make system-launch'."""
-    text = WORKFLOW.read_text(encoding='utf-8')
-    start = text.index('- name: Start System')
-    tags = [
-        match.start()
-        for match in re.finditer(r'^\s*docker tag .+ trader_joe_data_(?:store|ingest):test\s*$', text, re.MULTILINE)
-    ]
-    assert len(tags) == 2, tags
-    assert all(tag < start for tag in tags), (tags, start)
+    """The 09:00 note: 'CI is unaffected: it tags the pulled images :test before make system-launch'.
+
+    Per job since tj-7zjov1.10: System Testing and the Migration Gate each start the test stack, and each
+    must tag both images :test in a step before its own Start System -- one job's tags do nothing for the
+    other's runner. Four tags in all, two per job, and no other job starts the stack.
+    """
+    tag = re.compile(r'^docker tag .+ trader_joe_data_(store|ingest):test$')
+    jobs = (yaml.safe_load(WORKFLOW.read_text(encoding='utf-8')) or {}).get('jobs') or {}
+    launching = {}
+    for job in jobs.values():
+        steps = (job or {}).get('steps') or []
+        starts = [
+            index
+            for index, step in enumerate(steps)
+            if any(
+                line.strip().split()[:2] == ['make', 'system-launch'] for line in (step.get('run') or '').splitlines()
+            )
+        ]
+        if not starts:
+            continue
+        assert len(starts) == 1, (job.get('name'), starts)
+        [start] = starts
+        assert steps[start].get('name') == 'Start System', (job.get('name'), steps[start].get('name'))
+        tagged = [
+            match.group(1)
+            for step in steps[:start]
+            for line in (step.get('run') or '').splitlines()
+            if (match := tag.match(line.strip()))
+        ]
+        after = [
+            line for step in steps[start:] for line in (step.get('run') or '').splitlines() if tag.match(line.strip())
+        ]
+        assert sorted(tagged) == ['ingest', 'store'] and not after, (job.get('name'), tagged, after)
+        launching[job.get('name')] = tagged
+    assert set(launching) == {'System Testing', 'Migration Gate'}, launching
+    assert sum(map(len, launching.values())) == 4, launching
 
 
 def test_system_launchs_down_and_up_address_the_same_dev_project():

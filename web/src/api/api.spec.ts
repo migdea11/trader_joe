@@ -12,7 +12,7 @@ import {
   DatasetSummarySchema,
   ExpiryType,
   UsageFilter,
-  FreshnessStatus,
+  DatasetHealthStatus,
   IngestRunPageSchema,
   IngestRunState,
   RunTrigger,
@@ -24,6 +24,7 @@ import { readdirSync, readFileSync, statSync } from 'node:fs'
 import { join, relative } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
+import { rowBadge } from '@/catalog/rows'
 import { deleteRequest, patchMessage } from './client'
 import * as datasetsModule from './datasets'
 import { clientQuery } from './datasets'
@@ -67,7 +68,9 @@ import {
 // int64-as-string and the omission of zero values are exactly what the server sends. The script
 // built a DatasetSummary with every field set (bar_count 2**53 - 1), a DatasetPage holding it, a
 // DatasetFacets with a zero count, a BarPage with an optional trade_count set on one bar only, a
-// UiConfig, and a DatasetSummary with only id and symbol (health unset).
+// UiConfig, and a DatasetSummary with only id and symbol (health unset). The health key and its
+// DATASET_HEALTH_STATUS_* values (SUMMARY_JSON.health, FACETS_JSON.statuses) were re-rendered the same
+// way on 2026-10-31 after the rename (tj-grna9p.168): the server writes `health`, not `freshness`.
 const SUMMARY_JSON = {
   id: '3f6c1d2e-0000-4000-8000-000000000001',
   assetSymbol: 'VFV',
@@ -86,8 +89,8 @@ const SUMMARY_JSON = {
   firstBar: '2016-01-04T05:00:00Z',
   lastBar: '2026-10-09T04:00:00Z',
   barCount: '9007199254740991',
-  freshness: {
-    status: 'FRESHNESS_STATUS_LATE',
+  health: {
+    status: 'DATASET_HEALTH_STATUS_LATE',
     expectedLastBar: '2026-10-09T04:00:00Z',
     asOf: '2026-10-10T14:00:00Z',
   },
@@ -102,7 +105,7 @@ const FACETS_JSON = {
     { updateType: 'UPDATE_TYPE_STATIC', count: '4' },
     { updateType: 'UPDATE_TYPE_DAILY', count: '8' },
   ],
-  statuses: [{ status: 'FRESHNESS_STATUS_FRESH', count: '9' }, { status: 'FRESHNESS_STATUS_GAPS' }],
+  statuses: [{ status: 'DATASET_HEALTH_STATUS_FRESH', count: '9' }, { status: 'DATASET_HEALTH_STATUS_GAPS' }],
 }
 const BARS_JSON = {
   bars: [
@@ -161,7 +164,21 @@ describe('fromJson decode of real server JSON', () => {
     expect(item.source).toBe(DataSource.ALPACA_API)
     expect(item.updateType).toBe(UpdateType.DAILY)
     expect(item.barCount).toBe(9007199254740991n)
-    expect(item.freshness?.status).toBe(FreshnessStatus.LATE)
+    expect(item.health?.status).toBe(DatasetHealthStatus.LATE)
+  })
+
+  // tj-grna9p.168: the wire key is `health` (DatasetSummary field 18). A payload still on the old
+  // key is an unknown field, ignored on decode: the row has no health and reads Unknown, so a
+  // fixture left on `freshness` could never pass a Healthy or Failed assertion.
+  it('the health key is the one read; a pre-rename freshness key decodes as no health', async () => {
+    expect(Object.keys(SUMMARY_JSON)).toContain('health')
+    expect(Object.keys(SUMMARY_JSON)).not.toContain('freshness')
+    fetchMock.mockResolvedValueOnce(jsonResponse({ ...UNSET_SUMMARY_JSON, health: { status: 'DATASET_HEALTH_STATUS_GAPS' } }))
+    expect((await getDataset('ds-new')).health?.status).toBe(DatasetHealthStatus.GAPS)
+    fetchMock.mockResolvedValueOnce(jsonResponse({ ...UNSET_SUMMARY_JSON, freshness: { status: 'DATASET_HEALTH_STATUS_FRESH' } }))
+    const old = await getDataset('ds-old')
+    expect(old.health).toBeUndefined()
+    expect(rowBadge(old).label).toBe('Unknown')
   })
 
   it('DatasetSummary, every field', async () => {
@@ -176,15 +193,17 @@ describe('fromJson decode of real server JSON', () => {
     expect(summary.end?.seconds).toBe(BigInt(Date.UTC(2026, 9, 10, 14) / 1000))
     expect(summary.expiry?.seconds).toBe(BigInt(Date.UTC(2027, 0, 1) / 1000))
     expect(summary.lastBar?.seconds).toBe(BigInt(Date.UTC(2026, 9, 9, 4) / 1000))
-    expect(summary.freshness?.gapCount).toBe(0)
+    expect(summary.health?.gapCount).toBe(0)
+    expect(summary.health?.expectedLastBar?.seconds).toBe(BigInt(Date.UTC(2026, 9, 9, 4) / 1000))
+    expect(summary.health?.asOf?.seconds).toBe(BigInt(Date.UTC(2026, 9, 10, 14) / 1000))
     expect(summary.siblings).toHaveLength(1)
     expect(summary.siblings[0]!.granularity).toBe(Granularity.ONE_HOUR)
   })
 
-  it('DatasetSummary with health unset decodes freshness as absent', async () => {
+  it('DatasetSummary with health unset decodes health as absent', async () => {
     fetchMock.mockResolvedValue(jsonResponse(UNSET_SUMMARY_JSON))
     const summary = await getDataset('ds-empty')
-    expect(summary.freshness).toBeUndefined()
+    expect(summary.health).toBeUndefined()
     expect(summary.barCount).toBe(0n)
     expect(summary.firstBar).toBeUndefined()
   })
@@ -200,8 +219,8 @@ describe('fromJson decode of real server JSON', () => {
       [UpdateType.DAILY, 8n],
     ])
     expect(facets.statuses.map((s) => [s.status, s.count])).toEqual([
-      [FreshnessStatus.FRESH, 9n],
-      [FreshnessStatus.GAPS, 0n],
+      [DatasetHealthStatus.FRESH, 9n],
+      [DatasetHealthStatus.GAPS, 0n],
     ])
   })
 

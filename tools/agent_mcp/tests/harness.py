@@ -27,6 +27,7 @@ import subprocess
 import time
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -137,11 +138,18 @@ WORKTREE_FILES = {
     'tests/fakes/__init__.py': '',
     'tests/fakes/ingest_launcher.py': 'app = None\n',
     'pytest.ini': '[pytest]\n',
+    # The dev seed tool, test_client's read-only mounts (tj-7zjov1.313): the package marker and the one
+    # subpackage, never the rest of tools/.
+    'tools/__init__.py': '',
+    'tools/dev_datasets/__init__.py': '',
+    'tools/dev_datasets/dev_seed.py': 'SEED = 1\n',
     # Outside every SNAPSHOT_SOURCES entry: never copied. tests/ is allow-listed per subdirectory,
     # never whole, so a sibling of tests/system and tests/fakes stays out.
     'Dockerfile': 'FROM scratch\n',
     'README.md': 'not a source\n',
     'tests/README.md': 'not a source\n',
+    # tools/ is allow-listed per entry too: a sibling of tools/dev_datasets stays out.
+    'tools/agent_mcp/server.py': 'not a source\n',
 }
 EXECUTABLE_FILES = ('entrypoint.sh',)
 # A live env file's content: it must never reach a snapshot, the audit log or any output.
@@ -359,7 +367,10 @@ def is_seed_producer(step: stack.Step) -> bool:
 DEV_CONTAINER_ID = 'c0ffee000001'
 DEV_DB_TABLES_STDOUT = (
     b'dataset_read|t\ndataset_read_daily|t\ndataset_override_log|t\ndataset_deletion|t\n'
-    b'ingest_run|t\nstore_dataset_entry|t\nstock_market_activity|t\nalembic_version|t\n'
+    b'ingest_run|t\ningest_request|t\ningest_instance|t\nstore_dataset_entry|t\nstock_market_activity|t\n'
+    b'asset_list_snapshot|t\nasset_list_row|t\nasset_list_event|t\ncorporate_action|t\npanel|t\n'
+    b'panel_settings_version|t\npanel_source_settings_version|t\npanel_pass|t\npanel_member_transition|t\n'
+    b'alembic_version|t\n'
     b'version_num|d7e2a9c35b18\n'
 )
 # The data_ingest container's id in the rig: distinct from DEV_CONTAINER_ID so that migrate's TEST-mode stamp
@@ -376,6 +387,9 @@ DEV_MIGRATE_STATUS_STDOUT = (
 # What the http_get script prints for /ping (tj-iee6sn.13.6): the status line, then the redacted
 # body. Told apart by its option set, which is NONE: the container id follows `exec` directly.
 DEV_HTTP_GET_STDOUT = b'== GET /ping -> HTTP 200 ==\n{"message":"pong"}\n'
+# What test_reset's exec script prints (tj-w0rddi): the verification of the recreated schema, names and counts
+# only. Told apart from db_tables' exec by its option set, `-u postgres` with NO `-e` after it.
+TEST_RESET_STDOUT = b'database|postgres\nschema_owner|pg_database_owner\nalembic_version|absent\npublic_relations|0\n'
 
 
 def is_dev_lookup(step: stack.Step) -> bool:
@@ -448,6 +462,8 @@ def default_response(step: stack.Step) -> runner.ProcessResult:
         return runner.ProcessResult(0, f'{DEV_INGEST_CONTAINER_ID if ingest else DEV_CONTAINER_ID}\n'.encode(), b'')
     if is_dev_exec(step) and list(step.argv[2:4]) == ['-w', '/code']:
         return runner.ProcessResult(0, DEV_MIGRATE_STATUS_STDOUT, b'')
+    if is_dev_exec(step) and len(step.argv) > 4 and list(step.argv[2:4]) == ['-u', 'postgres'] and step.argv[4] != '-e':
+        return runner.ProcessResult(0, TEST_RESET_STDOUT, b'')
     if is_dev_exec(step) and len(step.argv) > 2 and not step.argv[2].startswith('-'):
         return runner.ProcessResult(0, DEV_HTTP_GET_STDOUT, b'')
     if is_dev_exec(step):
@@ -462,6 +478,9 @@ def default_response(step: stack.Step) -> runner.ProcessResult:
 # postgres mount read prints <repo host path>/volume_data/test/postgres. Every other step falls through to
 # BASE (default_response unless given), so the lookups and the stamps stay current. Spelled from literals.
 SYSTEM_SUITE_VERBS = frozenset({'run_system_tests', 'seed_dump'})
+# test_reset (tj-w0rddi) has the same rails (TEST mode only, the test directory's mount) but runs no client:
+# one exec into the postgres container. test_reset_response is the rig's answer under which its sample ends 'ok'.
+TEST_RESET_VERBS = frozenset({'test_reset'})
 TEST_MODE_LINE = b'/r/docker-compose.yaml,/r/docker-compose.fake.yaml\n'
 POSTGRES_DATA_TARGET = '/var/lib/postgresql/data'
 
@@ -506,11 +525,56 @@ def system_suite_response(
     return respond
 
 
+# test_stop, test_start and test_env (ADR tj-4rr0la addendum 32; tj-7zjov1.268): test_reset's rails, then a
+# lookup of BOTH services' containers in ANY state (`docker ps -a ... --format '{{.ID}} {{.State}}'`), a stamp
+# read of each container found, and one compose step on the named service. service_verb_response answers the
+# lookup with ONE container per service in STATE (running, or exited for test_start's sample).
+TEST_SERVICE_VERBS = frozenset({'test_stop', 'test_start', 'test_env'})
+SERVICE_LOOKUP_FORMAT = '{{.ID}} {{.State}}'
+# ps's one extra read (addendum 32 (6)): `docker ps -a` printing service|env_generation|env_names from labels.
+AGENT_ENV_LABELS_FORMAT = (
+    '{{.Label "com.docker.compose.service"}}|{{.Label "trader_joe.agent.env_generation"}}|'
+    '{{.Label "trader_joe.agent.env_names"}}'
+)
+
+
+def is_service_lookup(step: stack.Step) -> bool:
+    """The three verbs' lookup of one service's containers in any state, printing id and state."""
+    return list(step.argv[:3]) == ['/usr/local/bin/docker', 'ps', '-a'] and step.argv[-1] == SERVICE_LOOKUP_FORMAT
+
+
+def service_of(step: stack.Step) -> str:
+    """The service a label-filtered `docker ps` names."""
+    return next(w for w in step.argv if w.startswith('label=com.docker.compose.service=')).split('=', 2)[2]
+
+
+def is_agent_env_label_read(step: stack.Step) -> bool:
+    """The read by ps of the two env labels (and the service label) of the project's containers."""
+    return list(step.argv[:3]) == ['/usr/local/bin/docker', 'ps', '-a'] and step.argv[-1] == AGENT_ENV_LABELS_FORMAT
+
+
+def service_verb_response(
+    layout: Layout, state: str = 'running', base: Callable[[stack.Step], runner.ProcessResult] = default_response
+) -> Callable[[stack.Step], runner.ProcessResult]:
+    """system_suite_response, with each service lookup answering its one container (the lookup's ids) in STATE."""
+    suite = system_suite_response(layout, base)
+
+    def respond(step: stack.Step) -> runner.ProcessResult:
+        if is_service_lookup(step):
+            container = DEV_INGEST_CONTAINER_ID if service_of(step) == 'data_ingest' else DEV_CONTAINER_ID
+            return runner.ProcessResult(0, f'{container} {state}\n'.encode(), b'')
+        return suite(step)
+
+    return respond
+
+
 def response_for(
     verb: str, layout: Layout, base: Callable[[stack.Step], runner.ProcessResult] = default_response
 ) -> Callable[[stack.Step], runner.ProcessResult]:
-    """The answer under which VERB's sample is admitted: system_suite_response for the system-suite pair, else BASE."""
-    return system_suite_response(layout, base) if verb in SYSTEM_SUITE_VERBS else base
+    """The answer under which VERB's sample is admitted: system_suite_response for the test-mode verbs, else BASE."""
+    if verb in TEST_SERVICE_VERBS:
+        return service_verb_response(layout, 'exited' if verb == 'test_start' else 'running', base)
+    return system_suite_response(layout, base) if verb in SYSTEM_SUITE_VERBS | TEST_RESET_VERBS else base
 
 
 # The client's command (tj-iee6sn.20; no shell wrapper since 5a38b7f), spelled from literals:
@@ -603,6 +667,75 @@ def forbid_real_subprocesses(monkeypatch: pytest.MonkeyPatch, allowed: Sequence[
     monkeypatch.setattr(asyncio, 'create_subprocess_exec', refuse_async)
 
 
+# THE SESSION GRANT (ADR tj-4rr0la addendum 34). Every state-changing verb is refused at admission without an
+# open grant that covers it. The suites that test a verb's own rails are not about the grant, so a rig holds a
+# COVERING grant by default: CoveringAgentStack puts a real stack.Grant in the verb's own mode, listing every
+# verb of that mode, into the runner's grant slot for the length of each state-changing call, then clears it.
+# The production admission, mode check and audit run unchanged on it; nothing is patched. A single real grant
+# cannot do this job: one grant has one mode, and the suites call TEST and DEV verbs side by side.
+#
+# migrate, restart and down take the mode the mode guard resolves, so the covering grant's mode is read from
+# the rig's own answer to the guard step (respond, not run: the peek is not recorded as a step). A refused or
+# empty project counts as DEV, as the runner counts it.
+#
+# The grant tests (test_session_grant.py) opt out with make_rig(..., covering_grant=False): a plain AgentStack
+# with no grant, opened only through the real stack_session_open_* verbs.
+COVERING_GRANT_BEAD = 'tj-harness'
+COVERING_GRANT_PURPOSE = 'harness: covers the verb under test so its own rails are what the test sees'
+COVERING_GRANT_SECONDS = 480 * 60
+
+
+def covering_grant(mode: str, clock: Callable[[], float]) -> stack.Grant:
+    """An open grant of MODE listing every verb of that mode, expiring the TEST maximum after CLOCK's now."""
+    return stack.Grant(
+        bead=COVERING_GRANT_BEAD,
+        mode=mode,
+        verbs=stack.GRANT_VERBS[mode],
+        purpose=COVERING_GRANT_PURPOSE,
+        expires=clock() + COVERING_GRANT_SECONDS,
+        expires_at=datetime.now(UTC) + timedelta(seconds=COVERING_GRANT_SECONDS),
+    )
+
+
+class CoveringAgentStack(runner.AgentStack):
+    """An AgentStack that holds a covering grant (above) for the length of each state-changing call."""
+
+    def __init__(
+        self,
+        settings: Settings,
+        run: Callable[[stack.Step], Awaitable[runner.ProcessResult]],
+        respond: Callable[[stack.Step], runner.ProcessResult],
+        clock: Callable[[], float] = time.monotonic,
+    ):
+        super().__init__(settings, run=run, clock=clock)
+        self._covering_respond = respond
+
+    def _covering_mode(self, verb: str) -> str:
+        fixed = stack.GRANT_FIXED_MODE.get(verb)
+        if fixed is not None:
+            return fixed
+        answer = self._covering_respond(stack.dev_prod_guard_step(self.settings.stack_dir))
+        try:
+            mode = stack.check_mode_guard(answer.exit_status, answer.stdout)
+        except stack.Refused:
+            mode = None
+        return mode or stack.MODE_DEV
+
+    async def call(self, verb: str, arguments: object) -> dict[str, Any]:
+        if not isinstance(verb, str) or verb not in self._handlers or verb in runner.GRANT_FREE_VERBS:
+            return await super().call(verb, arguments)
+        self._grant = covering_grant(self._covering_mode(verb), self._clock)
+        try:
+            return await super().call(verb, arguments)
+        finally:
+            self._grant = None
+
+
+def covering_agent(rig: 'Rig', run: Callable[[stack.Step], Awaitable[runner.ProcessResult]]) -> runner.AgentStack:
+    """A CoveringAgentStack over RUN for RIG's layout, peeking at RIG's FakeDocker for the guard's answer."""
+    return CoveringAgentStack(rig.layout.settings, run=run, respond=lambda step: rig.docker.respond(step))
+
+
 @dataclass
 class Rig:
     """One layout with its fakes installed and an AgentStack over them."""
@@ -613,15 +746,29 @@ class Rig:
     agent: runner.AgentStack
 
     def call(self, verb: str, arguments: object) -> dict[str, Any]:
-        return asyncio.run(self.agent.call(verb, arguments))
+        result = asyncio.run(self.agent.call(verb, arguments))
+        # Every message any rig call reaches, refusals included, is checked for the withdrawn budget.
+        assert_no_budget_wording(result.get('message', ''))
+        return result
 
     def audit_lines(self) -> list[str]:
         path = self.layout.stack_dir / stack.AUDIT_LOG_NAME
         return path.read_text().splitlines() if path.exists() else []
 
 
-def make_rig(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, docker: FakeDocker | None = None) -> Rig:
-    """A layout, FakeGit listing repo and its one agent worktree, FakeDocker, and no real subprocess."""
+def make_rig(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    docker: FakeDocker | None = None,
+    *,
+    covering_grant: bool = True,
+    clock: Callable[[], float] = time.monotonic,
+) -> Rig:
+    """A layout, FakeGit listing repo and its one agent worktree, FakeDocker, and no real subprocess.
+
+    COVERING_GRANT (the default) gives the rig a CoveringAgentStack; False a plain AgentStack with no grant.
+    CLOCK is the runner's monotonic clock (a test of expiry passes a fake one).
+    """
     layout = make_layout(tmp_path)
     git = FakeGit(worktree_paths=[layout.repo, layout.worktree])
     monkeypatch.setattr(stack, 'run_git', git)
@@ -644,22 +791,59 @@ def make_rig(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, docker: FakeDocker
     ]
     forbid_real_subprocesses(monkeypatch, allowed)
     fake_docker = docker or FakeDocker()
-    return Rig(layout=layout, git=git, docker=fake_docker, agent=runner.AgentStack(layout.settings, run=fake_docker))
+    agent: runner.AgentStack
+    if covering_grant:
+        agent = CoveringAgentStack(
+            layout.settings, run=fake_docker, respond=lambda step: fake_docker.respond(step), clock=clock
+        )
+    else:
+        agent = runner.AgentStack(layout.settings, run=fake_docker, clock=clock)
+    return Rig(layout=layout, git=git, docker=fake_docker, agent=agent)
 
 
-def budget_spent(rig: Rig) -> int:
-    """How many state-changing calls the rig's S10 budget holds in its window (read in place, never charged)."""
-    return len(rig.agent.dev_budget._calls)
+# THE BUDGET'S ABSENCE (ADR tj-4rr0la addendum 33, owner ruling 2026-11-06). The S10 budget of 12
+# state-changing dev calls per rolling hour is withdrawn: no verb charges, counts or refuses on call
+# volume, and no counter exists anywhere in the MCP. These helpers pin that absence.
+
+# The withdrawn refusal, word for word as stack.DevBudget raised it at 9fffd07.
+OLD_BUDGET_REFUSAL = '12 state-changing dev verbs in the last hour is the budget; wait, or run the make target yourself'
+# Admitted calls a volume test makes, well past the withdrawn limit of 12. A rig's calls all land within
+# seconds, so every one of them falls inside a single rolling hour.
+CALL_VOLUME = 13
+# Words the withdrawn budget's refusal and descriptions used; none may reach an agent any more.
+BUDGET_WORDS = ('budget', 'an hour', 'per hour', 'hourly')
+
+
+def assert_no_budget_wording(text: str) -> None:
+    """TEXT, a tool description or a result message, says nothing of a budget or an hourly limit."""
+    lowered = text.lower()
+    assert OLD_BUDGET_REFUSAL.lower() not in lowered, text
+    assert [word for word in BUDGET_WORDS if word in lowered] == [], text
+
+
+def assert_no_call_counter(rig: Rig) -> None:
+    """The rig's runner holds no budget and stack exposes none: no dev_budget, no DevBudget, no DEV_BUDGET_*."""
+    assert not hasattr(rig.agent, 'dev_budget')
+    assert [name for name in vars(rig.agent) if 'budget' in name.lower() or 'charge' in name.lower()] == []
+    assert not hasattr(stack, 'DevBudget')
+    assert not hasattr(stack, 'DEV_BUDGET_LIMIT')
+    assert not hasattr(stack, 'DEV_BUDGET_WINDOW_SECONDS')
+    assert [name for name in dir(stack) if 'budget' in name.lower()] == []
 
 
 # A valid call of every verb. A verb added to AgentStack without an entry here fails
-# test_every_verb_has_a_sample, so parameterised tests cannot silently skip it. Exactly the fifteen
-# verbs of ADR tj-4rr0la addenda 26 (5) and 27 (4), under today's names (the rename is tj-iee6sn.26).
+# test_every_verb_has_a_sample, so parameterised tests cannot silently skip it. Exactly the sixteen
+# verbs of ADR tj-4rr0la addenda 26 (5) and 27 (4), under today's names (the rename is tj-iee6sn.26), and
+# the three of addendum 32 (tj-7zjov1.268): nineteen.
 VERB_SAMPLES: Mapping[str, dict[str, Any]] = {
     'migrate': {},
     'migrate_status': {},
     'run_system_tests': {'worktree': WORKTREE_NAME, 'paths': ['tests/system/test_one.py']},
     'seed_dump': {'worktree': WORKTREE_NAME},
+    'test_reset': {},
+    'test_stop': {'service': 'data_store'},
+    'test_start': {'service': 'data_store'},
+    'test_env': {'service': 'data_store', 'overrides': {'PANEL_MANAGER_ENABLED': 'false'}},
     'logs': {'service': 'postgres', 'tail': 50},
     'ps': {},
     'db_tables': {},
@@ -671,6 +855,15 @@ VERB_SAMPLES: Mapping[str, dict[str, Any]] = {
     'tools': {},
     'test_build': {},
     'test_up': {},
+}
+# A valid call of each SESSION verb (ADR tj-4rr0la addendum 34). Kept out of VERB_SAMPLES on purpose: the
+# parameterised sweeps over VERB_SAMPLES are about docker steps and their classes, and a session verb runs
+# none (test_session_grant.py pins that). test_every_verb_has_a_sample holds the two maps to the verb table
+# together, so a new verb still needs a sample in one of them.
+SESSION_VERB_SAMPLES: Mapping[str, dict[str, Any]] = {
+    'stack_session_open_test': {'bead': 'tj-ab12cd.4', 'verbs': 'test-campaign', 'purpose': 'sample open'},
+    'stack_session_open_dev': {'bead': 'tj-ab12cd.4', 'verbs': ['build', 'up'], 'purpose': 'sample open'},
+    'stack_session_close': {},
 }
 # Verbs that run no docker at all. None since tj-irhy0a.22 wired seed_dump; kept so a future verb
 # that runs no docker is classified here rather than tripping the docker sweeps.
@@ -695,6 +888,10 @@ DEV_PROJECT_VERBS = frozenset(
         # tj-iee6sn.10: the unified pair acts on the one project (DEV or TEST mode), not the agent stack.
         'migrate',
         'migrate_status',
+        # tj-w0rddi: the test-mode rails, then one exec into the postgres container, on the one project.
+        'test_reset',
+        # tj-7zjov1.268: test_reset's rails plus the any-state service lookups, then ONE compose step.
+        *TEST_SERVICE_VERBS,
     }
 )
 # The subset that runs PLAIN docker -- a label lookup, then `docker exec` -- rather than the dev

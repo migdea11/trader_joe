@@ -31,6 +31,13 @@ CLIENT_ID_HEADER: Final = 'X-Client-Id'
 # The one definition: the /ui/v1 write beads reuse it for the actor they record.
 OPERATOR_PRINCIPAL: Final = 'operator'
 
+# THE RESERVED OWNER of the datasets the panel manager creates (ADR tj-26jt9w addendum 20). The one definition of the string
+# 'panel'. It is reserved like any non-operator owner: an operator write on its datasets needs the override reason
+# (dataset_override.overriding_reason), and POST /store refuses a caller claiming it (routers/data_store/
+# asset_dataset_store.py). The panel manager's own path is not guarded. It is also the client_label of the ingest
+# requests the manager writes, which the request-rate window counts.
+PANEL_OWNER: Final = 'panel'
+
 UNATTRIBUTED: Final = '_unattributed'
 OVERFLOW: Final = '_overflow'
 RESERVED_PREFIX: Final = '_'

@@ -21,6 +21,7 @@ import inspect
 import json
 import pkgutil
 from datetime import UTC, datetime, timedelta, timezone
+from enum import StrEnum
 from typing import Any
 from uuid import UUID
 
@@ -29,12 +30,27 @@ from pydantic import BaseModel, ValidationError
 
 import schemas.data_ingest
 from common.enums.data_stock import ExpiryType, Feed, UpdateType
+from schemas.data_ingest.delivery import (
+    AssetRecord,
+    AssetRecords,
+    AttemptDelivery,
+    CorporateActionRecord,
+    CorporateActionRecords,
+    DeliverAttemptResponse,
+    DeliveryHeader,
+    DeliveryOutcome,
+    DeliveryTrailer,
+    DeliveryVerdict,
+    RegisterInstanceRequest,
+    RegisterInstanceResponse,
+    VendorCallStats,
+    VendorReported,
+)
 from schemas.data_ingest.fetch_dataset import (
     Bar,
     BarPage,
     FetchAccepted,
     FetchDatasetRequest,
-    FetchDone,
     FetchRefused,
     ServedRange,
 )
@@ -46,6 +62,18 @@ from schemas.data_ingest.get_dataset_request import (
     StockDatasetRequest,
 )
 from schemas.data_ingest.quote import QuoteResult, ScopeCapacity
+from schemas.data_ingest.submit import (
+    AssetListRequest,
+    AssetListStatus,
+    BarsRequest,
+    CorporateActionsRequest,
+    InstanceRequest,
+    InstanceResponse,
+    SubmitAccepted,
+    SubmitAck,
+    SubmitRequest,
+    SubmitResponse,
+)
 
 
 pytestmark = pytest.mark.data_ingest
@@ -60,6 +88,10 @@ EXPECTED_MODULES = frozenset(
         'schemas.data_ingest.fetch_dataset',
         # tj-grna9p.44 item 8b: the domain side of the internal Quote call.
         'schemas.data_ingest.quote',
+        # P08 (tj-7zjov1.15): the domain side of Submit and Instance on ingest.proto.
+        'schemas.data_ingest.submit',
+        # P32 (tj-7zjov1.16): the domain side of DeliverAttempt and RegisterInstance on store.proto.
+        'schemas.data_ingest.delivery',
     }
 )
 
@@ -128,6 +160,15 @@ _BAR_PAYLOAD: dict[str, Any] = {
 }
 _SERVED_RANGE_PAYLOAD: dict[str, Any] = {'start': WHEN, 'end': WHEN}
 _SCOPE_PAYLOAD: dict[str, Any] = {'quota_key': 'alpaca-a', 'cap': 200, 'remaining': 150, 'window_seconds': 60}
+# The Submit request's bars arm: FetchDatasetRequest's fields minus the envelope (owner).
+_BARS_REQUEST_PAYLOAD: dict[str, Any] = {key: value for key, value in _FETCH_REQUEST_PAYLOAD.items() if key != 'owner'}
+# status is required (tj-7zjov1.105): a request always names which of the vendor's two lists it wants.
+_ASSET_LIST_PAYLOAD: dict[str, Any] = {'source': 'ALPACA', 'asset_type': 'stock', 'status': AssetListStatus.ACTIVE}
+# The SubmitRequest envelope's required fields. A kind arm is required too, by the oneof validator rather
+# than as a field, which is why the model is covered by its own test below.
+_SUBMIT_ENVELOPE: dict[str, Any] = {'request_id': 'request-1', 'owner': 'rebalancer'}
+_HEADER_PAYLOAD: dict[str, Any] = {'request_id': 'request-1', 'instance_id': 'ingest-1', 'attempt_no': 1}
+_TRAILER_PAYLOAD: dict[str, Any] = {'outcome': DeliveryOutcome.SUCCEEDED}
 
 # Every public model in the package, with a minimal valid payload. Minimal means: every required
 # field and nothing else.
@@ -143,16 +184,46 @@ CONSTRUCT_CASES: list[tuple[type[BaseModel], dict[str, Any]]] = [
     (FetchAccepted, {'feed': Feed.IEX}),
     (FetchRefused, {'reason': 'FEED_NOT_AVAILABLE', 'domain': 'trader-joe', 'detail': 'no SIP entitlement'}),
     (ServedRange, _SERVED_RANGE_PAYLOAD),
-    (FetchDone, {'bar_count': 0, 'served_range': ServedRange(**_SERVED_RANGE_PAYLOAD), 'as_of': WHEN}),
     # reset_at is optional (None when the scope has no known reset), so it is not in the minimal set.
     (ScopeCapacity, _SCOPE_PAYLOAD),
     (QuoteResult, {'estimated_vendor_calls': 0, 'quota_key': 'alpaca-a', 'scopes': [ScopeCapacity(**_SCOPE_PAYLOAD)]}),
+    # submit.py (tj-7zjov1.15). SubmitRequest and SubmitAck carry a oneof and are covered below instead.
+    (BarsRequest, _BARS_REQUEST_PAYLOAD),
+    (AssetListRequest, _ASSET_LIST_PAYLOAD),
+    (CorporateActionsRequest, {'source': 'ALPACA', 'asset_symbol': 'VFV', 'start': WHEN, 'end': WHEN}),
+    (SubmitAccepted, {'quota_key': 'alpaca-a'}),
+    (SubmitResponse, {'ack': SubmitAck(accepted=SubmitAccepted(quota_key='alpaca-a')), 'instance_id': 'ingest-1'}),
+    (InstanceResponse, {'instance_id': 'ingest-1', 'started_at': WHEN}),
+    # delivery.py (tj-7zjov1.16).
+    (DeliveryHeader, _HEADER_PAYLOAD),
+    (VendorCallStats, {'calls': 0, 'pages': 0, 'throttled_429': 0, 'retries': 0}),
+    (DeliveryTrailer, _TRAILER_PAYLOAD),
+    (AssetRecord, {'vendor_asset_id': 'a-1', 'symbol': 'VFV', 'raw_payload': b'{}'}),
+    (AssetRecords, {'records': []}),
+    (CorporateActionRecord, {'vendor_action_id': 'ca-1', 'action_type': 'split', 'raw_payload': b'{}'}),
+    (CorporateActionRecords, {'records': []}),
+    (AttemptDelivery, {'header': DeliveryHeader(**_HEADER_PAYLOAD), 'trailer': DeliveryTrailer(**_TRAILER_PAYLOAD)}),
+    (DeliverAttemptResponse, {'verdict': DeliveryVerdict.FINAL, 'attempt_count': 1}),
+    (RegisterInstanceRequest, {'instance_id': 'ingest-1', 'started_at': WHEN}),
 ]
 
-# Public classes in the package that are NOT Pydantic models, and so are covered by a dedicated
-# test rather than by the construct/reject pair. Empty here; see the data_store module for the
-# case this list exists for.
-KNOWN_NON_MODELS: frozenset[str] = frozenset()
+# Models whose every field has a default, so `{}` is VALID and the reject-empty half cannot apply. Each
+# is driven instead by test_all_optional_model_accepts_empty_and_rejects_a_constraint_violation: `{}`
+# constructs, and the payload listed here violates the named field's constraint.
+CONSTRAINT_CASES: list[tuple[type[BaseModel], dict[str, Any], str]] = [
+    # Absent is not zero (proto3 optional); a negative count is still refused, as the wire is unsigned.
+    (VendorReported, {'limit': -1}, 'limit')
+]
+
+# Models that declare NO field at all: the call's message is empty on the wire, so `{}` is the only
+# valid payload and there is no constraint to violate. Pinned by test_a_fieldless_model_accepts_only_empty.
+FIELDLESS_MODELS: list[type[BaseModel]] = [InstanceRequest, RegisterInstanceResponse]
+
+# Public classes in the package that are NOT Pydantic models. The five here are the StrEnums the
+# contracts name; test_every_known_non_model_is_an_enum keeps the list from hiding a model.
+KNOWN_NON_MODELS: frozenset[str] = frozenset(
+    {'RequestKind', 'DeliveryOutcome', 'DeliveryErrorClass', 'DeliveryVerdict', 'AssetListStatus'}
+)
 
 # Models the construct/reject PAIR cannot express, each with the dedicated test that covers it
 # instead. Distinct from KNOWN_NON_MODELS above, which is about classes that are not models at all --
@@ -164,7 +235,12 @@ KNOWN_NON_MODELS: frozenset[str] = frozenset()
 # is a `value_error` naming no field rather than a set of `missing` ones. Covered instead by
 # test_an_ack_sets_exactly_one_arm in schemas/tests/test_fetch_dataset_contract.py, which asserts
 # both failing directions and both arms; a second copy here would be the same assertion twice.
-COVERED_BY_A_DEDICATED_TEST: frozenset[str] = frozenset({'FetchAck'})
+#
+# SubmitAck is the same shape as FetchAck, and SubmitRequest is the other oneof: its empty payload reports
+# request_id and owner missing, but its minimal VALID payload also needs one kind arm, which the oneof
+# validator requires and the missing-set cannot name. Both are covered by
+# test_a_submit_oneof_model_constructs_with_one_arm_and_refuses_the_rest below.
+COVERED_BY_A_DEDICATED_TEST: frozenset[str] = frozenset({'FetchAck', 'SubmitAck', 'SubmitRequest'})
 
 
 def _public_classes(module) -> set[str]:
@@ -219,11 +295,144 @@ def test_every_public_model_is_covered():
     Without this the construct/reject pair silently stops being a smoke test of the package and
     becomes a smoke test of whatever someone last remembered to list.
     """
-    covered = {model.__name__ for model, _ in CONSTRUCT_CASES} | KNOWN_NON_MODELS | COVERED_BY_A_DEDICATED_TEST
+    covered = (
+        {model.__name__ for model, _ in CONSTRUCT_CASES}
+        | {model.__name__ for model, _, _ in CONSTRAINT_CASES}
+        | {model.__name__ for model in FIELDLESS_MODELS}
+        | KNOWN_NON_MODELS
+        | COVERED_BY_A_DEDICATED_TEST
+    )
     declared = set()
     for module_name in sorted(EXPECTED_MODULES):
         declared |= _public_classes(importlib.import_module(module_name))
     assert declared == covered
+
+
+def _package_class(name: str) -> type:
+    """Return the public class ``name`` from whichever module of the package defines it.
+
+    Args:
+        name: A public class name.
+
+    Returns:
+        type: The class.
+    """
+    for module_name in sorted(EXPECTED_MODULES):
+        module = importlib.import_module(module_name)
+        if name in _public_classes(module):
+            return getattr(module, name)
+    raise LookupError(name)
+
+
+@pytest.mark.parametrize('name', sorted(KNOWN_NON_MODELS))
+def test_every_known_non_model_is_an_enum(name: str):
+    """KNOWN_NON_MODELS exempts a class from every model case, so it must not be able to hide a model.
+
+    Args:
+        name: A name the list exempts.
+    """
+    cls = _package_class(name)
+    assert issubclass(cls, StrEnum)
+    assert not issubclass(cls, BaseModel)
+
+
+def test_every_public_model_in_the_package_forbids_extras():
+    """The strict-receiver base, as a property of the WHOLE package rather than of the listed cases.
+
+    Every model here is received across the store and ingest hop, so every one inherits InboundContract.
+    Derived from the package's own classes, so a new model that forgot the base reds here naming itself.
+    """
+    lax = {}
+    for module_name in sorted(EXPECTED_MODULES):
+        module = importlib.import_module(module_name)
+        for name in sorted(_public_classes(module)):
+            model = getattr(module, name)
+            if issubclass(model, BaseModel) and model.model_config.get('extra') != 'forbid':
+                lax[name] = model.model_config.get('extra')
+    assert not lax, f'models that do not forbid unknown fields: {lax}'
+
+
+@pytest.mark.parametrize(('model', 'payload', 'field'), CONSTRAINT_CASES, ids=_case_id)
+def test_all_optional_model_accepts_empty_and_rejects_a_constraint_violation(
+    model: type[BaseModel], payload: dict[str, Any], field: str
+):
+    """The pair that replaces empty-payload rejection where ``{}`` is valid.
+
+    Args:
+        model: The model class.
+        payload: A payload that violates the declared constraint.
+        field: The field the violation is expected to be reported against.
+    """
+    assert model().model_dump(exclude_unset=True) == {}
+    with pytest.raises(ValidationError) as excinfo:
+        model(**payload)
+    assert [error['loc'] for error in excinfo.value.errors()] == [(field,)]
+
+
+@pytest.mark.parametrize('model', FIELDLESS_MODELS, ids=_case_id)
+def test_a_fieldless_model_accepts_only_empty(model: type[BaseModel]):
+    """An empty message on the wire: no field to require, and an unknown one is still refused.
+
+    Args:
+        model: The fieldless model.
+    """
+    assert model.model_fields == {}
+    assert model().model_dump() == {}
+    with pytest.raises(ValidationError) as excinfo:
+        model(a_field_no_contract_declares=1)
+    assert [(error['loc'], error['type']) for error in excinfo.value.errors()] == [
+        (('a_field_no_contract_declares',), 'extra_forbidden')
+    ]
+
+
+_SUBMIT_ARMS: dict[str, BaseModel] = {
+    'bars': BarsRequest(**_BARS_REQUEST_PAYLOAD),
+    'asset_list': AssetListRequest(**_ASSET_LIST_PAYLOAD),
+    'corporate_actions': CorporateActionsRequest(source='ALPACA', asset_symbol='VFV', start=WHEN, end=WHEN),
+}
+_ACK_ARMS: dict[str, BaseModel] = {
+    'accepted': SubmitAccepted(quota_key='alpaca-a'),
+    'refused': FetchRefused(reason='FEED_NOT_AVAILABLE', domain='trader-joe', detail='no SIP entitlement'),
+}
+
+
+@pytest.mark.parametrize(
+    ('model', 'envelope', 'arms'),
+    [(SubmitRequest, _SUBMIT_ENVELOPE, _SUBMIT_ARMS), (SubmitAck, {}, _ACK_ARMS)],
+    ids=_case_id,
+)
+def test_a_submit_oneof_model_constructs_with_one_arm_and_refuses_the_rest(
+    model: type[BaseModel], envelope: dict[str, Any], arms: dict[str, BaseModel]
+):
+    """The smoke pair for the two oneof models, which CONSTRUCT_CASES cannot express (see above).
+
+    Each arm alone constructs; no arm and two arms are refused by the oneof validator; the empty payload
+    names exactly the envelope's required fields; an unknown field is refused as extra.
+
+    Args:
+        model: SubmitRequest or SubmitAck.
+        envelope: The required fields beside the oneof.
+        arms: One valid value per oneof arm.
+    """
+    for arm, value in arms.items():
+        instance = model(**envelope | {arm: value})
+        assert set(envelope) | {arm} <= instance.model_fields_set
+
+    first, second = list(arms)[:2]
+    for payload in (envelope, envelope | {first: arms[first], second: arms[second]}):
+        with pytest.raises(ValidationError) as excinfo:
+            model(**payload)
+        assert [error['type'] for error in excinfo.value.errors()] == ['value_error'], payload
+
+    with pytest.raises(ValidationError) as excinfo:
+        model()
+    assert {str(error['loc'][0]) for error in excinfo.value.errors() if error['type'] == 'missing'} == set(envelope)
+
+    with pytest.raises(ValidationError) as excinfo:
+        model(**envelope | {first: arms[first], 'a_field_no_contract_declares': 1})
+    assert [(error['loc'], error['type']) for error in excinfo.value.errors()] == [
+        (('a_field_no_contract_declares',), 'extra_forbidden')
+    ]
 
 
 @pytest.mark.parametrize(('model', 'payload'), CONSTRUCT_CASES, ids=_case_id)
@@ -250,7 +459,13 @@ def test_model_rejects_empty_payload(model: type[BaseModel], payload: dict[str, 
     assert missing == set(payload)
 
 
-@pytest.mark.parametrize(('model', 'payload'), CONSTRUCT_CASES, ids=_case_id)
+@pytest.mark.parametrize(
+    ('model', 'payload'),
+    # The constraint cases contribute `{}`, not their listed payload, which violates their constraint and
+    # would add a second error beside the unknown key.
+    CONSTRUCT_CASES + [(model, {}) for model, _, _ in CONSTRAINT_CASES],
+    ids=_case_id,
+)
 def test_model_rejects_an_unknown_field(model: type[BaseModel], payload: dict[str, Any]):
     """Every request shape here is RECEIVED, so every one rejects a field it does not declare.
 
@@ -484,3 +699,43 @@ def test_a_json_round_trip_keeps_every_offset(model: type[BaseModel], end: datet
             assert getattr(received, field) is None
         else:
             assert getattr(received, field).utcoffset() == value.utcoffset(), f'{field} lost its offset'
+
+
+def test_the_delivery_outcome_vocabulary_is_exactly_the_four_ruled_outcomes():
+    """EXHAUSTED joins as its own member (tj-wisp-g9rmw0 ruling 1), its value its name like the rest."""
+    assert {member.name: member.value for member in DeliveryOutcome} == {
+        'SUCCEEDED': 'SUCCEEDED',
+        'FAILED': 'FAILED',
+        'EXPIRED': 'EXPIRED',
+        'EXHAUSTED': 'EXHAUSTED',
+    }
+
+
+@pytest.mark.parametrize('name', ['EXPIRED', 'EXHAUSTED'])
+def test_a_no_call_trailer_carries_no_cross_field_rule_in_this_layer(name: str):
+    """The carrying model judges no combination: P34 (tj-7zjov1.27), the store, owns those rules.
+
+    Ruled at the P32 gate and restated on tj-7zjov1.64: EXHAUSTED is shaped as EXPIRED, but nothing here
+    refuses a no-call trailer that carries stats, so the descriptor-driven round trip can populate every
+    field. Its defaults are the no-call shape.
+
+    Args:
+        name: EXPIRED or EXHAUSTED, looked up here so a missing member reds this test and not the module.
+    """
+    outcome = DeliveryOutcome[name]
+    bare = DeliveryTrailer(outcome=outcome)
+    loaded = DeliveryTrailer(
+        outcome=outcome,
+        vendor_stats=VendorCallStats(calls=1, pages=1, throttled_429=0, retries=0),
+        as_of=WHEN,
+        last_attempt=True,
+    )
+
+    assert (bare.vendor_stats, bare.served_range, bare.as_of, bare.error_class, bare.last_attempt) == (
+        None,
+        None,
+        None,
+        None,
+        False,
+    )
+    assert loaded.outcome is outcome

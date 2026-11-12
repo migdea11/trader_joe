@@ -18,17 +18,17 @@ class BaseGetDatasetRequest(InboundContract):
     source: DataSource
     # KEPT, BUT INERT TODAY, AND THE COMMENT THAT USED TO SIT HERE OVERSTATED IT. It claimed this
     # was "the only model where that optionality is meant to end" -- that the adapter would take
-    # the caller's selection when there is one. NOTHING IN data/ingest READS THIS FIELD. The one
-    # resolution site (alpaca/broker_api.py, `'sip' if sip_enabled() else 'iex'`) consults a
-    # deployment env var and never the request, so a request naming a tape is accepted and
-    # ignored -- exactly the failure schemas/inbound_contract.py exists to prevent, arriving
-    # through a field rather than past one.
+    # the caller's selection when there is one. NOTHING IN data/ingest READS THIS FIELD. The Alpaca
+    # handle decides the feed per request from the request it is handed (SIP by default, IEX only
+    # when a request names it; no setting), but it is never handed this model, so a tape named
+    # here is accepted and ignored -- exactly the failure schemas/inbound_contract.py exists to
+    # prevent, arriving through a field rather than past one.
     #
     # WHY IT SURVIVES ANYWAY, while StoreAssetDatasetBody.feed did not: nothing can populate it
     # now. tj-rh4b7f (2026-09-25) deferred caller-selected feed, so there is no feed to forward.
     # NOTE, tj-mzaub8: this comment used to call the model the store->ingest channel and the
-    # designated landing site for that deferred work. It is neither any more. The live
-    # store->ingest channel is FetchDatasetRequest (schemas/data_ingest/fetch_dataset.py) over
+    # designated landing site for that deferred work. It is neither any more. The store sends
+    # ingest a SubmitRequest (schemas/data_ingest/submit.py; its bars arm is BarsRequest) over
     # gRPC, and this module has no non-test importer left. Caller-selected feed lands there, not
     # here. The model is retained but off every live path; its fate is undecided.
     #
@@ -40,7 +40,7 @@ class BaseGetDatasetRequest(InboundContract):
     # AwareDatetime, REFUSE not convert (user ruling D2 = A on tj-vhboky.20, the tj-1bl90i rule).
     # The sender this was written for, data/store/app/ingest/data_action_request.py, built it from
     # StoreAssetDatasetBody over an RPC that carried model_dump_json(). That path is gone: it now
-    # builds a FetchDatasetRequest instead, and this model has no sender at all.
+    # builds a SubmitRequest from the stored request row, and this model has no sender at all.
     start: AwareDatetime
     end: AwareDatetime | None
 

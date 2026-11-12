@@ -1,6 +1,6 @@
 <script setup lang="ts">
 // A status dot plus its label, from a BadgeSpec (theme/semantics.ts). The label carries the
-// meaning; the colour only supports it. Pass the spec from freshnessBadge(), collectionBadge(),
+// meaning; the colour only supports it. Pass the spec from healthBadge(), collectionBadge(),
 // requestBadge() or STALE_BADGE rather than a literal.
 import type { BadgeSpec } from '@/theme/semantics'
 

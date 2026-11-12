@@ -2,8 +2,7 @@
 
 **The source of truth for everything that crosses the gRPC wire.** The `.proto` files here are
 written by hand, and every consumer generates its code from them. Nothing in this directory is
-generated, and nothing in it is Python. (ADR tj-8konfu D1, with this root home from addendum A1; the
-generated layout is decision tj-3mk3u5.42, addendum F1.)
+generated, and nothing in it is Python.
 
 Pydantic models stay the internal domain representation and keep the REST surface, with one
 exception: the `/ui/v1` routes answer with the protobuf canonical JSON of a `trader_joe.proto.ui.v1`
@@ -37,14 +36,14 @@ contract**: nothing depends on its shape, and the first real contract does not e
 import "trader_joe/proto/market/v1/<file>.proto";
 ```
 
-Domain messages are imported, never copied: duplicated structures drift out of sync. The hierarchy,
-accepted as a starting point (tj-3mk3u5.42 F1, rule 8):
+Domain messages are imported, never copied: duplicated structures drift out of sync. The hierarchy
+is:
 
 | Package | Holds |
 |---|---|
 | `trader_joe.proto.market.v1` | The shared vocabulary: `Bar` and the market-data enums. Imports `google/protobuf` only. |
-| `trader_joe.proto.internal.ingest.v1` | `FetchDataset`, the data_store to data_ingest contract. `Quote` is declared here too and is **reserved**: no server and no caller. |
-| `trader_joe.proto.internal.store.v1` | `StoreService.Bootstrap`, data_ingest to data_store at start-up. **Reserved**: declared, no server and no caller, and due to be rewritten. |
+| `trader_joe.proto.internal.ingest.v1` | `Submit`, `Instance` and `Quote`, the data_store to data_ingest contract. `Quote` is **reserved**: no server and no caller. |
+| `trader_joe.proto.internal.store.v1` | `StoreService.DeliverAttempt` (client-streaming; ingest reports each attempt, success or failure, and the answer is the acknowledgement) and `StoreService.RegisterInstance` (ingest announces its instance id at start), data_ingest to data_store. `Bootstrap` is removed. Internal: buf's breaking checks ignore the package. |
 | `trader_joe.proto.internal.latency.v1` | The latency harness probe, `LatencyService.Probe`. Internal: both ends deploy together. |
 | `trader_joe.proto.data.v1` | The external streaming contract. The name is provisional. |
 | `trader_joe.proto.ui.v1` | The UI's messages, served as protobuf canonical JSON over REST (and, for events, over a WebSocket), never as binary. Ranges in it are half-open `[start, end)`. `data.proto`: datasets, facets, bar pages and runs (`IngestRun`, `IngestRunPage`); `stats.proto`: `CoverageStrip`; `events.proto`: `UiEvent`; `shell.proto`: the shell configuration. **Served:** the dataset, facet, bar, run and coverage messages and `UiEvent` with `DatasetChanged` and `IngestRunChanged`. **Reserved, no server, and due to change before the SDK release:** the request and request-log messages in `data.proto` and `ops.proto`, the collection statistics in `stats.proto`, and `RequestChanged` and `ReaperPendingChanged`. |
@@ -114,7 +113,7 @@ The Python tree mirrors the proto packages, so protoc's imports resolve as it wr
   under compose: the root env file, copied from `.env.default`, carries a legacy, host-side-only
   `PYTHONPATH=./`, every service loads it through `env_file:`, and `env_file:` outranks the
   image's `ENV`.
-  `environment:` outranks both (decision tj-3mk3u5.42, addendum F1-A).
+  `environment:` outranks both.
 
 A process outside pytest that imports `common.rpc` needs `gen/proto/python` on its `PYTHONPATH`, as
 the image has it.
@@ -178,7 +177,7 @@ The configuration is `buf.yaml` at the repository root:
   agent's worktree and in CI, which compares against a fresh `origin/main`. A local `main` can lag
   `origin/main`. That is acceptable while the check is report-only. While `main` has no `proto/`, the
   check says `nothing to compare` and passes.
-- **Report-only until the first SDK release** (tj-d2mhru), while the compatibility window above is
+- **Report-only until the first SDK release**, while the compatibility window above is
   open. A break is printed, under a `REPORT-ONLY` banner, and in CI it is annotated on the pull request,
   but it does not fail. At the release, one Makefile line, `BUF_BREAKING_BLOCKING := 1`, makes it
   blocking. Report-only covers findings only: a check that cannot run fails in both modes. That means
@@ -205,6 +204,6 @@ covers `proto/`. It is never skipped.
 ## The one exception: errors
 
 The error vocabulary is not defined here. The closed `(domain, reason)` enum and the exception
-hierarchy are canonical in Python in `common/` (ADR tj-fa1rpu, U1). They cross the wire as
+hierarchy are canonical in Python in `common/`. They cross the wire as
 `google.rpc.Status` with an `ErrorInfo` carrying that `(reason, domain)` pair. Do not define reason
 enums in a `.proto`.

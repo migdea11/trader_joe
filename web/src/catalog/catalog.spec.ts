@@ -7,8 +7,8 @@ import { DataSource, DataType, Feed, Granularity, UpdateType } from '@generated/
 import {
   ClientKind,
   DatasetFacetsSchema,
+  DatasetHealthStatus,
   DatasetSummarySchema,
-  FreshnessStatus,
   IngestRunState,
 } from '@generated/trader_joe/proto/ui/v1/data_pb'
 
@@ -175,13 +175,13 @@ describe('facetCounts', () => {
       { updateType: UpdateType.STATIC, count: 12n },
     ],
     statuses: [
-      { status: FreshnessStatus.FRESH, count: 20n },
-      { status: FreshnessStatus.COMPLETE, count: 7n },
-      { status: FreshnessStatus.LATE, count: 2n },
-      { status: FreshnessStatus.OVERDUE, count: 1n },
-      { status: FreshnessStatus.GAPS, count: 3n },
-      { status: FreshnessStatus.RETIRED, count: 0n },
-      { status: FreshnessStatus.UNSPECIFIED, count: 7n },
+      { status: DatasetHealthStatus.FRESH, count: 20n },
+      { status: DatasetHealthStatus.COMPLETE, count: 7n },
+      { status: DatasetHealthStatus.LATE, count: 2n },
+      { status: DatasetHealthStatus.OVERDUE, count: 1n },
+      { status: DatasetHealthStatus.GAPS, count: 3n },
+      { status: DatasetHealthStatus.RETIRED, count: 0n },
+      { status: DatasetHealthStatus.UNSPECIFIED, count: 7n },
     ],
   })
 
@@ -259,32 +259,32 @@ describe('facetCounts', () => {
 
 describe('row labels and badge', () => {
   it.each([
-    [FreshnessStatus.FRESH, 'Healthy'],
-    [FreshnessStatus.COMPLETE, 'Healthy'],
-    [FreshnessStatus.LATE, 'Late'],
-    [FreshnessStatus.OVERDUE, 'Failed'],
-    [FreshnessStatus.GAPS, 'Failed'],
+    [DatasetHealthStatus.FRESH, 'Healthy'],
+    [DatasetHealthStatus.COMPLETE, 'Healthy'],
+    [DatasetHealthStatus.LATE, 'Late'],
+    [DatasetHealthStatus.OVERDUE, 'Failed'],
+    [DatasetHealthStatus.GAPS, 'Failed'],
     // tj-grna9p.177 (decision tj-hhy3dk): RETIRED is collect off, and the UI reads it Stopped.
-    [FreshnessStatus.RETIRED, 'Stopped'],
-    [FreshnessStatus.UNSPECIFIED, 'Unknown'],
-  ])('freshness %s renders %s', (status, label) => {
-    expect(rowBadge(create(DatasetSummarySchema, { freshness: { status } })).label).toBe(label)
+    [DatasetHealthStatus.RETIRED, 'Stopped'],
+    [DatasetHealthStatus.UNSPECIFIED, 'Unknown'],
+  ])('health %s renders %s', (status, label) => {
+    expect(rowBadge(create(DatasetSummarySchema, { health: { status } })).label).toBe(label)
   })
 
-  it('a row with no freshness at all is Unknown, never Healthy', () => {
+  it('a row with no health at all is Unknown, never Healthy', () => {
     expect(rowBadge(create(DatasetSummarySchema, {})).label).toBe('Unknown')
   })
 
   // tj-grna9p.77: the Collection badge is Running while the latest run is in flight, WHATEVER the
-  // freshness says (a Late or Failed dataset may be running its catch-up); otherwise the freshness word.
+  // health says (a Late or Failed dataset may be running its catch-up); otherwise the health word.
   it.each([
-    FreshnessStatus.FRESH,
-    FreshnessStatus.LATE,
-    FreshnessStatus.GAPS,
-    FreshnessStatus.RETIRED,
-    FreshnessStatus.UNSPECIFIED,
-  ])('a RUNNING last run reads Running over freshness %s', (status) => {
-    const row = create(DatasetSummarySchema, { freshness: { status }, lastRun: { state: IngestRunState.RUNNING } })
+    DatasetHealthStatus.FRESH,
+    DatasetHealthStatus.LATE,
+    DatasetHealthStatus.GAPS,
+    DatasetHealthStatus.RETIRED,
+    DatasetHealthStatus.UNSPECIFIED,
+  ])('a RUNNING last run reads Running over health %s', (status) => {
+    const row = create(DatasetSummarySchema, { health: { status }, lastRun: { state: IngestRunState.RUNNING } })
     expect(isRunning(row)).toBe(true)
     expect(rowBadge(row)).toEqual(RUNNING_BADGE)
   })
@@ -298,14 +298,14 @@ describe('row labels and badge', () => {
     [IngestRunState.EMPTY, 'Late'],
     [IngestRunState.FAILED, 'Late'],
     [IngestRunState.UNSPECIFIED, 'Late'],
-  ])('a finished last run (%s) leaves the freshness word: %s', (state, label) => {
-    const row = create(DatasetSummarySchema, { freshness: { status: FreshnessStatus.LATE }, lastRun: { state } })
+  ])('a finished last run (%s) leaves the health word: %s', (state, label) => {
+    const row = create(DatasetSummarySchema, { health: { status: DatasetHealthStatus.LATE }, lastRun: { state } })
     expect(isRunning(row)).toBe(false)
     expect(rowBadge(row).label).toBe(label)
   })
 
   it('no last run is not running', () => {
-    expect(isRunning(create(DatasetSummarySchema, { freshness: { status: FreshnessStatus.FRESH } }))).toBe(false)
+    expect(isRunning(create(DatasetSummarySchema, { health: { status: DatasetHealthStatus.FRESH } }))).toBe(false)
   })
 
   it('the row and its Symbol open the Dataset detail; the Viewer keeps its own route', () => {

@@ -1,0 +1,19 @@
+{
+  "provenance": {
+    "kind": "recorded",
+    "recorded_at": "2026-10-24T19:42:43.139514+00:00",
+    "endpoint": "GET https://data.alpaca.markets/v1/corporate-actions",
+    "params": {
+      "symbols": "SIVB",
+      "start": "2015-01-01",
+      "end": "2026-10-24",
+      "limit": "1000",
+      "sort": "asc"
+    },
+    "byte_length": 342,
+    "sha256": "dff01217dc915b8e74883cc3340719fd3bb8814cfe07dde4038e2c348f312236",
+    "note": "Captured through the dev vendor probe (P27a s10/s10x, tj-7zjov1.7). body_text is the body as served, byte for byte: its length and sha256 are the capture's own."
+  },
+  "status": 200,
+  "body_text": "{\"corporate_actions\":{\"stock_and_cash_mergers\":[{\"acquiree_cusip\":\"101119105\",\"acquiree_rate\":1,\"acquiree_symbol\":\"BPFH\",\"acquirer_cusip\":\"78486Q101\",\"acquirer_rate\":0.0228,\"acquirer_symbol\":\"SIVB\",\"cash_rate\":2.1,\"effective_date\":\"2021-07-01\",\"id\":\"69dbd57d-28b8-41bb-bb0b-c34e9409ba62\",\"process_date\":\"2021-07-01\"}]},\"next_page_token\":null}"
+}

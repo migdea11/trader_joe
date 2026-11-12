@@ -4,10 +4,12 @@ Expiry is the deletion date only; whether a DAILY or STREAM subscription is bein
 operator intent. On the wire that is ADDITIVE and renames nothing:
 
 * every enum NAME and NUMBER is kept, RETIRED included (renaming it belongs to tj-grna9p.168), pinned here
-  with numbers so a renumbering is red in the unit suite and not only in the buf step;
+  with numbers so a renumbering is red in the unit suite and not only in the buf step. tj-grna9p.168 has
+  since renamed FreshnessStatus to DatasetHealthStatus (prefix DATASET_HEALTH_STATUS_) at the SAME numbers,
+  RETIRED kept: the pin below carries the new names and the unchanged numbers;
 * RESUMED is documented as RETIRED's counterpart: collecting again (tj-grna9p.182, finding F3);
 * RETIRED is re-documented as "a subscription whose collect intent is false", in data.proto (DatasetState,
-  FreshnessStatus), events.proto (DatasetChange) and ops.proto (OpsHealth.retired);
+  DatasetHealthStatus), events.proto (DatasetChange) and ops.proto (OpsHealth.retired);
 * DatasetSummary gains ``optional bool collecting = 23`` (derived: a subscription's intent; STATIC, a fetch in
   progress), appended after the phase 3 fields;
 * ``SetCollectingRequest { optional bool collect = 1; OperatorOverride override = 2; }``, the same
@@ -73,14 +75,14 @@ KEPT_ENUMS = {
         ('DATASET_STATE_ACTIVE', 1),
         ('DATASET_STATE_RETIRED', 2),
     ],
-    (DATA, 'FreshnessStatus'): [
-        ('FRESHNESS_STATUS_UNSPECIFIED', 0),
-        ('FRESHNESS_STATUS_FRESH', 1),
-        ('FRESHNESS_STATUS_LATE', 2),
-        ('FRESHNESS_STATUS_OVERDUE', 3),
-        ('FRESHNESS_STATUS_COMPLETE', 4),
-        ('FRESHNESS_STATUS_GAPS', 5),
-        ('FRESHNESS_STATUS_RETIRED', 6),
+    (DATA, 'DatasetHealthStatus'): [
+        ('DATASET_HEALTH_STATUS_UNSPECIFIED', 0),
+        ('DATASET_HEALTH_STATUS_FRESH', 1),
+        ('DATASET_HEALTH_STATUS_LATE', 2),
+        ('DATASET_HEALTH_STATUS_OVERDUE', 3),
+        ('DATASET_HEALTH_STATUS_COMPLETE', 4),
+        ('DATASET_HEALTH_STATUS_GAPS', 5),
+        ('DATASET_HEALTH_STATUS_RETIRED', 6),
     ],
     (EVENTS, 'DatasetChange'): [
         ('DATASET_CHANGE_UNSPECIFIED', 0),
@@ -229,10 +231,12 @@ def test_dataset_state_documents_retired_as_a_subscription_not_collecting():
     assert 'expiry has been set' not in text and 'no longer collects' not in text, text
 
 
-def test_freshness_retired_documents_a_subscription_not_collecting():
-    text = _comments(DATA, _enum_path(DATA, 'FreshnessStatus', 'FRESHNESS_STATUS_RETIRED'))
+def test_dataset_health_retired_documents_a_subscription_not_collecting():
+    """'owes no freshness' became 'owes no recency' with the tj-grna9p.168 rename; the rest is unchanged."""
+    text = _comments(DATA, _enum_path(DATA, 'DatasetHealthStatus', 'DATASET_HEALTH_STATUS_RETIRED'))
     assert f'A DAILY or STREAM subscription whose {NOT_COLLECTING}' in text, text
-    assert 'owes no freshness' in text and 'deletion is its expiry, separately' in text, text
+    assert 'owes no recency' in text and 'deletion is its expiry, separately' in text, text
+    assert 'freshness' not in text.lower(), text
     assert 'The dataset is retired' not in text, text
 
 

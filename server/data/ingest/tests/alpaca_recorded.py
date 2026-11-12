@@ -7,7 +7,8 @@ can import it without importing a test module.
 
 The transport is a requests adapter mounted on the client's own session for BOTH http:// and
 https://, so every URL the SDK can build reaches it and nothing reaches a socket. It fails the test
--- rather than answering -- on any host other than Alpaca's data host, on a page token no fixture
+-- rather than answering -- on any host other than the one it serves (Alpaca's data host, or the invented
+trading host of stub_trading_vendor for the asset reads, tj-7zjov1.22), on a page token no fixture
 knows, and past a request cap, so a paging loop that never ends turns red instead of hanging.
 
 Fixture files live in fixtures/alpaca/ as JSON: {"provenance": {...}, "status": <int>, "body": ...}.
@@ -19,13 +20,22 @@ RESPONSE HEADERS (TE-5 tj-3mk3u5.37.6). A response can carry headers beside its 
 429 can be answered with or without X-RateLimit-Reset or Retry-After. No fixture records any: the
 recorder writes no header (README, Re-recording), and which ones a real 429 sends is unknown. A
 test that needs one attaches it with with_headers(), and says so.
+
+STUB VENDORS (tj-7zjov1.56). Since the reader owns the bars page loop, it reads the client's private
+_session, _base_url, _api_version and _get_default_headers (broker_api.request_page), so a Mock client
+standing in for get_stock_bars no longer reaches anything. Tests that only need a few bars, or an
+exception from the HTTP session, use stub_vendor(): the REAL client over this same transport, answering
+scripted answers in turn, with constructed bodies (wire_bar, bars_answer, status_answer) whose
+provenance says 'constructed'. So every such test also exercises the private attributes for real.
 """
 
+import asyncio
+import hashlib
 import json
 import re
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
-from datetime import datetime
+from datetime import UTC, datetime
 from http import HTTPStatus
 from itertools import pairwise
 from pathlib import Path
@@ -36,8 +46,12 @@ from urllib.parse import parse_qs, urlsplit
 import requests
 from alpaca.common import rest as alpaca_rest
 from alpaca.data.historical import StockHistoricalDataClient
+from alpaca.data.historical.corporate_actions import CorporateActionsClient
+from alpaca.trading.client import TradingClient
 from requests.adapters import BaseAdapter
 from requests.structures import CaseInsensitiveDict
+
+from data.ingest.app.brokers.alpaca import broker_api
 
 
 FIXTURES_DIR = Path(__file__).parent / 'fixtures' / 'alpaca'
@@ -217,10 +231,13 @@ class RecordedTransport(BaseAdapter):
         request_cap (int): Requests allowed before the transport fails the test.
     """
 
-    def __init__(self, responder: Responder, request_cap: int = DEFAULT_REQUEST_CAP) -> None:
+    def __init__(
+        self, responder: Responder, request_cap: int = DEFAULT_REQUEST_CAP, host: str = ALPACA_DATA_HOST
+    ) -> None:
         super().__init__()
         self.responder = responder
         self.request_cap = request_cap
+        self.host = host
         self.sent: list[SentRequest] = []
 
     def send(self, request, stream=False, timeout=None, verify=True, cert=None, proxies=None):
@@ -228,14 +245,15 @@ class RecordedTransport(BaseAdapter):
         self.sent.append(sent)
         if len(self.sent) > self.request_cap:
             raise AssertionError(f'more than {self.request_cap} requests reached the transport; is the client looping?')
-        if sent.host != ALPACA_DATA_HOST:
+        if sent.host != self.host:
             raise AssertionError(f'request left the recorded vendor host: {sent.url}')
         recorded = self.responder(sent)
 
         response = requests.Response()
         response.status_code = recorded.status
         response.reason = HTTPStatus(recorded.status).phrase
-        response._content = json.dumps(recorded.body).encode()
+        # A bytes body is served exactly as given (the asset reads slice it byte for byte); anything else as JSON.
+        response._content = recorded.body if isinstance(recorded.body, bytes) else json.dumps(recorded.body).encode()
         response.headers = CaseInsensitiveDict({'Content-Type': 'application/json', **recorded.headers})
         response.encoding = 'utf-8'
         response.url = request.url
@@ -246,23 +264,266 @@ class RecordedTransport(BaseAdapter):
         pass
 
 
-def record_sdk_sleeps(monkeypatch) -> list[float]:
-    """Replace the clock alpaca-py's retry loop sleeps on with a recorder, for one test.
+# RETIRED ON tj-7zjov1.56: record_sdk_sleeps.
+#
+# It replaced the clock alpaca-py's own retry loop sleeps on (common/rest.py RESTClient._request). Since
+# tj-7zjov1.56 the reader owns the bars page loop and makes every request through broker_api.request_page,
+# which never enters that loop, so the clock it patched is dead: a test asserting its recorder stayed empty
+# asserted nothing. Its live successor is record_page_retry_sleeps below, the wait between the 504 retries the
+# reader now makes itself. A reader that slid back onto the SDK's loop is caught by request counts instead
+# (a 429 would reach the transport four times, not once), and by sdk_retry_is_never_entered.
 
-    alpaca-py cannot be built with a zero retry wait: RESTClient ignores retry_wait_seconds=0
-    ('if retry_wait_seconds and retry_wait_seconds > 0', common/rest.py:79) and keeps its 3 s
-    default. Patching the module's time reference instead keeps the production defaults, keeps
-    the gate fast, and makes each wait the SDK asked for assertable.
+
+def record_page_retry_sleeps(monkeypatch) -> list[float]:
+    """Replace the wait broker_api's bars page loop sleeps before a 504 retry with a recorder, for one test.
+
+    The loop waits with asyncio.sleep(BARS_PAGE_RETRY_WAIT_S), 3 s (tj-7zjov1.56). Only that module's asyncio
+    reference is replaced, and get_running_loop is the real one, so the scheduler's own waits and the worker pool
+    are untouched. The recorded sleep returns at once, so the gate stays fast and each wait is assertable.
 
     Args:
         monkeypatch (pytest.MonkeyPatch): The test's monkeypatch fixture, which undoes this.
 
     Returns:
-        list[float]: Every wait the SDK requested, in order.
+        list[float]: Every wait the page loop asked for, in order.
     """
     sleeps: list[float] = []
-    monkeypatch.setattr(alpaca_rest, 'time', SimpleNamespace(sleep=sleeps.append))
+
+    async def sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+
+    monkeypatch.setattr(broker_api, 'asyncio', SimpleNamespace(sleep=sleep, get_running_loop=asyncio.get_running_loop))
     return sleeps
+
+
+def sdk_retry_is_never_entered(monkeypatch) -> list[str]:
+    """Make alpaca-py's own request loop record every entry, for one test.
+
+    RESTClient._request is where the SDK sleeps and retries a 429 or 504 by itself. Since tj-7zjov1.56 nothing on
+    the bars path may reach it (the bead's requirement 3: no HTTP request outside the scheduler). The real method
+    still runs, so a regression is observed and not masked.
+
+    Args:
+        monkeypatch (pytest.MonkeyPatch): The test's monkeypatch fixture, which undoes this.
+
+    Returns:
+        list[str]: The path of every request that went through the SDK's own loop.
+    """
+    entered: list[str] = []
+    sdk_request = alpaca_rest.RESTClient._request
+
+    def recording(self, method, path, *args, **kwargs):
+        entered.append(path)
+        return sdk_request(self, method, path, *args, **kwargs)
+
+    monkeypatch.setattr(alpaca_rest.RESTClient, '_request', recording)
+    return entered
+
+
+# Constructed bodies, for tests that need a bar set no fixture holds. Never written to fixtures/: these are
+# not recordings, and their provenance says so.
+
+
+def wire_bar(timestamp: datetime, close: float = 10.0) -> dict[str, Any]:
+    """One bar as the vendor's JSON carries it (tj-vhboky.57 item 1), at an aware instant."""
+    if timestamp.utcoffset() is None:
+        raise ValueError(f'a wire bar needs an aware instant: {timestamp!r}')
+    stamp = timestamp.astimezone(UTC).isoformat().replace('+00:00', 'Z')
+    return {'t': stamp, 'o': 1.0, 'h': 2.0, 'l': 0.5, 'c': close, 'v': 10, 'n': 3, 'vw': 1.5}
+
+
+def bars_answer(
+    bars_by_symbol: Mapping[str, Sequence[dict[str, Any]]],
+    next_page_token: str | None = None,
+    headers: Mapping[str, str] | None = None,
+) -> RecordedResponse:
+    """A constructed 200 bars page: its bars by symbol, its next_page_token, and any response headers."""
+    return RecordedResponse(
+        name=f'constructed_bars[{next_page_token}]',
+        status=200,
+        body={
+            'bars': {symbol: list(bars) for symbol, bars in bars_by_symbol.items()},
+            'next_page_token': next_page_token,
+        },
+        provenance={'kind': 'constructed'},
+        headers=dict(headers or {}),
+    )
+
+
+def status_answer(status: int, message: str = 'no', headers: Mapping[str, str] | None = None) -> RecordedResponse:
+    """A constructed error answer, shaped as Alpaca's: {"message": ...}, with no code field."""
+    return RecordedResponse(
+        name=f'constructed_{status}',
+        status=status,
+        body={'message': message},
+        provenance={'kind': 'constructed'},
+        headers=dict(headers or {}),
+    )
+
+
+Answer = RecordedResponse | BaseException
+
+
+def scripted(*answers: Answer) -> Responder:
+    """Answer the n-th request with the n-th answer, raising it when it is an exception.
+
+    An exception is raised by the transport, inside the HTTP session, which is where requests raises a
+    connection error, a timeout or a cut body. A request past the last answer fails the test.
+    """
+    remaining = list(answers)
+
+    def respond(sent: SentRequest) -> RecordedResponse:
+        if not remaining:
+            raise AssertionError(f'unscripted request past the last scripted answer: {sent.url}')
+        answer = remaining.pop(0)
+        if isinstance(answer, BaseException):
+            raise answer
+        return answer
+
+    return respond
+
+
+@dataclass
+class StubVendor:
+    """A real alpaca-py client over a scripted RecordedTransport, and what reached it.
+
+    Attributes:
+        client (StockHistoricalDataClient): The client to inject.
+        transport (RecordedTransport): Its transport.
+    """
+
+    client: StockHistoricalDataClient
+    transport: RecordedTransport
+
+    @property
+    def sent(self) -> list[SentRequest]:
+        """Every HTTP request that reached the vendor, in order."""
+        return self.transport.sent
+
+
+def stub_vendor(*answers: Answer, request_cap: int = DEFAULT_REQUEST_CAP) -> StubVendor:
+    """A real client answering each request in turn with `answers` (see scripted)."""
+    client, transport = recorded_client(scripted(*answers), request_cap)
+    return StubVendor(client, transport)
+
+
+# The trading host the asset-read tests configure. Invented and unresolvable on purpose: the real host is
+# deployment configuration (ALPACA_TRADING_BASE_URL), never a default, and nothing here may reach a network.
+ALPACA_TRADING_TEST_HOST = 'trading.alpaca.test.invalid'
+ALPACA_TRADING_TEST_URL = f'https://{ALPACA_TRADING_TEST_HOST}'
+# The path alpaca-py 0.44.0's TradingClient prefixes (api_version v2) to the asset endpoint.
+ASSETS_PATH = '/v2/assets'
+
+
+@dataclass
+class StubTradingVendor:
+    """A real alpaca-py TradingClient over a scripted RecordedTransport, and what reached it.
+
+    Attributes:
+        client (TradingClient): The client to inject.
+        transport (RecordedTransport): Its transport.
+    """
+
+    client: TradingClient
+    transport: RecordedTransport
+
+    @property
+    def sent(self) -> list[SentRequest]:
+        """Every HTTP request that reached the vendor, in order."""
+        return self.transport.sent
+
+
+def stub_trading_vendor(*answers: Answer, request_cap: int = DEFAULT_REQUEST_CAP) -> StubTradingVendor:
+    """A real TradingClient on ALPACA_TRADING_TEST_URL, answering each request in turn with `answers` (see scripted).
+
+    Built exactly as broker_api.get_trading_client builds one (url_override, header auth), with the placeholder pair.
+    """
+    client = TradingClient(PLACEHOLDER_KEY_ID, PLACEHOLDER_SECRET, url_override=ALPACA_TRADING_TEST_URL)
+    transport = RecordedTransport(scripted(*answers), request_cap, host=ALPACA_TRADING_TEST_HOST)
+    session = client._session
+    session.mount('https://', transport)
+    session.mount('http://', transport)
+    if set(session.adapters) != {'https://', 'http://'} or any(a is not transport for a in session.adapters.values()):
+        raise AssertionError(f'a real adapter is still mounted: {dict(session.adapters)}')
+    return StubTradingVendor(client, transport)
+
+
+def raw_answer(body: bytes, status: int = 200, headers: Mapping[str, str] | None = None) -> RecordedResponse:
+    """A constructed answer whose body is served byte for byte, never re-encoded."""
+    return RecordedResponse(
+        name=f'constructed_raw_{status}',
+        status=status,
+        body=body,
+        provenance={'kind': 'constructed'},
+        headers=dict(headers or {}),
+    )
+
+
+def load_raw(name: str) -> RecordedResponse:
+    """Load a fixture recorded byte for byte: fixtures/alpaca/<name>.json whose body_text is the body as served.
+
+    For an endpoint whose records are sliced from the body (the corporate actions, tj-7zjov1.23), a fixture whose
+    body were re-encoded by json.dumps would serve bytes the vendor never sent. The text is checked against the
+    recording's own length and sha256 before it is served, so an edited fixture fails here and not downstream.
+
+    Args:
+        name (str): File stem.
+
+    Returns:
+        RecordedResponse: The fixture, its body the served bytes.
+
+    Raises:
+        AssertionError: If the body text is not the bytes the recording measured.
+    """
+    raw = json.loads((FIXTURES_DIR / f'{name}.json').read_text())
+    body = raw['body_text'].encode('utf-8')
+    provenance = raw.get('provenance', {})
+    if len(body) != provenance['byte_length'] or hashlib.sha256(body).hexdigest() != provenance['sha256']:
+        raise AssertionError(f'{name}: body_text is not the bytes recorded')
+    return RecordedResponse(name=name, status=raw['status'], body=body, provenance=provenance)
+
+
+@dataclass
+class StubDataVendor:
+    """A real alpaca-py CorporateActionsClient over a scripted RecordedTransport, and what reached it.
+
+    Attributes:
+        client (CorporateActionsClient): The client to inject.
+        transport (RecordedTransport): Its transport.
+    """
+
+    client: CorporateActionsClient
+    transport: RecordedTransport
+
+    @property
+    def sent(self) -> list[SentRequest]:
+        """Every HTTP request that reached the vendor, in order."""
+        return self.transport.sent
+
+
+def stub_corporate_actions_vendor(*answers: Answer, request_cap: int = DEFAULT_REQUEST_CAP) -> StubDataVendor:
+    """A real CorporateActionsClient on Alpaca's data host, answering each request in turn with `answers`.
+
+    Built exactly as broker_api.get_corporate_actions_client builds one (the SDK's own data host, v1), with the
+    placeholder pair. The transport refuses any other host, so a read sent to the trading host fails the test.
+    """
+    client = CorporateActionsClient(PLACEHOLDER_KEY_ID, PLACEHOLDER_SECRET)
+    transport = RecordedTransport(scripted(*answers), request_cap)
+    session = client._session
+    session.mount('https://', transport)
+    session.mount('http://', transport)
+    if set(session.adapters) != {'https://', 'http://'} or any(a is not transport for a in session.adapters.values()):
+        raise AssertionError(f'a real adapter is still mounted: {dict(session.adapters)}')
+    return StubDataVendor(client, transport)
+
+
+def asset_answer(symbol: str, vendor_asset_id: str) -> RecordedResponse:
+    """A constructed 200 asset-by-symbol answer: one trading-API asset record, invented, not a recording."""
+    body = (
+        f'{{"id": "{vendor_asset_id}", "class": "us_equity", "exchange": "NASDAQ", "symbol": "{symbol}",'
+        f' "name": "Constructed {symbol}", "status": "active", "tradable": true}}'
+    )
+    return raw_answer(body.encode('utf-8'))
 
 
 def recorded_client(

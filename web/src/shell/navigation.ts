@@ -42,6 +42,7 @@ export interface SubTabItem {
 
 const SUB_TAB_PATHS: Record<DataTab, { path: string; built: boolean }> = {
   Datasets: { path: '/data/datasets', built: true },
+  Panels: { path: '/data/panels', built: true },
   Requests: { path: '/data/requests', built: false },
   Health: { path: '/data/health', built: false },
   Usage: { path: '/data/usage', built: true },

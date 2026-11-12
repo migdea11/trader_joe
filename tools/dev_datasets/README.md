@@ -15,9 +15,12 @@ ended range, a non-BULK expiry type, usage reads, and deliberately damaged datas
 ## The set
 
 Dates are relative to **D**, the run's UTC date (`--date YYYY-MM-DD` overrides it). Ranges are UTC `[start, end)`.
-`end` of `-` is open-ended. Expiry `-` is Never. The vendor's history on the dev plan is not the same for every resolution: monthly bars begin 2020-07 and daily bars
-2020-07-27, and the depth was not stable between runs (a first run returned a first monthly bar of 2018-11-01 for the
-same series). Every healthy row therefore starts after 2020-07-27 (r6 on 2020-08-01).
+`end` of `-` is open-ended. Expiry `-` is Never. The vendor's history on the dev plan is not the same for every
+resolution: monthly bars begin 2020-07 and daily bars 2020-07-27, and the depth was not stable between runs (a first
+run returned a first monthly bar of 2018-11-01 for the same series). Every healthy row therefore starts after
+2020-07-27 (r6 on 2020-08-01).
+
+The plan names no feed, so dev runs are now served on SIP, and the depth above needs re-measuring (and r14's intentional leading GAPS re-checking).
 
 | id | symbol | granularity | start .. end | update | expiry type | expiry | owner | reads | exercises |
 |---|---|---|---|---|---|---|---|---|---|
@@ -87,15 +90,18 @@ provides the two credentials). Use the venv that `make` synced, `.venv-devcontai
 |---|---|
 | `check` | Reports `secret`, `db password` (set, EMPTY or PLACEHOLDER, never the value), GET /ping and GET /ui/v1/config. |
 | `seed` (the default) | **Resets first (see below), then** POSTs each row to `/store/stock/market-activity/{symbol}` as its owner. A row already present is skipped, so a rerun with `--no-reset` never rewrites an expiry. A 409 `OWN_OVERLAP_CONFLICT` counts as already there; any other 4xx stops; 429, 503 and 504 stop and say wait. |
-| `reset` (`--reset`) | The reset alone, without the plan. |
+| `reset` (`--reset`) | The reset alone, without the plan. On a dev stack it keeps the trimmed seed (see **The reset**). |
 | `reads` (`--reads`) | One UI read (`X-Client-Id: operator`, no cursor) for r4 and r7, one SDK read (`X-Client-Id: dev-datasets-sdk`) for r11, so Usage has something to show. |
 | `degrade` (`--degrade`) | One SQL transaction deleting the bars of r12 and r13 between New York midnights (whole sessions). Touches no audit, usage or run table. |
 | `repair` (`--repair`) | Re-sends r12 and r13's seed bodies. |
+| `export` (`--export`) | Writes the trimmed, non-reproducible state to `output/dev_seed/` (see **The export** below). Reads only; needs no `--yes-reset`. |
+| `load --seed DIR` (`--load`) | Puts a seed back into a database whose eighteen tables are empty (see **Load** below). Needs no `--yes-reset`: it removes nothing. |
 
 Order: `check`, `seed --yes-reset`, `reads`, `degrade`, then (optionally) the r13 step below, then `repair`.
 `--dry-run` on `reads`, `degrade` and `repair` prints what would be sent or deleted and makes no network or database
 call. On `seed` and `reset` it asks the rail (a read) which backend this is, reads the row counts a reset would
-remove (a read), prints the request bodies, and changes nothing.
+remove (a read), prints the request bodies, and changes nothing. On `export` it prints the per-table counts and size
+estimates (a read) and writes no file.
 
 Seeding takes minutes on dev: roughly 15-20k bars and about 20 vendor calls. Ranges must end in the past.
 
@@ -107,31 +113,133 @@ group, not the default one. Run them from a venv synced through `make` (`make in
 
 ## The reset
 
-`reset` empties **exactly these seven tables, in one transaction**, with one `TRUNCATE ... RESTART IDENTITY` (no
-`CASCADE`: the one foreign key among them, `stock_market_activity.dataset_id`, has both ends in the statement):
+`reset` empties **exactly these eighteen tables, in one transaction**, with one `TRUNCATE ... RESTART IDENTITY` (no
+`CASCADE`: every foreign key among them has both ends in the statement, so none needs ordering). The keys are
+`stock_market_activity.dataset_id` -> `store_dataset_entry` (`ON DELETE CASCADE`), and six panel keys with
+no `ON DELETE` rule: `panel_settings_version` -> `panel`, `panel_pass` -> `panel`, `panel_pass` ->
+`panel_settings_version`, `panel_pass` -> `panel_source_settings_version`, `panel_member_transition` -> `panel` and
+`panel_member_transition` -> `panel_pass`.
 
-`stock_market_activity`, `store_dataset_entry`, `ingest_run`, `dataset_read`, `dataset_read_daily`,
-`dataset_override_log`, `dataset_deletion`.
+`stock_market_activity`, `store_dataset_entry`, `ingest_run`, `ingest_request`, `ingest_instance`, `dataset_read`,
+`dataset_read_daily`, `dataset_override_log`, `dataset_deletion`, `asset_list_snapshot`, `asset_list_row`,
+`asset_list_event`, `corporate_action`, `panel`, `panel_settings_version`, `panel_source_settings_version`,
+`panel_pass`, `panel_member_transition`.
+
+There is no dev guard: a reset never refuses because the asset-list, corporate-action or panel tables hold rows.
+
+**On a dev stack the reset keeps a seed.** The same transaction, under the lock and after the in-flight check, runs
+the export (**The export** below: the last 90 days of what cannot be re-fetched cheaply; `corporate_action` 180 days),
+checks every written file against its manifest, runs the one `TRUNCATE ... RESTART IDENTITY`, `COPY`s the files back in
+(parents first, so every foreign key has both ends before the commit), sets the serial sequence (`stock_market_activity.id`,
+the only serial among the eighteen; the rest are uuids) to `max(id)`, and recounts each table against the manifest. A count
+that differs, or any failure, rolls everything back and leaves the data as it was; the export stays on disk. The
+transaction is `READ COMMITTED`: the lock is taken before the first read, so no writer can intervene, whereas a
+`REPEATABLE READ` snapshot could predate the lock and the TRUNCATE would then drop rows the export never saw. After the
+commit it waits and recounts as below, but expects the manifest's counts, not 0. The database must be at the checkout's
+migration head: otherwise the reset refuses before it changes anything and exits 3, because the export it would reload
+is keyed to that revision. **On the test label the reset is the plain wipe**: no export, nothing reloaded, every table 0.
+`seed` on dev runs this reset first, so a dev `seed` keeps the last 90 days of the state it replaces.
 
 It keeps the schema, `alembic_version` and every other table, and runs no DDL. A failure rolls the whole transaction
 back. It prints the row count of each table before and after, never the password or the connection string.
 
-- **Reset a quiet stack** (no Viewer open, no request running). The reset refuses, changing nothing and exiting 1,
-  while any `ingest_run` row is `RUNNING` (it counts them in the same transaction, before the TRUNCATE, and names the
-  count). After the commit it waits two usage flush intervals (10 s; the store flushes every 5 s) and recounts
-  `ingest_run` and `dataset_read`; a non-zero count prints `NOT CLEAN` with the counts and exits 1. The guarantee is
-  exactly that: clean at commit, verified after one flush interval.
+- **Reset a quiet stack** (no Viewer open, no request running). The reset first locks the eighteen tables, then refuses,
+  changing nothing and exiting 1, while any `ingest_run` row is `RUNNING` or any `ingest_request` row is `PENDING` or
+  `QUEUED` (it counts both in the same transaction, after the lock and before the TRUNCATE, and names the counts;
+  `NOT_DELIVERED` does not block and is not reloaded; on dev the finished requests of the last 90 days are reloaded from
+  the seed). To clear a stuck request, restart
+  `data_ingest`, which marks its queued work `NOT_DELIVERED`. After the commit it waits two usage flush intervals
+  (10 s; the store flushes every 5 s) and recounts all eighteen tables; a count that is not the expected one in any of them prints `NOT CLEAN`
+  with the counts and exits 1 (on a test stack the expected count is zero; on dev it is the manifest's, so any count
+  that differs from the manifest's is `NOT CLEAN`). The guarantee is exactly that: clean at commit, verified
+  after one flush interval. `ingest_instance` is exported empty, so a live `data_ingest` that re-registers in the window
+  shows up as `NOT CLEAN`: reset with `data_ingest` stopped, as before.
 - **`--yes-reset` is required.** Without it `seed` and `reset` print the counts they would remove, change nothing
   and exit 1.
 - **`--no-reset`** (seed only) skips the reset, for incremental use: add a row, rerun a `--row`, seed on top of what is
   there. `--row` needs it, because the reset is not row-bound. `--yes-reset` with `--no-reset` is a usage error.
-- **`--dry-run`** shows the counts and the request bodies and changes nothing.
+- **`--dry-run`** shows the counts and the request bodies and changes nothing (it writes no export either).
 
 **The two audit tables are append-only by convention only.** `dataset_override_log` and `dataset_deletion` are written
 only by code paths that append; nothing in the database protects them (no trigger, rule or `REVOKE`), so the database
 permits the reset. The reset is a **deliberate environment reset** and is **not recorded** anywhere, `dataset_deletion`
 included: a clean start means empty. Use it on a dev or test database only; it removes every dataset, run, usage and
 audit row.
+
+## The export
+
+`export` writes the part of the dev state that cannot be re-fetched cheaply, trimmed to a cutoff, to a seed directory.
+It is the first half of a preserving reset (the dev reset above runs it, then reloads the files); on its own it
+**changes nothing in the database**.
+
+    .venv-devcontainer/bin/python -m tools.dev_datasets.request export [--dry-run]
+
+- **Read only, one snapshot.** Everything runs in one `REPEATABLE READ, READ ONLY` transaction that is never committed,
+  so the files are one consistent snapshot and the database cannot be changed by it. It sits behind the same rail as every
+  other mode (the store's `deploymentLabel` and the database's `cluster_name`), needs the database password and not the
+  instance secret, and takes no `--yes-reset`.
+- **The cutoff** is 90 days before the export, UTC (`CUTOFF_DAYS` in `dev_seed.py`). Bars and dataset entries use the
+  first New York midnight at or after it, so no session is cut in half; an entry that starts earlier has its start moved
+  up to that boundary. `corporate_action` is kept for twice the cutoff, 180 days by `as_of` (`CORPORATE_ACTION_DAYS`,
+  derived from the cutoff), so an action that touched data at the start of the window is not lost.
+- **What is kept, per table.** Entries that are open-ended or end after the cutoff and have not expired, with their bars
+  at or after the cutoff. Ingest requests of the last 90 days that are in a terminal state (`SUCCEEDED`, `EMPTY` or
+  `FAILED`; a request still `PENDING`, `QUEUED` or `NOT_DELIVERED` is neither exported nor reloaded). Ingest runs of the
+  last 90 days, plus each kept dataset's latest accepted run (the base of the vendor-asset stop rule); a run that names an
+  open request (an attempt row) is dropped, and so is a panel `CREATED` transition that names one (dropped, not nulled,
+  so the next pass creates that member's dataset again). Asset-list snapshots of the last 90 days plus the newest non-empty one before them per
+  source and list (the diff base, as the store picks it), with their rows and events. Panel, settings and
+  source-settings rows whole; passes started in the window; and transitions in the window plus, for each member
+  before it (judged as the store does, ignoring dry-run passes), its ENTERED row and its newest row of any kind, with
+  the passes they reference. `ingest_instance`, `dataset_read`, `dataset_read_daily`, `dataset_override_log`
+  and `dataset_deletion` are exported empty: the live ingest re-registers, and the rest is usage and audit history.
+  A few references carry no foreign key and may point at a row that was trimmed; the docstring of `dev_seed.py` lists them.
+- **Where it goes.** `output/dev_seed/<revision>/<UTC stamp>/`: one `<table>.copy` file per table (Postgres COPY text)
+  and `manifest.json`. The directories are mode 0700 and the files 0600, created exclusively and without following a
+  symbolic link, and fsynced. The newest three stamps of a revision are kept; older ones are removed once the new one is
+  complete. A failed export removes its own directory. The seed holds real tickers, vendor bars and owner names: it is
+  gitignored, listed in `.dockerignore`, and must never be committed, pasted into CI or copied into an image.
+- **The manifest** records the revision (`alembic_version`, read inside the transaction), the checkout head, the cutoffs,
+  the stack label, and per table the row count, byte count, sha256 of the file and a column fingerprint (names, types
+  and order from `information_schema`). The export **refuses**, writing nothing, unless the database revision equals the
+  head of `server/data/store/migrations/versions`: migrate the dev database first. That refusal exits 3, like the seed
+  producer's; every other failure exits 1.
+- **`--dry-run`** runs the same checks and the same trim statements and prints, per table, the row count and an estimated
+  size in bytes (the heap size of the kept rows, not the size of the files). It writes no file. Run it before the first
+  real export: the asset-list rows are the large table.
+
+## Load
+
+`load --seed DIR` puts a seed back into a database whose eighteen tables are **all empty**, in one transaction, and
+removes nothing. `DIR` is a stamp directory (`output/dev_seed/<revision>/<UTC stamp>`), or a revision directory, for which
+the newest **complete** stamp (one with a `manifest.json`) is used; a symbolic link is refused.
+
+    .venv-devcontainer/bin/python -m tools.dev_datasets.request load --seed output/dev_seed/<revision> [--dry-run]
+
+- **The stale-seed rule.** It refuses unless the **seed's revision, the database's `alembic_version` and the checkout's
+  migration head are the same**, and every table's column fingerprint (names, types, order) equals the manifest's. A refusal
+  changes nothing, exits **3** and names the three revisions (never a value):
+  `refused: the seed is at revision A, the database at B and the checkout head is C; ...`. To recover: migrate the dev
+  database to the head, then run a dev `reset`, which exports a seed of the current revision and reloads it. (An older
+  seed cannot be upgraded here; that would need a database at its revision.)
+- **After the alpha reset.** The first alpha replaced every earlier store migration with one baseline revision,
+  and the bar and panel tables changed shape. An export under `output/dev_seed/<old revision>/` names a
+  revision that no longer exists, so it cannot be loaded; drop the dev database, `make migrate`, and re-request the
+  datasets (the `request-datasets` skill). Exports taken after the reset load as before.
+- **The stack rule.** The manifest records the stack the seed was exported from (`dev` or `test`). A load refuses, exits
+  **3** and writes nothing when that differs from the target's `deploymentLabel`:
+  `refused: this seed was exported from the 'A' stack and the target is the 'B' stack; nothing was written`. The check runs
+  after the rail and the database proof and before any lock or write. A manifest with no stack, or one other than `dev` or
+  `test`, is not a seed. The dev reset's own reload is the same stack and is unaffected.
+- **Order.** Behind the same rail as every writing mode, one transaction locks the eighteen tables (`ACCESS EXCLUSIVE`,
+  10 s lock timeout), checks the revisions and fingerprints, proves the live schema has no serial column but the one it
+  resets, refuses (exit 1) if any table holds a row, **verifies the size and sha256 of every file before the first write**,
+  `COPY`s the files in (and hashes the bytes the server reads, so a file edited in between is caught), sets the sequence,
+  recounts against the manifest and commits. Any failure rolls back.
+- **`--dry-run`** reads only the files: it verifies them and prints the seed's and the checkout's revision and the
+  per-table counts. No rail, no database. It also prints the seed's stack.
+- It needs the database password and not the instance secret. The seed holds real tickers and owner names: it never
+  leaves the machine (see **The export**).
 
 ## Two backends, one plan
 
@@ -183,7 +291,7 @@ For a genuine FAILED run in run history on dev: after `degrade`, stop `data_inge
   The value and source shown are what it found. The usual cause is a stack started before the marker existed: the first
   `make dev-up` (or `make system-launch`) after pulling the change recreates the postgres container with it, and the
   data folder survives. It does not stop someone with superuser rights or access to the server's command line.
-- **Every writing mode (seed, reset, reads, degrade, repair) refuses unless `GET /ui/v1/config` reports `deploymentLabel`
+- **Every writing mode (seed, reset, reads, degrade, repair, load) refuses unless `GET /ui/v1/config` reports `deploymentLabel`
   `dev` or `test`.** A prod stack answers an empty label and is refused before any SQL or request is sent.
 - **Credentials come only from the environment**: `INSTANCE_WRITE_SECRET` (sent only in the `X-Instance-Secret`
   header) and `POSTGRES_PASS` (the database password). Neither is printed, logged, or put in an exception, and a

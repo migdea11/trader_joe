@@ -14,7 +14,7 @@
 import { computed, nextTick, onMounted, ref } from 'vue'
 import type { DatasetSummary } from '@generated/trader_joe/proto/ui/v1/data_pb'
 
-import { OPERATOR_CLIENT_ID } from '@/api'
+import { OPERATOR_CLIENT_ID, PANEL_MANAGED_TEXT, PANEL_OWNER } from '@/api'
 import type { OperatorOverride } from '@/api'
 import { granularityLabel } from '@/catalog/labels'
 import { MISSING } from '@/format/formatters'
@@ -37,7 +37,9 @@ const { timeZone } = useFormatters()
 
 /** The one dataset, named as the operator knows it: symbol and granularity (VFV 1d). */
 const name = computed(() => `${props.dataset.assetSymbol} ${granularityLabel(props.dataset.granularity)}`)
-const heldElsewhere = computed(() => props.dataset.owner !== OPERATOR_CLIENT_ID)
+// A panel's dataset: Set Expiry is withheld (disabled, with the reason); no override prompt.
+const panelOwned = computed(() => props.dataset.owner === PANEL_OWNER)
+const heldElsewhere = computed(() => props.dataset.owner !== OPERATOR_CLIENT_ID && !panelOwned.value)
 const owner = computed(() => (props.dataset.owner === '' ? MISSING : props.dataset.owner))
 
 const dayText = ref('')
@@ -57,7 +59,7 @@ const hint = computed(() => {
   }
   return ''
 })
-const canSubmit = computed(() => !busy.value && hint.value === '')
+const canSubmit = computed(() => !busy.value && !panelOwned.value && hint.value === '')
 
 function override(): OperatorOverride | undefined {
   return heldElsewhere.value ? { reason: reason.value.trim(), confirmed: true } : undefined
@@ -142,6 +144,22 @@ function onKeydown(event: KeyboardEvent): void {
         keeps it.
       </p>
 
+      <p
+        v-if="panelOwned"
+        id="expiry-panel-managed"
+        class="warning"
+        role="note"
+        data-testid="panel-managed"
+      >
+        {{ PANEL_MANAGED_TEXT }}
+        <RouterLink
+          to="/data/panels"
+          data-testid="panel-managed-link"
+        >
+          {{ titleCase('Panels') }}
+        </RouterLink>
+      </p>
+
       <div
         v-if="heldElsewhere"
         class="warning"
@@ -166,7 +184,8 @@ function onKeydown(event: KeyboardEvent): void {
             type="text"
             inputmode="numeric"
             placeholder="YYYY/MM/DD"
-            :disabled="busy"
+            :disabled="busy || panelOwned"
+            :aria-describedby="panelOwned ? 'expiry-panel-managed' : undefined"
             :aria-invalid="dayProblem"
             data-testid="expiry-day"
             @keydown.enter="submit"
@@ -174,7 +193,8 @@ function onKeydown(event: KeyboardEvent): void {
           <button
             type="button"
             class="btn"
-            :disabled="busy"
+            :disabled="busy || panelOwned"
+            :aria-describedby="panelOwned ? 'expiry-panel-managed' : undefined"
             data-testid="expiry-tomorrow"
             @click="dayText = tomorrowText(timeZone)"
           >
@@ -239,7 +259,7 @@ function onKeydown(event: KeyboardEvent): void {
           type="button"
           class="btn btn--primary"
           :disabled="!canSubmit"
-          :aria-describedby="hint ? 'expiry-dialog-hint' : undefined"
+          :aria-describedby="panelOwned ? 'expiry-panel-managed' : hint ? 'expiry-dialog-hint' : undefined"
           data-testid="expiry-submit"
           @click="submit"
         >
@@ -260,6 +280,11 @@ function onKeydown(event: KeyboardEvent): void {
 </template>
 
 <style scoped>
+.warning a {
+  margin-left: 6px;
+  color: var(--tj-accent-tint);
+}
+
 .scrim {
   position: fixed;
   inset: 0;

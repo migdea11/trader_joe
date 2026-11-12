@@ -53,7 +53,7 @@ from common.errors.vocabulary import ExogenousError, Reason
 from data.store.app.database.crud.stock import store_dataset_entry as crud
 from data.store.app.database.models.stock_market_activity import StockMarketActivity
 from data.store.app.database.models.store_dataset_entry import StoreDatasetEntry
-from data.store.app.health import FreshnessStatus, evaluate_dataset
+from data.store.app.health import DatasetHealthStatus, evaluate_dataset
 from data.store.app.trading_calendar import calendar_for_source
 from schemas.data_store.asset_dataset_store import (
     AssetDatasetStore,
@@ -397,12 +397,23 @@ async def _bound_conflict(
     statement = _only(db.statements, 'INSERT')
     sql = _sql(statement)
     clause = _do_update_clause(sql)
-    bound = re.fullmatch(r'expiry = %\((\w+)\)s(?:, collect = %\((\w+)\)s)?, updated_at = now\(\)', clause)
+    bound = re.fullmatch(
+        r'expiry = %\((\w+)\)s(?:, collect = %\((\w+)\)s(?:, stopped_cause = %\((\w+)\)s)?)?, updated_at = now\(\)',
+        clause,
+    )
     assert bound, (
         f'the exact-repeat branch no longer writes the body expiry (and an explicit collect) as plain binds, so a '
         f'repeat POST would not set them from the body (tj-grna9p.105, tj-grna9p.189): {clause}'
     )
     params = _params(statement)
+    # THE RESUME CLEAR (P50, tj-7zjov1.144; ADR tj-26jt9w addendum 13): an explicit collect TRUE on a repeat sets
+    # stopped_cause NULL in the same SET, and nothing else ever names stopped_cause here. Explicit false and an omitted
+    # collect leave the stored cause. Checked on every call, so every case above and below pins it.
+    if bound.group(2) is not None and params[bound.group(2)] is True:
+        assert bound.group(3) is not None, f'an explicit collect true did not clear stopped_cause in its SET: {clause}'
+        assert params[bound.group(3)] is None, f'the Resume wrote a stop cause instead of NULL: {clause}'
+    else:
+        assert bound.group(3) is None, f'a repeat that does not resume touched stopped_cause: {clause}'
     inserted = re.search(r'VALUES \((.*?)\) ON CONFLICT', sql)
     assert inserted, sql
     columns = re.search(r'INSERT INTO store_dataset_entry \((.*?)\) VALUES', sql)
@@ -504,14 +515,14 @@ async def test_a_daily_repeat_without_expiry_clears_the_expiry_and_only_an_expli
     health. collect follows the tj-hhy3dk addendum (tj-grna9p.189): a repeat that omits it leaves the stored intent,
     so a stopped subscription stays RETIRED, and only an explicit value flips it.
 
-    The health is computed by the real freshness function from the value the row holds after each repeat, so the
+    The health is computed by the real health function from the value the row holds after each repeat, so the
     claim is the chain: what the POST writes (or leaves) is what the health reads.
     """
     request = _daily_request()
     now = datetime(2026, 3, 4, 21, tzinfo=UTC)  # a Wednesday after the close, well after start
     calendar = calendar_for_source(DataSource.ALPACA_API)
 
-    def health(collect: bool | None) -> FreshnessStatus:
+    def health(collect: bool | None) -> DatasetHealthStatus:
         return evaluate_dataset(
             update_type=UpdateType.DAILY,
             granularity=Granularity.ONE_DAY,
@@ -529,20 +540,24 @@ async def test_a_daily_repeat_without_expiry_clears_the_expiry_and_only_an_expli
 
     expiry, collect, _ = await _bound_conflict(request, collect=False)
     assert (expiry, collect) == (FEBRUARY, False)
-    assert health(after(True, collect)) is FreshnessStatus.RETIRED, 'the control: explicit false stops it'
+    assert health(after(True, collect)) is DatasetHealthStatus.RETIRED, 'the control: explicit false stops it'
 
     expiry, collect, _ = await _bound_conflict(_without_expiry(request))
     assert (expiry, collect) == (None, KEPT), 'a DAILY repeat without collect wrote one over the stored intent'
-    assert health(after(False, collect)) is FreshnessStatus.RETIRED, 'a repeat without collect resumed a stopped one'
-    assert health(after(True, collect)) is not FreshnessStatus.RETIRED, 'clearing the expiry stopped a collecting one'
+    assert health(after(False, collect)) is DatasetHealthStatus.RETIRED, (
+        'a repeat without collect resumed a stopped one'
+    )
+    assert health(after(True, collect)) is not DatasetHealthStatus.RETIRED, (
+        'clearing the expiry stopped a collecting one'
+    )
 
     expiry, collect, _ = await _bound_conflict(request)
     assert (expiry, collect) == (FEBRUARY, KEPT)
-    assert health(after(True, collect)) is not FreshnessStatus.RETIRED, 'an expiry on a collecting DAILY retired it'
+    assert health(after(True, collect)) is not DatasetHealthStatus.RETIRED, 'an expiry on a collecting DAILY retired it'
 
     expiry, collect, _ = await _bound_conflict(_without_expiry(request), collect=True)
     assert (expiry, collect) == (None, True)
-    assert health(after(False, collect)) is not FreshnessStatus.RETIRED, 'explicit true did not resume it'
+    assert health(after(False, collect)) is not DatasetHealthStatus.RETIRED, 'explicit true did not resume it'
 
 
 @pytest.mark.asyncio
@@ -2443,7 +2458,8 @@ def test_the_entry_expiry_column_is_timezone_aware():
     The bar's old expiry was a naive DateTime while every other timestamp here is timestamptz, and
     a naive column makes "when does this data die" depend on the session timezone. Nothing else
     reads this attribute, so without an explicit assertion a revert to DateTime() is invisible.
-    The compiled-DDL half is in test_head_revision_shape.py.
+    The compiled-DDL half is in test_store_model_invariants.py, and the baseline builds it as the model declares
+    (test_alpha_baseline_revision.py offline, test_alpha_baseline_schema_pg.py on Postgres).
 
     NOT COVERED, AND NOT COVERABLE WITHOUT A PRODUCTION CHANGE: a NAIVE expiry sent in the request
     body is accepted and bound unchanged into the insert today -- neither refused nor converted.

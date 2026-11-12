@@ -8,6 +8,14 @@
 # debian:bookworm-slim and caddy:2.11.7-alpine (the web image's server, 2026-10-06) from
 # registry-1.docker.io, uv:0.12.19 from ghcr.io.
 
+# GLOBAL-SCOPE ARGS, before the first FROM: a FROM may expand only these. COPY --from= cannot expand a
+# build arg at all ("variable expansion is not supported for --from"), so migrations_selected below
+# resolves the per-service revision stage through its FROM and service_build_image copies that fixed name.
+# The stages that use the values in their instructions still redeclare them (an ARG is not inherited
+# into a stage by being global).
+ARG SERVICE_PATH=none
+ARG SERVICE_NAME=none
+
 # Base Build Image
 FROM debian:bookworm-slim@sha256:3783cc01769c7b2b1b83a5c5ad96c815348e28ed7da68e2e3687004faa906251 AS base_build_image
 ARG SERVICE_PATH=none
@@ -38,6 +46,26 @@ COPY ./uv.lock /code/uv.lock
 # Install dependencies for specific services
 RUN uv venv
 RUN uv sync --only-group base --frozen
+
+# THE REVISIONS TRAVEL WITH THE IMAGE (bead tj-7zjov1.10, folding tj-y3sj8x). alembic.ini and migrations/
+# were bind-mounted from the checkout, so what ran could differ from what was built; now the image that
+# applies a revision carries it, at /code/alembic.ini and /code/migrations (the paths alembic and
+# migrations/env.py already use). Only data_store has revisions, and the by-name COPY of the app
+# cannot say "nothing" for data_ingest, so the revisions sit in one scratch stage per service, picked
+# by name in service_build_image: migrations_data_store holds them, migrations_data_ingest is empty and
+# copies nothing. They are plain COPYs, so tools/source_digest.sh reads them and BOTH images' digests
+# cover the store's revisions (the ingest digest moving with a store revision is the cost of the
+# digest having no per-service list for this); the stamp migrate-check compares is thereby also a
+# revision stamp. Defined before service_build_image because a stage must precede its first use.
+FROM scratch AS migrations_data_store
+COPY ./server/data/store/alembic.ini /alembic.ini
+COPY ./server/data/store/migrations /migrations
+
+FROM scratch AS migrations_data_ingest
+
+# The pick: one stage whose name does not vary, so COPY --from can name it. The FROM expands the global
+# ARGs above (the only place a build arg may select a stage).
+FROM migrations_${SERVICE_PATH}_${SERVICE_NAME} AS migrations_selected
 
 FROM base_build_image AS service_build_image
 ARG SERVICE_PATH=none
@@ -79,6 +107,7 @@ COPY ./gen/proto/python /code/gen/proto/python
 
 # Add service-specific files
 COPY ./server/${SERVICE_PATH}/${SERVICE_NAME}/app /code/${SERVICE_PATH}/${SERVICE_NAME}/app
+COPY --from=migrations_selected / /code/
 
 # Extending Base Build image to include dev deps
 FROM service_build_image AS service_build_image_dev
@@ -230,7 +259,7 @@ CMD ["/code/entrypoint.sh"]
 # THE SOURCE STAMP (decision tj-yb1bxj clauses 1 and 6), applied to both deploy stages below.
 #
 # WHAT IT IS FOR. data/store/migrations/env.py imports the models from /code -- IN THE IMAGE --
-# while only alembic.ini and migrations/ are bind-mounted, so `alembic check` always compares the
+# while alembic.ini and migrations/ were bind-mounted (they are now in the image too), so `alembic check` always compares the
 # IMAGE'S models against the live schema and never the checkout's. On 2026-10-04 that reported
 # three drift items against a stale prod image that were all phantoms. This label is what lets
 # migrate-check (tj-ymsobh) tell a stale image from a fresh one instead of warning about it.

@@ -240,6 +240,23 @@ def test_one_connection_at_the_session_options_with_autocommit():
     assert connection.executed == [('SELECT 1;', True), ('SELECT 2;', True), ('SELECT 3;', True)]
 
 
+def test_async_url_names_the_same_database_for_asyncpg_and_masks_the_password():
+    """Bead tj-7zjov1.100: the ingest records go in through the store's async code, on the same database."""
+    url = _stack().async_url()
+    assert url.drivername == 'postgresql+asyncpg'
+    assert (url.host, url.port, url.username, url.database) == ('store-db-host', 5433, 'seed-user', 'seed-db')
+    assert url.password == PASSWORD
+    _assert_no_sentinel(repr(url))
+    _assert_no_sentinel(str(url))
+
+
+def test_async_url_connects_nothing_and_reads_no_secret_into_the_url():
+    connect, post = FakeConnect(), FakePost()
+    url = _stack(connect=connect, http_post=post).async_url()
+    assert connect.calls == [] and post.calls == []
+    assert SECRET not in url.render_as_string(hide_password=False)
+
+
 def test_the_session_options_are_the_digests_settings():
     assert SESSION_OPTIONS == '-c TimeZone=UTC -c extra_float_digits=1'
 

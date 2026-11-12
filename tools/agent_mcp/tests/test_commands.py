@@ -41,8 +41,11 @@ from tools.agent_mcp.tests.harness import (
     DEV_UP_VERBS,
     DOCKERLESS_VERBS,
     REPO_ROOT,
+    SESSION_VERB_SAMPLES,
     SYSTEM_SUITE_VERBS,
     TEST_MODE_VERBS,
+    TEST_RESET_VERBS,
+    TEST_SERVICE_VERBS,
     VERB_SAMPLES,
     WORKTREE_NAME,
     client_prefix_words,
@@ -103,8 +106,12 @@ def _run_verb(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, verb: str, respon
 def test_every_verb_has_a_sample():
     """The parameterised tests below run every verb: a new verb without a sample goes red here."""
     agent = runner.AgentStack(settings=None)  # type: ignore[arg-type] -- only the verb table is read
-    assert set(agent.verbs) == set(VERB_SAMPLES), f'verbs {agent.verbs} vs samples {sorted(VERB_SAMPLES)}'
-    assert set(runner.VERB_SCHEMAS) == set(VERB_SAMPLES) == set(runner.VERB_TIMEOUT_SECONDS)
+    samples = set(VERB_SAMPLES) | set(SESSION_VERB_SAMPLES)
+    assert not set(VERB_SAMPLES) & set(SESSION_VERB_SAMPLES)
+    assert set(agent.verbs) == samples, f'verbs {agent.verbs} vs samples {sorted(samples)}'
+    assert set(runner.VERB_SCHEMAS) == samples
+    # The session verbs (addendum 34) take no verb lock and run no step, so only the docker verbs are timed.
+    assert set(runner.VERB_TIMEOUT_SECONDS) == set(VERB_SAMPLES)
 
 
 @pytest.mark.parametrize('verb', sorted(VERB_SAMPLES))
@@ -196,6 +203,13 @@ def test_every_verb_runs_only_the_argv_heads_of_its_class(tmp_path: Path, monkey
             steps = [
                 stack.Step(dev_up_compose_argv(step), step.cwd) if is_dev_up_wrapper(step) else step for step in steps
             ]
+        elif verb in TEST_RESET_VERBS:
+            # tj-w0rddi: the test-mode rails' plain reads (`ps`, `inspect`) and the trusted digests (bash),
+            # then ONE plain `exec` into the postgres container. No compose, no base, no client.
+            heads = [['ps'], ['inspect'], ['exec']]
+            steps = [step for step in steps if not is_dev_digest(step)]
+            assert len(steps) < len(rig.docker.steps), f'{verb} ran no digest step'
+            assert not [step for step in steps if is_dev_up_wrapper(step)], f'{verb} ran the secret wrapper'
         elif verb in TEST_MODE_VERBS:
             # tj-iee6sn.24: the digests (bash), the bases' `image`/`pull`, test_up's guard `ps` and its
             # :test inspects and stamp reads (`image`), then compose, UNWRAPPED (no secret wrapper, no
@@ -204,6 +218,17 @@ def test_every_verb_runs_only_the_argv_heads_of_its_class(tmp_path: Path, monkey
             assert not [step for step in steps if is_dev_up_wrapper(step)], f'{verb} ran the secret wrapper'
             steps = [step for step in steps if not is_dev_digest(step)]
             assert len(steps) < len(rig.docker.steps), f'{verb} ran no digest step'
+        elif verb in TEST_SERVICE_VERBS:
+            # tj-7zjov1.268 (addendum 32 (4)): test_reset's rails' plain reads (`ps`, `inspect`) and the trusted
+            # digests (bash), the any-state lookups (`ps -a`), the bases' `image`/`pull` before an up, then ONE
+            # compose step, UNWRAPPED. No exec. Their whole argv is pinned in _EXPECTED_TAILS_DEV.
+            heads = [['ps'], ['inspect'], ['image'], ['pull'], ['compose']]
+            assert not [step for step in steps if is_dev_up_wrapper(step)], f'{verb} ran the secret wrapper'
+            steps = [step for step in steps if not is_dev_digest(step)]
+            assert len(steps) < len(rig.docker.steps), f'{verb} ran no digest step'
+        elif verb == 'ps':
+            # Addendum 32 (6): compose's own ps, then ONE plain read-only `docker ps -a` of the env labels.
+            heads = [['compose'], ['ps']]
         assert all(list(step.argv[1:2]) in heads and step.argv[0] == EXPECTED_DOCKER for step in steps)
         return
     if verb in DOCKERLESS_VERBS:
@@ -286,7 +311,23 @@ def _expected_dev_wrapped(tail: list[str]) -> list[str]:
 
 
 _EXPECTED_TAILS_DEV = {
-    'ps': [[EXPECTED_DOCKER, 'compose', '-p', EXPECTED_DEV_PROJECT, 'ps', '--all']],
+    # Compose's ps, then (ADR tj-4rr0la addendum 32 (6)) ONE plain read of the project's non-one-off
+    # containers' service and two env labels: names and a generation, never the containers' environment.
+    'ps': [
+        [EXPECTED_DOCKER, 'compose', '-p', EXPECTED_DEV_PROJECT, 'ps', '--all'],
+        [
+            EXPECTED_DOCKER,
+            'ps',
+            '-a',
+            '--filter',
+            f'label=com.docker.compose.project={EXPECTED_DEV_PROJECT}',
+            '--filter',
+            'label=com.docker.compose.oneoff=False',
+            '--format',
+            '{{.Label "com.docker.compose.service"}}|{{.Label "trader_joe.agent.env_generation"}}|'
+            '{{.Label "trader_joe.agent.env_names"}}',
+        ],
+    ],
     'logs': [
         [EXPECTED_DOCKER, 'compose', '-p', EXPECTED_DEV_PROJECT, 'logs', '--no-color', '--tail', '50', 'postgres']
     ],
@@ -644,6 +685,97 @@ _EXPECTED_SYSTEM_SUITE = {
     ],
 }
 
+# test_reset (tj-w0rddi): the system-suite rails, whole, then ONE exec as user postgres (no -e: the one member
+# of the exec family that is not read-only) into the postgres container the rails read the mount of. No
+# inspect of a base and no client step. The script word is the module constant, pinned in test_test_reset.py.
+_EXPECTED_TAILS_DEV['test_reset'] = [
+    *_EXPECTED_SYSTEM_SUITE_RAILS,
+    [EXPECTED_DOCKER, 'exec', '-u', 'postgres', DEV_CONTAINER_ID, 'sh', '-c', stack.TEST_RESET_SCRIPT],
+]
+
+
+def _expected_any_state_lookup(service: str) -> list[str]:
+    """The three verbs' lookup of SERVICE's non-one-off containers in ANY state, printing id and state."""
+    return [
+        EXPECTED_DOCKER,
+        'ps',
+        '-a',
+        '--filter',
+        f'label=com.docker.compose.project={EXPECTED_DEV_PROJECT}',
+        '--filter',
+        f'label=com.docker.compose.service={service}',
+        '--filter',
+        'label=com.docker.compose.oneoff=False',
+        '--format',
+        '{{.ID}} {{.State}}',
+    ]
+
+
+def _expected_container_stamp(container: str) -> list[str]:
+    return [
+        EXPECTED_DOCKER,
+        'inspect',
+        '--type',
+        'container',
+        '--format',
+        '{{ with .Config.Labels }}{{ index . "trader_joe.source.digest" }}{{ end }}',
+        container,
+    ]
+
+
+# test_stop, test_start and test_env (tj-7zjov1.268; ADR tj-4rr0la addendum 32 (4)): the mode guard; the postgres
+# lookup and its mount; the two digests; then per service the any-state lookup and the stamp of each container
+# found (running OR stopped); then ONE compose step on the sampled service (data_store). Stop is label-only;
+# start and env run over the trusted test set (env with the generated overlay, which its sample has just
+# written, LAST, from the MCP's stack directory) after the bases, as every up.
+_EXPECTED_TEST_SERVICE_RAILS = [
+    _EXPECTED_DEV_GUARD,
+    _expected_dev_lookup('postgres'),
+    _EXPECTED_SYSTEM_SUITE_RAILS[2],
+    ['/usr/bin/bash', f'{EXPECTED_TRUSTED_DIR}/tools/source_digest.sh', '--context', '<HOST>', 'data', 'store'],
+    ['/usr/bin/bash', f'{EXPECTED_TRUSTED_DIR}/tools/source_digest.sh', '--context', '<HOST>', 'data', 'ingest'],
+    _expected_any_state_lookup('data_store'),
+    _expected_container_stamp(DEV_CONTAINER_ID),
+    _expected_any_state_lookup('data_ingest'),
+    _expected_container_stamp('c0ffee000002'),
+]
+_EXPECTED_TEST_SET = [
+    EXPECTED_DOCKER,
+    'compose',
+    '-p',
+    EXPECTED_DEV_PROJECT,
+    '--project-directory',
+    '<HOST>',
+    '-f',
+    f'{EXPECTED_TRUSTED_DIR}/docker-compose.yaml',
+    '-f',
+    f'{EXPECTED_TRUSTED_DIR}/docker-compose.fake.yaml',
+]
+_EXPECTED_UP_ONE = ['up', '-d', '--wait', '--wait-timeout', '300', '--no-deps']
+_EXPECTED_TAILS_DEV['test_stop'] = [
+    *_EXPECTED_TEST_SERVICE_RAILS,
+    [EXPECTED_DOCKER, 'compose', '-p', EXPECTED_DEV_PROJECT, 'stop', 'data_store'],
+]
+_EXPECTED_TAILS_DEV['test_start'] = [
+    *_EXPECTED_TEST_SERVICE_RAILS,
+    *_INSPECTS,
+    [*_EXPECTED_TEST_SET, *_EXPECTED_UP_ONE, '--no-recreate', 'data_store'],
+]
+_EXPECTED_TAILS_DEV['test_env'] = [
+    *_EXPECTED_TEST_SERVICE_RAILS,
+    *_INSPECTS,
+    [
+        *_EXPECTED_TEST_SET,
+        '-f',
+        '<STACK>/docker-compose.agent-env.yaml',
+        *_EXPECTED_UP_ONE,
+        '--force-recreate',
+        'data_store',
+    ],
+]
+# The one -f that is not a trusted copy: the generated overlay, in the MCP's own stack directory (addendum 32 (3)).
+AGENT_ENV_OVERLAY_MARK = '<STACK>/docker-compose.agent-env.yaml'
+
 
 def _fill_marks(argv: list[str], host: str, stack_dir: str) -> list[str]:
     """ARGV with a word that is, or starts with, HOST_MARK or STACK_MARK filled in from the rig."""
@@ -702,12 +834,9 @@ def test_every_dev_verb_runs_exactly_its_fixed_read_only_argv(
     """
     rig, result = _run_verb(tmp_path, monkeypatch, verb)
     assert result['status'] == 'ok', result
-    host = str(rig.layout.repo_host_path)
-    # A word that IS the mark, or starts with it (up's `<HOST>/.env`), names the rig's host path.
-    expected = [
-        [host + word[len(HOST_MARK) :] if word.startswith(HOST_MARK) else word for word in argv]
-        for argv in _EXPECTED_TAILS_DEV[verb]
-    ]
+    host, stack_dir = str(rig.layout.repo_host_path), str(rig.layout.stack_dir)
+    # A word that IS a mark, or starts with it (up's `<HOST>/.env`), names the rig's host path or stack directory.
+    expected = [_fill_marks(argv, host, stack_dir) for argv in _EXPECTED_TAILS_DEV[verb]]
     assert [list(step.argv) for step in rig.docker.steps] == expected
 
 
@@ -734,6 +863,10 @@ def test_every_file_based_prefix_names_only_the_trusted_copies():
         if flag in ('-f', '--file')
     }
     assert files, 'no expected argv passes a compose file, so this pin would guard nothing'
+    # The ONE exception (ADR tj-4rr0la addendum 32 (3)): test_env's generated overlay, which the MCP writes in its
+    # own stack directory (never the worktree, never the checkout). Asserted present, so a stale exemption is red.
+    assert AGENT_ENV_OVERLAY_MARK in files
+    files.discard(AGENT_ENV_OVERLAY_MARK)
     assert all(posixpath.dirname(value) == EXPECTED_TRUSTED_DIR for value in files), sorted(files)
     assert f'{EXPECTED_TRUSTED_DIR}/{RETIRED_OVERLAY}' not in files
 
@@ -989,7 +1122,16 @@ def test_snapshot_sources_are_exactly_what_the_trusted_files_read_from_the_proje
     for name in CLIENT_FILES:
         expected |= _relative_bind_sources(REPO_ROOT / name)
     # The service trees moved under server/ (tj-iontkq.4); tests/ and pytest.ini did not.
-    floor = {'server/data/store/migrations', 'tests/system', 'tests/fakes', 'server/data/ingest/app', 'pytest.ini'}
+    # tj-7zjov1.313: the client mounts the dev seed tool, the package marker and the one subpackage only.
+    floor = {
+        'server/data/store/migrations',
+        'tests/system',
+        'tests/fakes',
+        'server/data/ingest/app',
+        'pytest.ini',
+        'tools/__init__.py',
+        'tools/dev_datasets',
+    }
     assert floor <= expected, expected
     assert set(stack.SNAPSHOT_SOURCES) == expected, (
         f'SNAPSHOT_SOURCES {sorted(stack.SNAPSHOT_SOURCES)} vs what the trusted files read {sorted(expected)}'
@@ -1004,7 +1146,18 @@ def test_snapshot_sources_are_exactly_what_the_trusted_files_read_from_the_proje
 # `up`), and restart by owner ruling (tj-iee6sn.1 D1, bead tj-iee6sn.7). Every other verb starts,
 # restarts, creates and recreates nothing: run_system_tests and seed_dump in particular must not restart
 # test mode between a validator's focused runs -- they create test_client alone, by `run`.
-_STARTING_VERBS = {'up': 'up', 'test_up': 'up', 'tools': 'up', 'restart': 'restart'}
+# ADR tj-4rr0la addendum 32 (1) (tj-7zjov1.268) adds two, each an `up --no-deps` of ONE named service in test mode:
+# test_start brings a stopped container back (--no-recreate) and test_env recreates the one service it changed
+# (--force-recreate, the only verb allowed that flag). test_stop stops and starts nothing.
+_STARTING_VERBS = {
+    'up': 'up',
+    'test_up': 'up',
+    'tools': 'up',
+    'restart': 'restart',
+    'test_start': 'up',
+    'test_env': 'up',
+}
+_RECREATE_FLAG = {'test_start': '--no-recreate', 'test_env': '--force-recreate'}
 _STARTING_SUBCOMMANDS = ('up', 'restart', 'create', 'start')
 
 
@@ -1031,6 +1184,11 @@ def test_only_the_launchers_and_dev_restart_start_a_service(tmp_path: Path, monk
     if verb not in _STARTING_VERBS:
         for _, tail in tails:
             assert '--force-recreate' not in tail and '--always-recreate-deps' not in tail, f'{verb} runs {tail}'
+    if verb in _RECREATE_FLAG:
+        (tail,) = [tail for _, tail in tails if tail[:1] == ['up']]
+        flags = [word for word in tail if word in ('--no-recreate', '--force-recreate', '--always-recreate-deps')]
+        assert flags == [_RECREATE_FLAG[verb]] and '--no-deps' in tail, f'{verb} runs {tail}'
+        assert tail[-1] == VERB_SAMPLES[verb]['service'] and not [w for w in tail if w in ('postgres', 'web')], tail
 
 
 def test_the_compose_tail_reader_skips_every_prefix_the_verbs_spell():

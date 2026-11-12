@@ -122,8 +122,10 @@ class LoopbackGrpc:
             os.environ.pop(name, None)
         build = app_depends.build_grpc_host
 
-        def recording_build(readers):
-            built = build(readers)
+        def recording_build(**kwargs):
+            # kwargs: the Submit and Instance handlers, handed over by keyword since P11 (tj-7zjov1.20). Keyword-only
+            # since tj-7zjov1.275 removed the readers mapping, so a positional argument here would be a TypeError.
+            built = build(**kwargs)
             self.hosts.append(built)
             return built
 

@@ -120,7 +120,7 @@ data-ingest = [
 data-store = [
     "alembic>=1.20.0",
     "asyncpg>=0.31.0",
-    # The trading calendar the freshness and completeness rules read (decision tj-grna9p.8 item 3):
+    # The trading calendar the health rules read (decision tj-grna9p.8 item 3):
     # offline, Apache-2.0, XNYS and XTSE among others. data-store only; no other group installs it.
     "exchange-calendars>=4.13.2",
     # Imported directly by data/store/app/trading_calendar.py (calendar session and timestamp arithmetic);
@@ -165,6 +165,9 @@ agent-mcp = [
     # to -102274), and one more against 2.14.0, fixed in 2.15.0 (CVE-2026-101918). Without the
     # floor a re-lock is free to pick either straight back.
     "pyjwt>=2.15.0",
+    # Imported directly by tools/agent_mcp/stack.py: the generated docker-compose.agent-env.yaml is dumped
+    # and read back as YAML (ADR tj-4rr0la addendum 32). The same floor as the testing group.
+    "pyyaml>=6.0.3",
 ]
 security = [
     "bandit>=1.8.6",

@@ -4,9 +4,9 @@
 // nothing can render before registration.
 //
 // Only what the Data screens draw is registered, so the bundle carries the tree-shaken subset
-// rather than all of ECharts: line and bar series (stacked bars, bucket bars, percentile lines,
-// quota burn, source bars), the grid, tooltip, legend and dataZoom components, a mark line for the
-// quota cap, and the canvas renderer. Add a part here when a screen needs it, not before.
+// rather than all of ECharts: line and bar series (the Usage tab's and the Dataset detail's bar
+// charts; the dev chart showcase also draws a line and a mark line), the grid, tooltip, legend and
+// dataZoom components, and the canvas renderer. Add a part here when a screen needs it, not before.
 import { BarChart, LineChart } from 'echarts/charts'
 import {
   DataZoomComponent,

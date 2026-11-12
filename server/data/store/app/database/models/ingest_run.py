@@ -1,6 +1,6 @@
 from enum import StrEnum
 
-from sqlalchemy import UUID, BigInteger, Column, DateTime, Enum, Index, Integer, String, func
+from sqlalchemy import UUID, BigInteger, Column, DateTime, Enum, Index, Integer, String, func, text
 
 from common.database.sql_alchemy_sensitive_string import SensitiveString
 from common.database.sql_alchemy_table import AppBase, CustomTypeTable
@@ -33,6 +33,12 @@ class IngestRunState(StrEnum):
 # so the run history can say "this run was cut off" rather than "this run failed for a reason".
 INTERRUPTED_REASON = 'INTERRUPTED'
 
+# error_reason written on the attempt row of a bars delivery the store refused because its vendor asset id differs from
+# the dataset's last accepted one (P50). Same kind of marker as INTERRUPTED_REASON: not a Reason member, never on
+# problem+json, error_domain stays NULL. The refresh's permanence read ignores it because it requires the vendor
+# error domain.
+VENDOR_ASSET_CHANGED_REASON = 'VENDOR_ASSET_CHANGED'
+
 
 def _values(enum_cls: type[StrEnum]) -> list[str]:
     return [member.value for member in enum_cls]
@@ -55,6 +61,8 @@ class IngestRun(AppBase.DATA_STORE_BASE, CustomTypeTable):
     DATASET_STARTED_INDEX = 'ix_ingest_run_dataset_id_started_at_id'
     RUNNING_INDEX = 'ix_ingest_run_running_dataset_id'
     FINISHED_INDEX = 'ix_ingest_run_finished_at'
+    # One attempt row per (request, attempt number): a redelivered report finds its row and writes nothing.
+    ATTEMPT_UNIQUE_INDEX = 'uq_ingest_run_request_id_attempt_no'
 
     # No unique=True: primary_key=True already provides it (see StoreDatasetEntry.id).
     id = Column(UUID(as_uuid=True), primary_key=True, server_default=func.gen_random_uuid(), nullable=False)
@@ -63,24 +71,57 @@ class IngestRun(AppBase.DATA_STORE_BASE, CustomTypeTable):
     # id does not exist before then. A run that fails before its ack keeps NULL and is identified by
     # its label. No foreign key, because the run must survive the dataset's deletion.
     dataset_id = Column(UUID(as_uuid=True), nullable=True)
-    # The request-log entry that caused the run. This is the link the scheduler's request log will use
-    # (tj-pd41mt); no request log exists yet, so it stays NULL and carries no foreign key.
+    # The ingest_request that caused the run (ingest_request.id). NULL for a store-driven fetch that has no
+    # request record. No foreign key: a run outlives its request.
     request_id = Column(UUID(as_uuid=True), nullable=True)
+    # Set only on the attempt row of a reported attempt (PR 5): the attempt's number within its request,
+    # starting at 1, the instance that made it and the quota scope it was charged to. All NULL on a run the
+    # store drove itself.
+    attempt_no = Column(Integer, nullable=True)
+    instance_id = Column(String, nullable=True)
+    # A non-secret configured label, never key material.
+    quota_key = Column(String, nullable=True)
+    # What the store told ingest for this attempt (CONTINUE or FINAL), kept so a redelivered report is answered
+    # from the stored row. NULL where there is no reported attempt.
+    verdict = Column(String, nullable=True)
+
+    # What the attempt cost at the vendor (the wire's VendorCallStats), failed attempts included. All NULL on
+    # a run with no reported stats; vendor_reported_* is the vendor's own header count, corroboration only.
+    vendor_calls = Column(BigInteger, nullable=True)
+    vendor_pages = Column(BigInteger, nullable=True)
+    vendor_throttled_429 = Column(BigInteger, nullable=True)
+    vendor_retries = Column(BigInteger, nullable=True)
+    vendor_first_call_at = Column(DateTime(timezone=True), nullable=True)
+    vendor_last_call_at = Column(DateTime(timezone=True), nullable=True)
+    vendor_reported_limit = Column(BigInteger, nullable=True)
+    vendor_reported_remaining = Column(BigInteger, nullable=True)
+    vendor_reported_reset_at = Column(DateTime(timezone=True), nullable=True)
+    # The vendor's public instrument key the bars header carried, opaque and stored as received. NULL when the header
+    # named none (an empty string is never stored) and on every run that is not a delivered bars attempt.
+    vendor_asset_id = Column(String, nullable=True)
+    # The window a SUCCEEDED report answered for (the trailer's served_range): start inclusive, end exclusive. Stored
+    # exactly as the report carried it, whatever state the row ends in: a zero-bar SUCCEEDED report is an EMPTY row that
+    # carries it, and so is a dropped delivery. NULL where the report carried none: a FAILED report (rule (d) allows the
+    # range on SUCCEEDED only), an asset-list attempt, and a row with no reported attempt.
+    served_start = Column(DateTime(timezone=True), nullable=True)
+    served_end = Column(DateTime(timezone=True), nullable=True)
 
     trigger = Column(Enum(IngestRunTrigger, name='ingest_run_trigger', values_callable=_values), nullable=False)
     # Who caused the run: the request body's owner for POST /store. A SensitiveString exactly like
     # StoreDatasetEntry.owner, so no statement binding it renders the value, and it is never logged (D8).
     actor = Column(SensitiveString, nullable=False)
 
-    # The label: what the dataset's identity said when the run started. Same enum types as the entry.
-    asset_symbol = Column(String, nullable=False)
-    asset_type = Column(Enum(AssetType), nullable=False)
-    data_type = Column(Enum(DataType), nullable=False)
+    # The label: what the dataset's identity said when the run started. Same enum types as the entry. The label columns
+    # other than source are NULL on the attempt row of a request that is not about one bar series: a corporate-actions
+    # attempt keeps the symbol it asked for and nothing else, an asset-list attempt nothing. Never a sentinel; every reader handles NULL.
+    asset_symbol = Column(String, nullable=True)
+    asset_type = Column(Enum(AssetType), nullable=True)
+    data_type = Column(Enum(DataType), nullable=True)
     source = Column(Enum(DataSource), nullable=False)
-    granularity = Column(Enum(Granularity), nullable=False)
+    granularity = Column(Enum(Granularity), nullable=True)
     # UpdateType's integer value. A plain column rather than the entry's CustomColumn: this table is
     # read and written through the crud's own functions, never through get_fields.
-    update_type = Column(Integer, nullable=False)
+    update_type = Column(Integer, nullable=True)
     # The RESOLVED tape, known only at the ack. NULL for a run that never got one.
     feed = Column(Enum(Feed, name='feed', values_callable=lambda enum_cls: [m.value for m in enum_cls]), nullable=True)
 
@@ -97,7 +138,7 @@ class IngestRun(AppBase.DATA_STORE_BASE, CustomTypeTable):
 
     # error_domain and error_reason are the typed vocabulary's (domain, reason); error_message is
     # TraderJoeError.detail and NEVER str() of an exception (D8). error_reason also takes
-    # INTERRUPTED_REASON, a run-record marker that is not a Reason member and never reaches
+    # INTERRUPTED_REASON or VENDOR_ASSET_CHANGED_REASON, run-record markers that are not Reason members and never reach
     # problem+json. All four are NULL unless state is FAILED.
     error_domain = Column(String, nullable=True)
     error_reason = Column(String, nullable=True)
@@ -116,6 +157,15 @@ class IngestRun(AppBase.DATA_STORE_BASE, CustomTypeTable):
         Index(RUNNING_INDEX, 'dataset_id', postgresql_where=(state == IngestRunState.RUNNING)),
         # Retention and the collection stats window by finish time (tj-grna9p.65).
         Index(FINISHED_INDEX, 'finished_at'),
+        # Redelivery of an attempt is idempotent on this key. Partial, so the many runs with no request or no
+        # attempt number never collide.
+        Index(
+            ATTEMPT_UNIQUE_INDEX,
+            'request_id',
+            'attempt_no',
+            unique=True,
+            postgresql_where=text('request_id IS NOT NULL AND attempt_no IS NOT NULL'),
+        ),
     )
 
     def __repr__(self):

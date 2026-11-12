@@ -1,7 +1,7 @@
-"""The usage record against a real Postgres: migration b3d9e1a47c62, the recorder's flush, the rollup and the read helper.
+"""The usage record against a real Postgres: its two tables, the recorder's flush, the rollup and the read helper.
 
-Design: tj-grna9p.46 (body and the architect's notes of 2026-10-13, which win over it): one additive revision on
-6f5a798746a1 whose downgrade drops both tables and both enum types; a recorder that buffers reads in process and
+Design: tj-grna9p.46 (body and the architect's notes of 2026-10-13, which win over it); the tables are the alpha
+baseline's (ADR tj-kg521d), whose shape the baseline catalogue test owns; a recorder that buffers reads in process and
 writes them in ONE batch per flush, so the read path issues no INSERT; at most 32 distinct client ids per dataset
 per UTC day, applied against the ids already stored so it holds across a restart; a rollup that folds rows past the
 window into dataset_read_daily idempotently, where a kill between the fold and the delete neither double-counts nor
@@ -11,8 +11,8 @@ dataset it returned, labelled by X-Client-Id (OPTION R, tj-grna9p.131), and list
 WHY A SCRATCH DATABASE. The rollup is global -- it folds EVERY row past its cutoff -- and the running data_store runs
 the same rollup on its own schedule, so neither may be pointed at the stack's database without folding rows this
 suite does not own or racing a fold it does not control. Every test here except the last therefore migrates a
-database it creates itself, exactly as test_migration_with_data.py does (the tj-vhboky.62 exception; its ScratchDb
-is reused, not copied), and drops it afterwards. The last test drives the RUNNING data_store over HTTP and reads
+database it creates itself (the tj-vhboky.62 exception; tests/system/scratch_db.py's ScratchDb is reused, not
+copied), and drops it afterwards. The last test drives the RUNNING data_store over HTTP and reads
 back only rows keyed by an entry this run created, which it deletes.
 
 Run by make test-system and the agent-stack MCP's run_system_tests. FAIL, NEVER SKIP.
@@ -58,17 +58,13 @@ from data.store.app.database.models.dataset_read_daily import DatasetReadDaily
 from data.store.app.database.models.stock_market_activity import StockMarketActivity
 from data.store.app.usage_recorder import MAX_IDS_PER_DATASET_DAY, UsageRecorder
 from routers.data_store.app_endpoints import AssetDataInterface, AssetDatasetStoreInterface, UiDatasetsInterface
-from tests.system.test_migration_with_data import MIGRATIONS_DIR, ScratchDb, _quote
+from tests.system.scratch_db import MIGRATIONS_DIR, ScratchDb, _quote
 
 
 pytestmark = pytest.mark.data_store
 
 READ_TABLE = DatasetRead.__table__
 DAILY_TABLE = DatasetReadDaily.__table__
-DATASET_READ_REVISION = 'b3d9e1a47c62'
-PARENT_REVISION = '6f5a798746a1'
-NEW_TABLES = {READ_TABLE.name, DAILY_TABLE.name}
-NEW_ENUMS = {'read_client_kind', 'dataset_read_kind'}
 ROUTE = AssetDataInterface.GET_ASSET_DATA.value
 
 SDK_ONE = ClientLabel('client-one', ReadClientKind.SDK)
@@ -199,37 +195,16 @@ def _daily(db: ScratchDb) -> dict[tuple[uuid.UUID, str, date], dict[str, Any]]:
 
 
 # ---------------------------------------------------------------------------------------------
-# The migration.
+# The schema. Which tables and types the baseline creates is test_alpha_baseline_schema_pg.py's (upgrade versus
+# create_all); the per-revision upgrade/downgrade round trip went with the old chain (ADR tj-kg521d: no downgrade).
 
 
-def test_the_revision_is_below_the_head_and_sits_on_ingest_run():
-    # Was "is the head" until tj-grna9p.86 put d7e2a9c35b18 on it; the head's own pin is test_head_revision_shape.py.
-    script = ScriptDirectory(str(MIGRATIONS_DIR))
-    assert DATASET_READ_REVISION in {revision.revision for revision in script.walk_revisions('base', _head())}
-    assert script.get_revision(DATASET_READ_REVISION).down_revision == PARENT_REVISION
-
-
-def test_upgrade_downgrade_upgrade_creates_then_drops_exactly_the_two_tables_and_two_types(scratch_db: ScratchDb):
-    """Up adds the tables and types; down leaves the parent's schema exactly; up again is the same schema as before."""
-    scratch_db.must('upgrade', PARENT_REVISION)
-    parent_schema = scratch_db.schema()
-    assert not {name for name in NEW_ENUMS if scratch_db.enum_exists(name)}
-
-    scratch_db.must('upgrade', DATASET_READ_REVISION)
-    head_schema = scratch_db.schema()
-    tables = {row[0] for row in head_schema['columns']}
-    assert tables >= NEW_TABLES
-    assert all(scratch_db.enum_exists(name) for name in NEW_ENUMS)
-    # Additive: nothing the parent had is changed or missing.
-    for kind in ('columns', 'constraints', 'indexes', 'enums'):
-        assert set(parent_schema[kind]) <= set(head_schema[kind]), f'{kind} of the parent changed'
-
-    scratch_db.must('downgrade', PARENT_REVISION)
-    assert scratch_db.schema() == parent_schema
-    assert not {name for name in NEW_ENUMS if scratch_db.enum_exists(name)}
-
-    scratch_db.must('upgrade', DATASET_READ_REVISION)
-    assert scratch_db.schema() == head_schema
+def _rename_usage_tables(engine: sa.Engine, *, hidden: bool) -> None:
+    """Rename both usage tables away (or back), so usage_tables_exist's to_regclass answers as without them."""
+    with engine.begin() as conn:
+        for table in (READ_TABLE.name, DAILY_TABLE.name):
+            old, new = (table, f'{table}_hidden_by_test') if hidden else (f'{table}_hidden_by_test', table)
+            conn.execute(sa.text(f'ALTER TABLE public.{old} RENAME TO {new}'))  # nosec B608 -- module-constant names
 
 
 def test_the_label_is_not_null_and_the_daily_key_is_unique(migrated: ScratchDb):
@@ -360,8 +335,13 @@ async def test_a_failed_flush_keeps_the_rows_for_the_next_one(
 async def test_an_unmigrated_database_warns_once_drops_the_rows_and_recovers_after_migrate(
     scratch_db: ScratchDb, scratch_async: AsyncEngine, point_recorder, caplog: pytest.LogCaptureFixture
 ):
-    """The run-sweep pattern: one warning naming make migrate, rows dropped, never a raise; usage starts once migrated."""
-    scratch_db.must('upgrade', PARENT_REVISION)
+    """The run-sweep pattern: one warning naming make migrate, rows dropped, never a raise; usage starts once migrated.
+
+    THE ABSENCE IS MADE AT HEAD: there is no revision below the usage tables any more (one alpha baseline, ADR
+    tj-kg521d), so the database is migrated and the two tables are renamed away, then back for the recovery.
+    """
+    scratch_db.must('upgrade', _head())
+    _rename_usage_tables(scratch_db.engine, hidden=True)
     recorder = UsageRecorder(flush_batch_size=1000)
     caplog.set_level('DEBUG', logger=recorder_module.log.name)
 
@@ -376,7 +356,7 @@ async def test_an_unmigrated_database_warns_once_drops_the_rows_and_recovers_aft
     assert len(warnings) == 1, [record.getMessage() for record in warnings]
     assert warnings[0].levelname == 'WARNING' and 'make migrate' in warnings[0].getMessage()
 
-    scratch_db.must('upgrade', DATASET_READ_REVISION)
+    _rename_usage_tables(scratch_db.engine, hidden=False)
     recorder.record_read(uuid.uuid4(), SDK_ONE, ROUTE, 1)
     assert await recorder.flush() == 1
     assert len(_rows(scratch_db, READ_TABLE)) == 1

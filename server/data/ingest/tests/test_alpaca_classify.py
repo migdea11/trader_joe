@@ -54,8 +54,8 @@ from data.ingest.app.brokers.alpaca.classify import (
     VENDOR_FAILURES,
     classify_vendor_error,
 )
-from data.ingest.app.brokers.rate_budget import RateBudget
 from data.ingest.tests.alpaca_recorded import load
+from data.ingest.tests.scheduler_doubles import FixedWindow
 
 
 pytestmark = pytest.mark.data_ingest
@@ -111,11 +111,21 @@ def recorded(name: str, *, headers: Mapping[str, str] | None = None, marker: boo
     return api_error(fixture.status, body, headers=headers)
 
 
-def budget(rate_per_sec: float | None = 3.0, burst: float | None = 3.0) -> RateBudget:
-    return RateBudget('ALPACA', rate_per_sec=rate_per_sec, burst=burst)
+# Alpaca data's declared window (the scope's one limit interval, a minute). Since 18ff3f5 (tj-7zjov1.20, the
+# architect's ruling on finding (b)) a 429 naming no reset waits this, not the token bucket's refill.
+DECLARED_WINDOW_S = 60.0
 
 
-def classify(error: BaseException, rate_budget: RateBudget | None = None) -> TraderJoeError | None:
+def budget(declared_window_seconds: float = DECLARED_WINDOW_S, full_refill_seconds: float = 1.0) -> FixedWindow:
+    """The quota scope's window as the classifier reads it (classify.RefillWindow).
+
+    Until 18ff3f5 this was a RateBudget, whose refill from empty was the fallback; RateBudget no longer conforms.
+    The refill is still carried, at a different value, so a classifier that fell back to it again is caught.
+    """
+    return FixedWindow(declared_window_seconds=declared_window_seconds, full_refill_seconds=full_refill_seconds)
+
+
+def classify(error: BaseException, rate_budget: FixedWindow | None = None) -> TraderJoeError | None:
     return classify_vendor_error(error, rate_budget=rate_budget or budget(), clock=clock)
 
 
@@ -339,24 +349,21 @@ def test_without_a_reset_header_retry_after_gives_the_reset(retry_after, expecte
 
 
 @pytest.mark.parametrize(
-    ('rate', 'burst', 'refill_seconds'),
-    [pytest.param(3.0, 3.0, 1.0, id='the-deployed-default'), pytest.param(2.0, 10.0, 5.0, id='burst-10-at-2-per-s')],
+    ('declared_s', 'refill_s'),
+    [pytest.param(DECLARED_WINDOW_S, 1.0, id='alpaca-data-a-minute'), pytest.param(3600.0, 60.0, id='an-hour-window')],
 )
-def test_without_either_header_the_reset_is_the_budgets_refill_from_empty(rate, burst, refill_seconds):
-    rate_budget = budget(rate, burst)
-    assert rate_budget.full_refill_seconds == refill_seconds
+def test_without_either_header_the_reset_is_the_scopes_declared_window(declared_s, refill_s):
+    """18ff3f5: the vendor's declared window, never the bucket's refill, which re-429ed inside the same window."""
+    classified = classify(rate_limited(), budget(declared_s, refill_s))
 
-    classified = classify(rate_limited(), rate_budget)
-
-    assert classified.reset_at == NOW + timedelta(seconds=refill_seconds)
-    assert classified.retry_after == math.ceil(refill_seconds)
+    assert classified.reset_at == NOW + timedelta(seconds=declared_s)
+    assert classified.retry_after == math.ceil(declared_s)
 
 
-def test_an_unconfigured_budget_and_no_header_give_a_reset_of_now():
-    # The builder's open point (4) on TE-4: an unthrottled budget models no window and invents none.
-    # Pinned as built; reset_at is still always present, so the rate-limit error can be built.
-    rate_budget = budget(None, None)
-    assert rate_budget.full_refill_seconds == 0.0
+def test_a_scope_that_declares_no_window_and_no_header_give_a_reset_of_now():
+    # The builder's open point (4) on TE-4, carried to the declared window: a scope with no interval declares
+    # none and invents none (ScopeWindow answers 0.0). Pinned as built; reset_at is still always present.
+    rate_budget = budget(0.0, 0.0)
 
     classified = classify(rate_limited(), rate_budget)
 
@@ -377,15 +384,15 @@ def test_an_unconfigured_budget_and_no_header_give_a_reset_of_now():
             NOW + timedelta(seconds=7),
             id='out-of-range-reset-falls-to-retry-after',
         ),
-        pytest.param({RETRY_AFTER_HEADER: 'later'}, NOW + timedelta(seconds=1), id='unreadable-retry-after'),
-        pytest.param({RETRY_AFTER_HEADER: '-5'}, NOW + timedelta(seconds=1), id='negative-retry-after'),
-        pytest.param({RETRY_AFTER_HEADER: 'nan'}, NOW + timedelta(seconds=1), id='nan-retry-after'),
-        pytest.param({RETRY_AFTER_HEADER: 'inf'}, NOW + timedelta(seconds=1), id='infinite-retry-after'),
-        pytest.param({RETRY_AFTER_HEADER: '1e300'}, NOW + timedelta(seconds=1), id='overflowing-retry-after'),
+        pytest.param({RETRY_AFTER_HEADER: 'later'}, NOW + timedelta(seconds=60), id='unreadable-retry-after'),
+        pytest.param({RETRY_AFTER_HEADER: '-5'}, NOW + timedelta(seconds=60), id='negative-retry-after'),
+        pytest.param({RETRY_AFTER_HEADER: 'nan'}, NOW + timedelta(seconds=60), id='nan-retry-after'),
+        pytest.param({RETRY_AFTER_HEADER: 'inf'}, NOW + timedelta(seconds=60), id='infinite-retry-after'),
+        pytest.param({RETRY_AFTER_HEADER: '1e300'}, NOW + timedelta(seconds=60), id='overflowing-retry-after'),
     ],
 )
 def test_a_header_that_cannot_be_read_falls_through_to_the_next_source(headers, expected):
-    # The deployed default budget (3/s, burst 3) refills in 1 s: the last source.
+    # The last source is the scope's declared window, Alpaca data's 60 s (18ff3f5).
     classified = classify(rate_limited(headers))
 
     assert classified.reset_at == expected

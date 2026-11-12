@@ -246,7 +246,7 @@ async def test_no_reason_reaches_the_wire_as_unavailable_through_the_boundary(re
 # A REASON THAT NEVER RENDERS, RAISED OUT OF A SERVICER
 #
 # render() refuses a grpc_code-None reason, because asking for its status is a programming error. Raising
-# one out of a servicer is the SAME programming error -- FEED_NOT_AVAILABLE belongs in the FetchDataset ack
+# one out of a servicer is the SAME programming error -- FEED_NOT_AVAILABLE belongs in the Submit ack
 # (tj-3mk3u5.22 Q5) -- and the boundary treats it as the bug it is rather than letting render()'s
 # ValueError escape. That is what keeps the boundary total: it answers, always.
 

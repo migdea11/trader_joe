@@ -8,11 +8,13 @@
 # Vite dev proxy in web/vite.config.ts does with its rewrite.
 # Only /api/store/ui/v1/* is forwarded: data_store's other routes (/store/* dataset reads and writes,
 # /internal/*, /docs, /ping, /latency) are not the UI's and stay unreachable from a browser, so the
-# secret below is never offered to them. Only GET and HEAD pass, plus exactly three UI writes: PATCH
-# /api/store/ui/v1/datasets/<uuid>/expiry, PATCH /api/store/ui/v1/datasets/<uuid>/collecting and DELETE
-# /api/store/ui/v1/datasets/<uuid>. The secret authenticates writes, so each is matched by an anchored
-# regex on one method and one path shape; no other method (PUT, POST, ...) and no other path can use
-# the proxy as a write path.
+# secret below is never offered to them. Only GET and HEAD pass, plus exactly six UI writes: PATCH
+# /api/store/ui/v1/datasets/<uuid>/expiry, PATCH /api/store/ui/v1/datasets/<uuid>/collecting, DELETE
+# /api/store/ui/v1/datasets/<uuid>, POST /api/store/ui/v1/panels, POST
+# /api/store/ui/v1/panels/<uuid>/settings-versions and POST
+# /api/store/ui/v1/panel-sources/<DATA_SOURCE_NAME>/settings-versions. The secret authenticates writes, so
+# each is matched by an anchored regex on one method and one path shape; no other method (PUT, ...) and
+# no other path can use the proxy as a write path, and POST passes only on the three panel routes.
 # When the UI grows another write, widen exactly that one route and method here and nowhere else.
 #
 # NOTHING FOR data_ingest. There is no data_ingest upstream in this file and the web container is not
@@ -69,15 +71,15 @@
 		respond "ok" 200
 	}
 
-	# This rule is NOT what refuses traversal under /api: Caddy orders the routes (the four proxied rules,
+	# This rule is NOT what refuses traversal under /api: Caddy orders the routes (the seven proxied rules,
 	# /healthz, /api/*, then this one, then the SPA), so it answers 400 only for a path off /api (/x..y).
 	# Under /api a dot-segment traversal (../, %2e%2e/, ..%2f, %2E%2E) is refused by Caddy's own matching on
 	# the decoded, cleaned path: the cleaned path leaves /api/store/ui/v1/ and is never forwarded. It lands
 	# on the /api/* 404 while it stays under /api, and on the SPA (index.html) once it climbs off /api; this
 	# 400 fires only if the cleaned path still holds a literal '..' (/x..y, /api/../a..b). A literal '..'
 	# inside one segment (a..b) under /api/store/ui/v1/ is not a traversal and IS forwarded, as are %252e,
-	# %5c and %2f spellings that stay under /ui/v1; data_store answers those 404 or the same route. The three
-	# write rules' anchored regexes see the decoded path, so a write reaches only the three UI write routes
+	# %5c and %2f spellings that stay under /ui/v1; data_store answers those 404 or the same route. The six
+	# write rules' anchored regexes see the decoded path, so a write reaches only the six UI write routes
 	# whatever its spelling. Caddy 2.11.7 was run with the expiry and delete rules only (tj-grna9p.94):
 	# both forwarded their own shape and refused it spelled with %2e%2e, and the decoded match was seen on
 	# the expiry rule, which matched and forwarded PATCH <uuid>%2fexpiry. The collecting rule is a
@@ -88,7 +90,7 @@
 		respond "bad request" 400
 	}
 
-	# THE PROXIED ROUTES: the read rule, then the three write rules below it, each with the same forwarding
+	# THE PROXIED ROUTES: the read rule, then the six write rules below it, each with the same forwarding
 	# block. See the header for the mapping and the method restriction.
 	@store_ui {
 		method GET HEAD
@@ -147,6 +149,56 @@
 		path_regexp ^/api/store/ui/v1/datasets/[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$
 	}
 	handle @store_ui_delete {
+		uri strip_prefix /api/store
+		reverse_proxy {$DATA_STORE_UPSTREAM} {
+			header_up X-Instance-Secret "{$INSTANCE_WRITE_SECRET}"
+			# A response from the upstream is never cached by the browser or a shared cache: the
+			# data is live.
+			header_down Cache-Control "no-store"
+		}
+	}
+
+	# UI write: create a panel. POST only, exactly /panels (no trailing slash or sub-path). The path line
+	# beside the regex is for ordering, as in the expiry rule above.
+	@store_ui_panel_create {
+		method POST
+		path /api/store/ui/v1/panels
+		path_regexp ^/api/store/ui/v1/panels$
+	}
+	handle @store_ui_panel_create {
+		uri strip_prefix /api/store
+		reverse_proxy {$DATA_STORE_UPSTREAM} {
+			header_up X-Instance-Secret "{$INSTANCE_WRITE_SECRET}"
+			# A response from the upstream is never cached by the browser or a shared cache: the
+			# data is live.
+			header_down Cache-Control "no-store"
+		}
+	}
+
+	# UI write: save a new settings version of one panel (enable and disable included). POST only, one UUID.
+	@store_ui_panel_settings {
+		method POST
+		path /api/store/ui/v1/panels/*
+		path_regexp ^/api/store/ui/v1/panels/[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}/settings-versions$
+	}
+	handle @store_ui_panel_settings {
+		uri strip_prefix /api/store
+		reverse_proxy {$DATA_STORE_UPSTREAM} {
+			header_up X-Instance-Secret "{$INSTANCE_WRITE_SECRET}"
+			# A response from the upstream is never cached by the browser or a shared cache: the
+			# data is live.
+			header_down Cache-Control "no-store"
+		}
+	}
+
+	# UI write: save a new settings version of one data source's panel defaults. POST only, one DATA_SOURCE_
+	# enum name (the route itself refuses UNSPECIFIED and unknown names).
+	@store_ui_source_settings {
+		method POST
+		path /api/store/ui/v1/panel-sources/*
+		path_regexp ^/api/store/ui/v1/panel-sources/DATA_SOURCE_[A-Z0-9_]+/settings-versions$
+	}
+	handle @store_ui_source_settings {
 		uri strip_prefix /api/store
 		reverse_proxy {$DATA_STORE_UPSTREAM} {
 			header_up X-Instance-Secret "{$INSTANCE_WRITE_SECRET}"

@@ -1,6 +1,6 @@
 # Market data ingest
 
-Broker-facing ingest service. Fetches market data from Alpaca and answers data-store's `FetchDataset` gRPC request. Stock only today — crypto and option paths are stubs.
+Broker-facing ingest service. Fetches market data from Alpaca. Data-store's requests arrive on `Submit`, wait in a per-handle FIFO queue and are answered at once; each attempt's result is pushed to the store, which acknowledges it before any retry runs ([`docs/scheduler.md`](../../../docs/scheduler.md)). Stock only today — crypto and option paths are stubs.
 
 ## Architecture reference
 
@@ -8,11 +8,15 @@ Broker-facing ingest service. Fetches market data from Alpaca and answers data-s
 
 ## Tech stack
 
-Python 3.12, FastAPI, alpaca-py, grpc.aio server (health service and `FetchDataset`)
+Python 3.12, FastAPI, alpaca-py, grpc.aio server (health service, `Submit` and `Instance`)
 
 ## Key invariants
 
-Broker-facing layer only; data-store owns the data. Blocking SDK calls go through the shared worker pool, never inline in an async handler. `BrokerRead.get_bars` returns a `BarsResponse` (served, possibly empty, with its `served_range`) or a `BarsFailure` and raises only for a bug; tj-3mk3u5.11 deleted the Kafka edge that turned a failure into a bare `{}`, so every typed failure now reaches the gRPC servicer and is rendered there — no sentinel survives.
+Broker-facing layer only; data-store owns the data. Blocking SDK calls go through the shared worker pool, never inline in an async handler. `BrokerRead.get_bars` returns a `BarsResponse` (served, possibly empty, with its `served_range`) or a `BarsFailure` and raises only for a bug; tj-3mk3u5.11 deleted the Kafka edge that turned a failure into a bare `{}`. A typed failure now ends the attempt as a `FAILED` report whose trailer carries the vocabulary `reason` and the retry class (`DeliveryTrailer.reason`, `store.proto`); a failure with no typed reason (an asset the broker does not know, a raise in the attempt runner) leaves it empty. No sentinel survives.
+
+**Feed (Alpaca):** decided per request inside the Alpaca handle (`alpaca/broker_api.py` `resolve_feed`): no feed named is SIP, SIP named is SIP, IEX named is IEX and served. There is no setting and no environment read for it (owner ruling 2026-11-06, ADR `tj-xn3qa6` addendum 3); the generic `BrokerHandle` takes the rule as a feed policy and decides no feed itself. Downstream the feed is part of the dataset entry's identity, so an IEX request and a SIP request over one window are two datasets (`docs/API.md`, "The feed on a bar" and "What a create does"); the trailer carries the typed reason on `FAILED`.
+
+**The asset list is refused whole when it is malformed** (decision `tj-7zjov1.218`, owner ruling 2026-10-31; `brokers/alpaca/read.py` `get_assets`, `assets.py`, `broker_api.py`). Concrete signals only, never a size or percentage threshold, and every check lives here, not in the store (a delivery the store refuses is redelivered for ever and lost at an ingest restart). Checks on the list read (the by-symbol lookup keeps its own rules): G1 HTTP status exactly 200; G2 media type `application/json`; G3 `Content-Length`, when present and no `Content-Encoding` is applied (any value skips it, `identity` included), equals the body length; G4 one UTF-8 JSON array and nothing after it but whitespace; G5 per record the documented required fields with their types (`id` a UUID in CANONICAL form (lowercase, hyphenated 8-4-4-4-12, `str(uuid.UUID(id)) == id`; upper or mixed case, braces, a `urn:uuid:` or `uuid:` prefix, bare hex, misplaced hyphens and surrounding whitespace are violations; owner ruling 2026-11-01, commit `141899f`), `symbol`, `class` equal to the requested class, `status` equal to the requested list, `exchange`, the four booleans, `name` a string, empty allowed); G6 no vendor id twice in one response (a repeated symbol is not a signal); G7 each element a JSON object. Not checked, on purpose: exchange and attribute values (an open set), unknown extra keys, optional fields, an empty array. A violation is `AssetListFailure(ExogenousError(VENDOR_UNAVAILABLE, detail))`, error class TRANSIENT: retried up to `ALPACA_MAX_ATTEMPTS`, then the request fails `ATTEMPTS_EXHAUSTED`, and the snapshot schedule asks again at its next trigger. The detail is `asset list refused as malformed: <check> (<count>)` (the check phrase is fixed, e.g. `G6 duplicate vendor id`; counts only, never a vendor value) and reaches `ingest_run.error_message` and the UI's run history. No snapshot and no event is written, because the store's asset-list arm runs only on SUCCEEDED. **Residue accepted:** a complete, well-formed, internally consistent but SHORT list cannot be detected by format (the vendor documents no total or completeness marker), and no plausibility warning is logged, since any "too few" test is a size threshold by another name. Confirmed by the owner 2026-11-01 (addendum 2 of `tj-7zjov1.218`): values are not checked against a fixed list, and the refusal is told apart by its detail text only (no stored distinct reason). G6 compares ids as served strings, which is safe because G5 leaves an id one spelling (the store derives asset-list events by the raw id string, so a respelled id would write a false vanished and appeared).
 
 ## Environment variables
 
@@ -20,6 +24,12 @@ Broker-facing layer only; data-store owns the data. Blocking SDK calls go throug
 |---|---|---|
 | ALPACA_API_KEY / ALPACA_API_SECRET | broker credentials | unset |
 | APP_INTERNAL_GRPC_HOST / APP_INTERNAL_GRPC_PORT | where the gRPC server binds; startup fails if either is unset | unset, by design (compose sets them) |
+| DATA_STORE_GRPC_TARGET | host:port of the store's gRPC server, where attempt reports go; the production app's startup fails if it is unset | unset, by design (compose sets it) |
+| ALPACA_TRADING_BASE_URL | host of the Alpaca trading API, read by the asset list and asset-by-symbol reads; paper is `https://paper-api.alpaca.markets`. The key must match the host (paper key with the paper host, live key with the live host). Unset, the asset reads fail closed with a VENDOR_AUTH failure. A host selector, not an enable flag | unset, by design (commented in `.env.default`) |
+| ALPACA_RATE_LIMIT_PER_MINUTE | Alpaca calls per minute; may only lower the hard-coded ceiling of 200. Replaces the retired ALPACA_RATE_LIMIT_PER_SEC, ALPACA_RATE_BURST and ALPACA_BACKFILL_RESERVE, which nothing reads now | 200 |
+| ALPACA_OUTGOING_BUFFER_SIZE | unacknowledged attempt reports the Alpaca handle holds before it stops taking work from its queue | 64 (the queue, ready-by, retry, pacing and stall alarm: [`docs/scheduler.md`](../../../docs/scheduler.md)) |
+| ALPACA_STALL_TIMEOUT_S | seconds the oldest unacknowledged report may wait before the stall alarm (ERROR log, `stalled`) | 300 |
+| ALPACA_MAX_ATTEMPTS | attempts one request gets, the first included | 5 |
 
 ## Common pitfalls
 

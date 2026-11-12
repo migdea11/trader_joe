@@ -146,12 +146,19 @@ def test_the_two_fixed_texts_for_a_reason_that_is_never_a_grpc_status_are_the_on
     Every other assertion reads its expectation from the table or from these constants, so without this
     the two texts could be rewritten to anything and the suite would follow them silently.
     """
-    assert FEED_NOT_AVAILABLE_GRPC_TEXT == 'in-band on the FetchDataset ack, never a status'
+    # Reworded by P37 (tj-7zjov1.280): the FetchDataset stream is gone, and the one in-band refusal is on the
+    # Submit ack. The bead's original text named the FetchDataset ack.
+    assert FEED_NOT_AVAILABLE_GRPC_TEXT == 'in-band on the Submit ack, never a status'
     assert NO_GRPC_STATUS_TEXT == 'not rendered as a status'
 
     rows = {row[0]: row for row in table_rows(render_document())[2:]}
 
     assert rows[Reason.FEED_NOT_AVAILABLE.value][4] == FEED_NOT_AVAILABLE_GRPC_TEXT
+    # The committed document, read back the same way, carries it too (the byte-for-byte pin is below).
+    with DOC_PATH.open(encoding='utf-8', newline='') as handle:
+        committed = {row[0]: row for row in table_rows(handle.read())[2:]}
+    assert committed[Reason.FEED_NOT_AVAILABLE.value][4] == 'in-band on the Submit ack, never a status'
+    assert 'FetchDataset' not in DOC_PATH.read_text(encoding='utf-8')
     others = [
         reason for reason in Reason if REASONS[reason].grpc_code is None and reason is not Reason.FEED_NOT_AVAILABLE
     ]

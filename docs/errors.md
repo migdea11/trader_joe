@@ -31,7 +31,7 @@ carries a delay that went stale on the way.
 | INVALID_REQUEST | REFUSED | CLIENT_FIX | 422 | INVALID_ARGUMENT | The request did not match its declared schema; correct the fields the error lists and send it again. |
 | UNSUPPORTED_ASSET_TYPE | REFUSED | CLIENT_FIX | 422 | INVALID_ARGUMENT | The asset type or data type asked for is not supported; ask for a supported one instead. |
 | UNSUPPORTED_INSTRUMENT | REFUSED | CLIENT_FIX | 422 | INVALID_ARGUMENT | The broker cannot serve the instrument as specified, such as its currency or exchange; change the instrument and ask again. |
-| FEED_NOT_AVAILABLE | REFUSED | CLIENT_FIX | 422 | in-band on the FetchDataset ack, never a status | This deployment cannot serve the market-data feed asked for; ask for a feed it serves, or leave the feed unset. |
+| FEED_NOT_AVAILABLE | REFUSED | CLIENT_FIX | 422 | in-band on the Submit ack, never a status | This deployment cannot serve the market-data feed asked for; ask for a feed it serves, or leave the feed unset. |
 | VENDOR_INVALID_REQUEST | REFUSED | CLIENT_FIX | 422 | INVALID_ARGUMENT | The market-data vendor refused the request as invalid, such as an end before its start; correct the request and send it again. |
 | RANGE_IN_FUTURE | REFUSED | CLIENT_FIX | 422 | INVALID_ARGUMENT | The range asked for starts at or after the current time, so there is no history to fetch; check the dates and their time zone. |
 | VENDOR_REJECTED | REFUSED | PAGE | 422 | INVALID_ARGUMENT | The market-data vendor refused the request for a reason it does not document; do not retry it unchanged until an operator has looked. |
@@ -53,6 +53,7 @@ carries a delay that went stale on the way.
 | PEER_PROTOCOL_ERROR | NOT_READY | PAGE | 502 | not rendered as a status | Another service sent a reply this one could not interpret, usually a version mismatch between them; retry once both run the same release. |
 | DATABASE_UNAVAILABLE | NOT_READY | PAGE | 503 | not rendered as a status | The database could not be reached or dropped the connection; retry later. |
 | DATABASE_CONFLICT | NOT_READY | RECORD | 503 | not rendered as a status | The write collided with a concurrent transaction and was rolled back; retry it. |
+| RANGE_TOO_RECENT | NOT_READY | RECORD | 503 | FAILED_PRECONDITION | The range reaches into data too recent for this deployment's market-data entitlement; retry once reset_at has passed, or end the range earlier. |
 
 ## Extension members
 

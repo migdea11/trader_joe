@@ -10,23 +10,48 @@ but ui/v1 are built from the generated module directly. When builder-shared take
 common/rpc, this module reduces to imports from there.
 
 ENUMS CROSS BY MEMBER NAME, as everywhere (common.rpc.mapping.values): the ui/v1 enums that market/v1 does not
-carry (ExpiryType, DatasetState, FreshnessStatus) are looked up by their own prefixed names.
+carry (ExpiryType, DatasetState, DatasetHealthStatus) are looked up by their own prefixed names.
 """
 
 import uuid
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 
 from fastapi import Request
 
-from common.enums.data_stock import ExpiryType, Granularity
+from common.enums.data_stock import DataSource, ExpiryType, Granularity
+from common.errors.vocabulary import InvalidRequestError, Reason
 from common.rpc.mapping.fetch_dataset import bar_to_proto
-from common.rpc.mapping.values import ASSET_TYPE, DATA_SOURCE, DATA_TYPE, FEED, GRANULARITY, UPDATE_TYPE, to_timestamp
+from common.rpc.mapping.values import (
+    ASSET_TYPE,
+    DATA_SOURCE,
+    DATA_TYPE,
+    FEED,
+    GRANULARITY,
+    UPDATE_TYPE,
+    ProtoMappingError,
+    enum_mapping,
+    to_timestamp,
+)
 from data.store.app.database.crud.dataset_override import OperatorOverrideInput
 from data.store.app.database.crud.ingest_run import IngestRunRecord
+from data.store.app.database.crud.panel_reads import (
+    ActionRow,
+    PanelListRow,
+    PassRef,
+    SettingsVersionRow,
+    SourceVersionRow,
+)
+from data.store.app.database.crud.panel_settings import (
+    DEFAULT_CORPORATE_ACTION_WINDOW_DAYS,
+    PanelSettings,
+    SourceSettings,
+)
 from data.store.app.database.crud.stock.dataset_catalog import BarExtent
 from data.store.app.database.models.dataset_read import ReadClientKind
 from data.store.app.database.models.ingest_run import IngestRunState
+from data.store.app.database.models.panel import PANEL_GRANULARITIES, PanelCadence, PanelPassKind, PanelTransition
 from data.store.app.dataset_catalog import (
     BarPageIndexResult,
     BarPageResult,
@@ -48,10 +73,22 @@ from data.store.app.dataset_catalog import (
     is_retired,
 )
 from data.store.app.events import DatasetChanged, DomainEvent, IngestRunChanged, ReaperPendingChanged, RequestChanged
+from data.store.app.panel_views import (
+    ActionPageView,
+    BoundariesView,
+    DayState,
+    HistoryView,
+    MarkerKind,
+    MemberCounts,
+    MemberPageView,
+    PanelDetailView,
+    SettingsVersionPageView,
+    SourceVersionPageView,
+)
 from data.store.app.ui_config import UiConfigView
 from routers.common.proto_json import ProtoBody
 from schemas.data_ingest import fetch_dataset as domain
-from trader_joe.proto.ui.v1 import data_pb2, events_pb2, shell_pb2, stats_pb2  # noqa: TID251
+from trader_joe.proto.ui.v1 import data_pb2, events_pb2, panels_pb2, shell_pb2, stats_pb2  # noqa: TID251
 
 
 # The message types the routes declare as x-proto-message (routers.common.proto_json.proto_route). Re-exported so a
@@ -75,20 +112,34 @@ UiConfigMessage = shell_pb2.UiConfig
 SetExpiryRequestMessage = data_pb2.SetExpiryRequest
 DeleteDatasetRequestMessage = data_pb2.DeleteDatasetRequest
 SetCollectingRequestMessage = data_pb2.SetCollectingRequest
+# The panel messages (tj-7zjov1.36): the reads' responses and the three writes' bodies.
+PanelListMessage = panels_pb2.PanelList
+PanelDetailMessage = panels_pb2.PanelDetail
+PanelSettingsVersionPageMessage = panels_pb2.PanelSettingsVersionPage
+PanelSettingsVersionMessage = panels_pb2.PanelSettingsVersion
+PanelSourceSettingsVersionPageMessage = panels_pb2.PanelSourceSettingsVersionPage
+PanelSourceSettingsVersionMessage = panels_pb2.PanelSourceSettingsVersion
+PanelBoundariesMessage = panels_pb2.PanelBoundaries
+PanelMemberPageMessage = panels_pb2.PanelMemberPage
+AssetListHistoryMessage = panels_pb2.AssetListHistory
+CorporateActionEventPageMessage = panels_pb2.CorporateActionEventPage
+CreatePanelRequestMessage = panels_pb2.CreatePanelRequest
+SavePanelSettingsRequestMessage = panels_pb2.SavePanelSettingsRequest
+SaveSourceSettingsRequestMessage = panels_pb2.SaveSourceSettingsRequest
 
 
 def _enum_value(enum_type: Any, prefix: str, member: Any) -> int:
     return enum_type.Value(f'{prefix}{member.name}')
 
 
-def _freshness(view: DatasetView, as_of: datetime) -> data_pb2.Freshness:
-    message = data_pb2.Freshness()
+def _health(view: DatasetView, as_of: datetime) -> data_pb2.DatasetHealth:
+    message = data_pb2.DatasetHealth()
     message.as_of.CopyFrom(to_timestamp(as_of))
     health = view.health
     if health is None:
         # No trading calendar for the source: nothing is computed, and UNSPECIFIED says so.
         return message
-    message.status = _enum_value(data_pb2.FreshnessStatus, 'FRESHNESS_STATUS_', health.status)
+    message.status = _enum_value(data_pb2.DatasetHealthStatus, 'DATASET_HEALTH_STATUS_', health.status)
     message.gap_count = health.gap_count
     if health.expected_last_bar is not None:
         message.expected_last_bar.CopyFrom(to_timestamp(health.expected_last_bar))
@@ -155,7 +206,7 @@ def _summary(
         message.first_bar.CopyFrom(to_timestamp(extent.first_bar))
     if extent.last_bar is not None:
         message.last_bar.CopyFrom(to_timestamp(extent.last_bar))
-    message.freshness.CopyFrom(_freshness(view, as_of))
+    message.health.CopyFrom(_health(view, as_of))
     message.siblings.extend(
         data_pb2.DatasetSibling(id=str(sibling_id), granularity=GRANULARITY.to_proto(granularity))
         for sibling_id, granularity in siblings
@@ -229,7 +280,7 @@ def dataset_summary_message(detail: DatasetDetail) -> data_pb2.DatasetSummary:
         detail: The dataset the catalog produced.
 
     Returns:
-        data_pb2.DatasetSummary: The dataset with its freshness, extent and siblings.
+        data_pb2.DatasetSummary: The dataset with its health, extent and siblings.
     """
     return _summary(
         detail.view,
@@ -283,7 +334,9 @@ def facets_message(facets: Facets) -> data_pb2.DatasetFacets:
         for update_type, count in facets.update_types.items()
     )
     message.statuses.extend(
-        data_pb2.StatusFacet(status=_enum_value(data_pb2.FreshnessStatus, 'FRESHNESS_STATUS_', status), count=count)
+        data_pb2.StatusFacet(
+            status=_enum_value(data_pb2.DatasetHealthStatus, 'DATASET_HEALTH_STATUS_', status), count=count
+        )
         for status, count in facets.statuses.items()
     )
     return message
@@ -391,8 +444,8 @@ def bar_page_index_message(index: BarPageIndexResult) -> data_pb2.BarPageIndex:
 def bar_page_message(page: BarPageResult) -> data_pb2.BarPage:
     """A page of bars as a BarPage message.
 
-    Each bar crosses through the seam's own mapper (common.rpc.mapping.bar_to_proto), the same one the internal
-    FetchDataset contract uses. The store keeps no vwap, so none is set.
+    Each bar crosses through the seam's own mapper (common.rpc.mapping.bar_to_proto), the same one the Submit and delivery
+    contract uses. The store keeps no vwap, so none is set.
 
     Args:
         page: The bar rows the catalog produced.
@@ -459,7 +512,8 @@ def ui_config_message(config: UiConfigView) -> shell_pb2.UiConfig:
 def ingest_run_message(run: IngestRunRecord) -> data_pb2.IngestRun:
     """One run as an IngestRun message.
 
-    The dataset id is empty until the run's ack, the label is the symbol and bar width, and the error is
+    The dataset id is empty until the run's ack, the label is the symbol and bar width (either may be absent: a
+    corporate-actions attempt has a symbol and no width, an asset-list attempt neither, so its label is empty), and the error is
     set only for a FAILED run (an untyped failure carries an empty domain and reason).
 
     Args:
@@ -471,7 +525,7 @@ def ingest_run_message(run: IngestRunRecord) -> data_pb2.IngestRun:
     message = data_pb2.IngestRun(
         id=str(run.id),
         dataset_id=str(run.dataset_id) if run.dataset_id is not None else '',
-        label=f'{run.asset_symbol} {run.granularity.value}',
+        label=' '.join(part for part in (run.asset_symbol, run.granularity.value if run.granularity else None) if part),
         trigger=_enum_value(data_pb2.RunTrigger, 'RUN_TRIGGER_', run.trigger),
         actor=run.actor,
         state=_enum_value(data_pb2.IngestRunState, 'INGEST_RUN_STATE_', run.state),
@@ -630,3 +684,358 @@ async def delete_request_body(request: Request) -> data_pb2.DeleteDatasetRequest
     if not (await request.body()).strip():
         return DeleteDatasetRequestMessage()
     return await _parse_delete_body(request)
+
+
+# --------------------------------------------------------------------------------------------- panels (tj-7zjov1.36)
+
+_CADENCE = enum_mapping(panels_pb2.PanelCadence.DESCRIPTOR, PanelCadence)
+_TRANSITION = enum_mapping(panels_pb2.PanelTransition.DESCRIPTOR, PanelTransition)
+_PASS_KIND = enum_mapping(panels_pb2.PanelPassKind.DESCRIPTOR, PanelPassKind)
+_MARKER_KIND = enum_mapping(panels_pb2.PanelMarkerKind.DESCRIPTOR, MarkerKind)
+_DAY_STATE = enum_mapping(panels_pb2.AssetListDayState.DESCRIPTOR, DayState)
+
+
+def _refuse(detail: str) -> InvalidRequestError:
+    return InvalidRequestError(Reason.INVALID_REQUEST, detail)
+
+
+def _panel_settings_message(settings: PanelSettings) -> panels_pb2.PanelSettings:
+    message = panels_pb2.PanelSettings(
+        enabled=settings.enabled, allow_symbols=list(settings.allow_symbols), deny_symbols=list(settings.deny_symbols)
+    )
+    if settings.cadence is not None:
+        message.cadence = _CADENCE.to_proto(settings.cadence)
+    if settings.asset_class is not None:
+        message.asset_class = ASSET_TYPE.to_proto(settings.asset_class)
+    if settings.exchange is not None:
+        message.exchange = settings.exchange
+    if settings.active is not None:
+        message.active = settings.active
+    if settings.tradable is not None:
+        message.tradable = settings.tradable
+    message.include_otc = settings.include_otc
+    return message
+
+
+def _effective_pass_message(effective: PassRef) -> panels_pb2.EffectivePass:
+    message = panels_pb2.EffectivePass(pass_id=str(effective.pass_id), kind=_PASS_KIND.to_proto(effective.kind))
+    message.started_at.CopyFrom(to_timestamp(effective.started_at))
+    return message
+
+
+def panel_settings_version_message(row: SettingsVersionRow) -> panels_pb2.PanelSettingsVersion:
+    """One panel settings version as a PanelSettingsVersion: the full settings, the marker, the effective pass if any."""
+    record = row.record
+    message = panels_pb2.PanelSettingsVersion(
+        version_no=record.version_no, actor=record.actor, reason=record.reason or ''
+    )
+    message.settings.CopyFrom(_panel_settings_message(record.settings))
+    message.saved_at.CopyFrom(to_timestamp(record.saved_at))
+    if row.effective is not None:
+        message.effective_pass.CopyFrom(_effective_pass_message(row.effective))
+    return message
+
+
+def panel_source_settings_version_message(row: SourceVersionRow) -> panels_pb2.PanelSourceSettingsVersion:
+    """One source settings version as a PanelSourceSettingsVersion, the effective pass if any."""
+    record = row.record
+    # A rate that is NULL is NO LIMIT and stays unset on the wire (explicit presence), never 0 (ADR tj-2ayia2 D3).
+    message = panels_pb2.PanelSourceSettingsVersion(
+        source=DATA_SOURCE.to_proto(record.source),
+        version_no=record.version_no,
+        actor=record.actor,
+        reason=record.reason or '',
+        settings=panels_pb2.PanelSourceSettings(
+            ramp_datasets_per_hour=record.settings.ramp_datasets_per_hour,
+            request_cap_per_hour=record.settings.request_cap_per_hour,
+            corporate_action_window_pre_days=record.settings.corporate_action_window_pre_days,
+            corporate_action_window_post_days=record.settings.corporate_action_window_post_days,
+        ),
+    )
+    message.saved_at.CopyFrom(to_timestamp(record.saved_at))
+    if row.effective is not None:
+        message.effective_pass.CopyFrom(_effective_pass_message(row.effective))
+    return message
+
+
+def panel_list_message(rows: list[PanelListRow]) -> panels_pb2.PanelList:
+    """Every panel as a PanelList, in the order given."""
+    message = panels_pb2.PanelList()
+    message.items.extend(
+        panels_pb2.PanelListItem(
+            id=str(row.panel.id),
+            name=row.panel.name,
+            source=DATA_SOURCE.to_proto(row.panel.source),
+            enabled=row.enabled,
+            granularity=GRANULARITY.to_proto(row.panel.granularity),
+        )
+        for row in rows
+    )
+    return message
+
+
+def _counts_message(counts: MemberCounts) -> panels_pb2.PanelMembershipCounts:
+    return panels_pb2.PanelMembershipCounts(
+        members=counts.members, collecting=counts.collecting, draining=counts.draining, lagging=counts.lagging
+    )
+
+
+def panel_detail_message(view: PanelDetailView) -> panels_pb2.PanelDetail:
+    """A panel as a PanelDetail: current versions with their effective passes, and the counts."""
+    message = panels_pb2.PanelDetail(
+        id=str(view.panel.id),
+        name=view.panel.name,
+        source=DATA_SOURCE.to_proto(view.panel.source),
+        granularity=GRANULARITY.to_proto(view.panel.granularity),
+    )
+    message.created_at.CopyFrom(to_timestamp(view.panel.created_at))
+    message.current_version.CopyFrom(panel_settings_version_message(view.current_version))
+    if view.current_source_version is not None:
+        message.current_source_version.CopyFrom(panel_source_settings_version_message(view.current_source_version))
+    message.counts.CopyFrom(_counts_message(view.counts))
+    return message
+
+
+def panel_settings_version_page_message(page: SettingsVersionPageView) -> panels_pb2.PanelSettingsVersionPage:
+    """A page of panel settings versions, newest first."""
+    message = panels_pb2.PanelSettingsVersionPage(next_cursor=page.next_cursor)
+    message.items.extend(panel_settings_version_message(row) for row in page.items)
+    return message
+
+
+def panel_source_settings_version_page_message(
+    page: SourceVersionPageView,
+) -> panels_pb2.PanelSourceSettingsVersionPage:
+    """A page of source settings versions, newest first."""
+    message = panels_pb2.PanelSourceSettingsVersionPage(next_cursor=page.next_cursor)
+    message.items.extend(panel_source_settings_version_message(row) for row in page.items)
+    return message
+
+
+def panel_boundaries_message(view: BoundariesView) -> panels_pb2.PanelBoundaries:
+    """The markers of a window as a PanelBoundaries, oldest first, the window echoed."""
+    message = panels_pb2.PanelBoundaries()
+    message.start.CopyFrom(to_timestamp(view.start))
+    message.end.CopyFrom(to_timestamp(view.end))
+    for marker in view.markers:
+        entry = message.markers.add(
+            kind=_MARKER_KIND.to_proto(marker.kind),
+            version_no=marker.version_no,
+            actor=marker.actor,
+            reason=marker.reason,
+            dataset_id=str(marker.dataset_id) if marker.dataset_id is not None else '',
+            label=marker.label,
+        )
+        entry.at.CopyFrom(to_timestamp(marker.at))
+    return message
+
+
+def panel_member_page_message(page: MemberPageView) -> panels_pb2.PanelMemberPage:
+    """A page of members as a PanelMemberPage. A member with no dataset or no computed health reads UNSPECIFIED."""
+    message = panels_pb2.PanelMemberPage(next_cursor=page.next_cursor)
+    for member in page.items:
+        entry = message.items.add(
+            vendor_asset_id=member.vendor_asset_id,
+            symbol=member.symbol,
+            status=_TRANSITION.to_proto(member.status),
+            cause=member.cause,
+            dataset_id=str(member.dataset_id) if member.dataset_id is not None else '',
+            appeared_on=member.appeared_on,
+            vanished_on=member.vanished_on,
+        )
+        if member.last_bar is not None:
+            entry.last_bar.CopyFrom(to_timestamp(member.last_bar))
+        if member.health is not None:
+            entry.health = _enum_value(data_pb2.DatasetHealthStatus, 'DATASET_HEALTH_STATUS_', member.health)
+        entry.as_of.CopyFrom(to_timestamp(member.as_of))
+        entry.recorded_at.CopyFrom(to_timestamp(member.recorded_at))
+    return message
+
+
+def asset_list_history_message(view: HistoryView) -> panels_pb2.AssetListHistory:
+    """The asset-list history as an AssetListHistory: one entry per expected day, ascending."""
+    message = panels_pb2.AssetListHistory()
+    message.start.CopyFrom(to_timestamp(view.start))
+    message.end.CopyFrom(to_timestamp(view.end))
+    message.as_of.CopyFrom(to_timestamp(view.as_of))
+    message.days.extend(
+        panels_pb2.AssetListHistoryDay(
+            day=day.day, state=_DAY_STATE.to_proto(day.state), changed_count=day.changed_count
+        )
+        for day in view.days
+    )
+    return message
+
+
+def _action_message(row: ActionRow) -> panels_pb2.CorporateActionEvent:
+    message = panels_pb2.CorporateActionEvent(vendor_action_id=row.vendor_action_id, action_type=row.action_type)
+    for name, value in (
+        ('ex_date', row.ex_date),
+        ('record_date', row.record_date),
+        ('payable_date', row.payable_date),
+        ('process_date', row.process_date),
+        ('effective_date', row.effective_date),
+    ):
+        if value is not None:
+            getattr(message, name).CopyFrom(to_timestamp(value))
+    message.as_of.CopyFrom(to_timestamp(row.as_of))
+    return message
+
+
+def corporate_action_page_message(page: ActionPageView) -> panels_pb2.CorporateActionEventPage:
+    """A page of a dataset's corporate-action observations, newest as_of first."""
+    message = panels_pb2.CorporateActionEventPage(next_cursor=page.next_cursor)
+    message.items.extend(_action_message(row) for row in page.items)
+    return message
+
+
+# The write bodies. Presence is meaningful: an absent value is refused (422), never read as false or zero.
+
+
+def _panel_settings_of(request: Any) -> PanelSettings:
+    """The panel settings shared by the save and create bodies (save 1-9 and 11, create the same by name); an absent enabled is a 422.
+
+    include_otc is a plain bool: absent reads as false (off), the ruled default.
+    """
+    if not request.HasField('enabled'):
+        raise _refuse('enabled is required.')
+    try:
+        asset_class = ASSET_TYPE.to_domain(request.asset_class) if request.HasField('asset_class') else None
+        cadence = (
+            None if request.cadence == panels_pb2.PANEL_CADENCE_UNSPECIFIED else _CADENCE.to_domain(request.cadence)
+        )
+    except ProtoMappingError:
+        raise _refuse('asset_class and cadence must name a value this release knows.') from None
+    return PanelSettings(
+        enabled=request.enabled,
+        cadence=cadence,
+        allow_symbols=tuple(request.allow_symbols),
+        deny_symbols=tuple(request.deny_symbols),
+        asset_class=asset_class,
+        exchange=request.exchange if request.HasField('exchange') else None,
+        active=request.active if request.HasField('active') else None,
+        tradable=request.tradable if request.HasField('tradable') else None,
+        include_otc=request.include_otc,
+    )
+
+
+def save_panel_settings_values(request: panels_pb2.SavePanelSettingsRequest) -> tuple[PanelSettings, str]:
+    """A SavePanelSettingsRequest as plain values: the settings and the optional reason (empty means none).
+
+    A new version states its cadence in full, so an UNSPECIFIED one is refused here (422).
+
+    Args:
+        request: The parsed body.
+
+    Returns:
+        tuple[PanelSettings, str]: The settings and the reason as sent, possibly empty (the store trims it and
+            keeps NULL for a blank one).
+
+    Raises:
+        InvalidRequestError: INVALID_REQUEST (422) for an absent enabled, an UNSPECIFIED cadence, or a value
+            this release does not know.
+    """
+    settings = _panel_settings_of(request)
+    if settings.cadence is None:
+        raise _refuse('cadence is required.')
+    return settings, request.reason
+
+
+def _source_numbers(request: Any, *, window_default: bool) -> SourceSettings:
+    """A source settings from a body: an absent rate is None (no limit), the window days default when allowed.
+
+    Presence only: a present 0, a ramp under 1 or a cap under 2 passes through and the crud refuses it (the one place
+    the range lives).
+    """
+    ramp = request.ramp_datasets_per_hour if request.HasField('ramp_datasets_per_hour') else None
+    cap = request.request_cap_per_hour if request.HasField('request_cap_per_hour') else None
+    window: list[int] = []
+    for name in ('corporate_action_window_pre_days', 'corporate_action_window_post_days'):
+        if request.HasField(name):
+            window.append(getattr(request, name))
+        elif window_default:
+            window.append(DEFAULT_CORPORATE_ACTION_WINDOW_DAYS)
+        else:
+            raise _refuse(f'{name} is required.')
+    return SourceSettings(
+        ramp_datasets_per_hour=ramp,
+        request_cap_per_hour=cap,
+        corporate_action_window_pre_days=window[0],
+        corporate_action_window_post_days=window[1],
+    )
+
+
+def save_source_settings_values(request: panels_pb2.SaveSourceSettingsRequest) -> tuple[SourceSettings, str]:
+    """A SaveSourceSettingsRequest as plain values: the source settings and the reason.
+
+    Args:
+        request: The parsed body.
+
+    Returns:
+        tuple[SourceSettings, str]: The settings and the reason as sent.
+
+    Raises:
+        InvalidRequestError: INVALID_REQUEST (422) when a window day count is absent, or (from the store) a rate or
+            window is out of range.
+    """
+    return _source_numbers(request, window_default=False), request.reason
+
+
+@dataclass(frozen=True)
+class CreatePanelValues:
+    """A CreatePanelRequest as plain values."""
+
+    name: str
+    source: DataSource
+    granularity: Granularity
+    settings: PanelSettings
+    source_settings: SourceSettings | None
+    reason: str
+
+
+def create_panel_values(request: panels_pb2.CreatePanelRequest) -> CreatePanelValues:
+    """A CreatePanelRequest as plain values.
+
+    The granularity is required and fixed for the panel's life: UNSPECIFIED, or any value outside PANEL_GRANULARITIES
+    (1 Minute, 1 Hour, 1 Day), is refused. The cadence UNSPECIFIED is None, so the store applies its default. The source settings are GIVEN when any of fields
+    13 to 16 is present; an absent rate is None (no limit) and an absent window day count takes the store's 90. None
+    given is None, and the store then writes the source's first version (no limits, 90 days) when the source has none.
+
+    Args:
+        request: The parsed body.
+
+    Returns:
+        CreatePanelValues: The name, source, granularity, settings, optional source settings and reason.
+
+    Raises:
+        InvalidRequestError: INVALID_REQUEST (422) for an absent enabled, an UNSPECIFIED or unknown source, an
+            UNSPECIFIED granularity or one outside PANEL_GRANULARITIES, or a value this release does not know.
+    """
+    settings = _panel_settings_of(request)
+    try:
+        source = DATA_SOURCE.to_domain(request.source)
+    except ProtoMappingError:
+        raise _refuse('source is required and must name a source this release knows.') from None
+    try:
+        granularity = GRANULARITY.to_domain(request.granularity)
+    except ProtoMappingError:
+        raise _refuse('granularity is required and must be one of 1 Minute, 1 Hour or 1 Day.') from None
+    if granularity not in PANEL_GRANULARITIES:
+        raise _refuse('granularity is required and must be one of 1 Minute, 1 Hour or 1 Day.')
+    given = any(
+        request.HasField(name)
+        for name in (
+            'ramp_datasets_per_hour',
+            'request_cap_per_hour',
+            'corporate_action_window_pre_days',
+            'corporate_action_window_post_days',
+        )
+    )
+    return CreatePanelValues(
+        name=request.name,
+        source=source,
+        granularity=granularity,
+        settings=settings,
+        source_settings=_source_numbers(request, window_default=True) if given else None,
+        reason=request.reason,
+    )

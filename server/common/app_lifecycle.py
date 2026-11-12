@@ -3,7 +3,7 @@ from fastapi.routing import iter_route_contexts
 
 from common.enums.config_enum import RunMode
 from common.environment import get_env_var, get_run_mode
-from common.logging import get_logger
+from common.logging import configure_broker_sink, get_logger, install_scrub
 
 
 log = get_logger(__name__)
@@ -22,6 +22,10 @@ def startup_logs(app: FastAPI):
     Args:
         app (FastAPI): The FastAPI app
     """
+    # Scrub and broker sink first, so nothing below or later reaches a handler unwrapped. The sink
+    # path is read here because common.environment imports common.logging (a cycle otherwise).
+    configure_broker_sink(get_env_var('BROKER_LOG_FILE', None))
+    install_scrub()
     log.info('Starting up app...')
     log.info(f'App run mode: {get_run_mode()}')
     log.info('Routes:')

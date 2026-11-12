@@ -3,7 +3,7 @@
 // Datasets, Needs Attention) and Filters (Status, Source, Update) with counts from the facets.
 // The server filters by one value per group, so each group is a single choice: ticking an option
 // replaces the group's current one, and ticking it again clears the group. Running in the Status
-// group is the exception: it is orthogonal to the freshness words (a Late dataset can be running a
+// group is the exception: it is orthogonal to the health words (a Late dataset can be running a
 // retry), so it is its own toggle and combines with one of them. Stream is shown disabled
 // (a later phase). Phase 3 adds the Stale and Expiring Soon views, the Usage group (Read in the last
 // 30 days, Stale, Never read) and the Read By group (SDK and UI, at least one ticked, default SDK):

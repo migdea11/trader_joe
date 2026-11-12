@@ -6,6 +6,7 @@ from fastapi.concurrency import asynccontextmanager
 from fastapi.testclient import TestClient
 
 from common.app_lifecycle import startup_logs, teardown_logs
+from common.tests.logging_isolation import isolated_logging
 
 
 LOGGER_NAME = 'common.app_lifecycle'
@@ -67,7 +68,9 @@ def lifespan_logs(caplog: pytest.LogCaptureFixture) -> list[str]:
     """
     caplog.set_level(logging.INFO, logger=LOGGER_NAME)
     app = _build_app()
-    with TestClient(app):
+    # startup_logs installs the broker sink (propagate False on BROKER_LOGGERS) and wraps handlers
+    # for the rest of the process; put that back so later tests see the logging they started with.
+    with isolated_logging(), TestClient(app):
         pass
     return [record.getMessage() for record in caplog.records if record.name == LOGGER_NAME]
 

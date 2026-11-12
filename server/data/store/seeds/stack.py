@@ -39,6 +39,7 @@ from typing import Any, Self
 
 import httpx
 import psycopg2
+from sqlalchemy.engine import URL
 
 from data.store.seeds.manifest import SESSION_OPTIONS
 
@@ -191,6 +192,22 @@ class Stack:
             return self.__connection.cursor()
         except psycopg2.Error as error:
             raise StackError(f'{what}: could not open a cursor ({type(error).__name__})') from None
+
+    def async_url(self) -> URL:
+        """The asyncpg URL of the same database, for the store's own (async) code.
+
+        Returns:
+            URL: A URL object whose repr masks the password; never format it into a message.
+        """
+        settings = self.__settings
+        return URL.create(
+            'postgresql+asyncpg',
+            username=settings.user,
+            password=settings.password,
+            host=settings.host,
+            port=settings.port,
+            database=settings.database,
+        )
 
     def query(self, sql: str, what: str) -> list[tuple[Any, ...]]:
         """Run one statement and return its rows.

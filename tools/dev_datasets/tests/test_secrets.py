@@ -101,7 +101,21 @@ def test_a_database_failure_that_quotes_the_password_shows_the_type_only(argv):
     assert_no_canary(outcome.text)
 
 
-@pytest.mark.parametrize('failing', ['lock_timeout', "state = 'RUNNING'", 'count(*)', 'TRUNCATE'])
+@pytest.mark.parametrize(
+    'failing',
+    [
+        'lock_timeout',
+        "state = 'RUNNING'",
+        "state IN ('PENDING', 'QUEUED')",
+        'count(*)',
+        'TRUNCATE',
+        # tj-7zjov1.297: the dev reset's export and reload statements.
+        'TimeZone',
+        'alembic_version',
+        'information_schema',
+        'setval',
+    ],
+)
 def test_a_reset_failing_at_any_statement_with_the_password_in_its_text_shows_the_type_only(failing):
     db = FakeDb.with_plan_entries()
     db.execute_error = RuntimeError(f'password={DB_PASSWORD} dsn=postgresql://postgres:{DB_PASSWORD}@db/postgres')
@@ -109,6 +123,35 @@ def test_a_reset_failing_at_any_statement_with_the_password_in_its_text_shows_th
     outcome = run_tool(['reset', '--yes-reset'], http=store_for(), connect=db.connect)
     assert outcome.status == 1
     assert outcome.lines[-1] == 'the reset transaction failed and was rolled back (RuntimeError)'
+    assert_no_canary(outcome.text)
+
+
+QUOTING = RuntimeError(f'COPY failed near "{DB_PASSWORD}" password={DB_PASSWORD}')
+
+
+@pytest.mark.parametrize('where', ['copy_out', 'copy_in'])
+def test_a_dev_reset_whose_copy_fails_quoting_the_password_shows_the_type_only(where):
+    # tj-7zjov1.297: the export's COPY TO and the reload's COPY FROM are driver calls too.
+    db = FakeDb.with_plan_entries()
+    if where == 'copy_out':
+        db.copy_error, db.copy_error_on = QUOTING, 'panel'
+    else:
+        db.load_error, db.load_error_on = QUOTING, 'panel'
+    outcome = run_tool(['reset', '--yes-reset'], http=store_for(), connect=db.connect)
+    assert outcome.status == 1
+    assert outcome.lines[-1] == 'the reset transaction failed and was rolled back (RuntimeError)'
+    assert_no_canary(outcome.text)
+
+
+def test_a_load_whose_copy_fails_quoting_the_password_shows_the_type_only(tmp_path):
+    # tj-7zjov1.297: load mode's failure path, through the CLI, with a real seed written by a dev reset first.
+    source = FakeDb.with_plan_entries()
+    assert run_tool(['reset', '--yes-reset'], http=store_for(), connect=source.connect, seed_root=tmp_path).status == 0
+    [stamp] = [path.parent for path in tmp_path.glob('*/*/manifest.json')]
+    db = FakeDb(counts=dict.fromkeys(source.counts, 0), load_error=QUOTING, load_error_on='panel')
+    outcome = run_tool(['load', '--seed', str(stamp)], http=store_for(), connect=db.connect)
+    assert outcome.status == 1
+    assert outcome.lines[-1] == 'the load transaction failed and was rolled back (RuntimeError)'
     assert_no_canary(outcome.text)
 
 
@@ -122,6 +165,17 @@ def test_the_running_refusal_shows_no_credential(argv):
     outcome = run_tool(argv, http=store_for(), connect=db.connect)
     assert outcome.status == 1
     assert 'RUNNING' in outcome.lines[-1]
+    assert_no_canary(outcome.text)
+
+
+@pytest.mark.parametrize('argv', [['reset', '--yes-reset'], ['seed', '--yes-reset']])
+def test_the_open_request_refusal_shows_no_credential(argv):
+    # tj-7zjov1.51 (2): the second guard's refusal goes through the same message path.
+    db = FakeDb.with_plan_entries()
+    db.request_states = {'QUEUED': 1}
+    outcome = run_tool(argv, http=store_for(), connect=db.connect)
+    assert outcome.status == 1
+    assert '1 ingest request(s) are PENDING or QUEUED' in outcome.lines[-1]
     assert_no_canary(outcome.text)
 
 

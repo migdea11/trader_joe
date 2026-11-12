@@ -1,4 +1,9 @@
-"""THE INTERNAL FetchDataset CONTRACT, pinned against its design (tj-3mk3u5.27).
+"""THE INTERNAL INGEST CONTRACT'S REQUEST, ACK AND BAR, pinned against their design (tj-3mk3u5.27).
+
+The PR 4 FetchDataset pull stream these were first written for is gone (P37, tj-7zjov1.280; owner ruling
+2026-11-02 on tj-7zjov1.18). FetchDatasetRequest survives as Quote's argument, the ack as Submit's, and the
+page, served range and vendor stats as store.proto's restatements on the result path, which is where the
+pins below now read them.
 
 What this file is for: the contract is a SHAPE, and every ruling that shaped it is invisible in the
 generated code and easy to undo by accident. The .proto is read through protoc's own descriptors
@@ -7,14 +12,12 @@ generated package private to ``common/rpc``, and a test is not that seam.
 
 THE RULINGS PINNED HERE, each with the record that made it:
 
-* THE ACK CARRIES THE RESOLVED FEED, and is always the stream's first event. The store writes its
-  dataset entry, feed included, only once it has the ack (tj-ugl90j, tj-rh4b7f).
+* THE ACK CARRIES THE RESOLVED FEED. The store writes its dataset entry, feed included, only once the
+  resolved feed is settled (tj-ugl90j, tj-rh4b7f).
 * A REFUSAL TRAVELS INSIDE THE ACK, NEVER AS A gRPC STATUS (user ruling, tj-3mk3u5.22 Q5). This is
   the one most at risk: "a refusal is an error, errors are statuses" is the obvious shape, it is what
   the bead originally said, and moving ``FetchRefused`` out to a status would still compile, still
   generate and still pass every other test in this repository.
-* THE STREAM IS ack -> page* -> done, expressed as the one oneof on ``FetchDatasetResponse``, with
-  ``FetchDone`` carrying ``served_range`` and ``as_of`` (ADR tj-fa1rpu D2, the SERVED provenance).
 * NO dataset_id ANYWHERE: correlation is the transport's and the store stamps its own rows
   (ADR tj-8konfu D7.2, tj-rh4b7f).
 * EVERY TIME IS google.protobuf.Timestamp (tj-3mk3u5.22 Q4), and aware on the Python side.
@@ -44,28 +47,39 @@ from pydantic import BaseModel, ValidationError
 from common.enums.data_stock import Feed, UpdateType
 from common.tests.domain_fields import aware_datetime_fields
 from common.tests.proto_descriptors import field_names, file_named, messages, real_oneofs
-from schemas.data_ingest import fetch_dataset, quote
+from schemas.data_ingest import fetch_dataset, quote, submit
 from schemas.data_ingest.fetch_dataset import (
     Bar,
     BarPage,
     FetchAccepted,
     FetchAck,
     FetchDatasetRequest,
-    FetchDone,
     FetchRefused,
     ServedRange,
 )
 from schemas.data_ingest.quote import QuoteResult, ScopeCapacity
+from schemas.data_ingest.submit import (
+    AssetListRequest,
+    AssetListStatus,
+    BarsRequest,
+    CorporateActionsRequest,
+    InstanceRequest,
+    InstanceResponse,
+    SubmitRequest,
+    SubmitResponse,
+)
 
 
 pytestmark = pytest.mark.data_ingest
 
 CONTRACT = 'trader_joe/proto/internal/ingest/v1/ingest.proto'
+STORE = 'trader_joe/proto/internal/store/v1/store.proto'
 BAR = 'trader_joe/proto/market/v1/bar.proto'
 
 TIMESTAMP = '.google.protobuf.Timestamp'
 MARKET = '.trader_joe.proto.market.v1'
 INGEST = '.trader_joe.proto.internal.ingest.v1'
+STORE_PACKAGE = '.trader_joe.proto.internal.store.v1'
 
 WHEN = datetime(2026, 1, 1, tzinfo=UTC)
 
@@ -74,30 +88,29 @@ WHEN = datetime(2026, 1, 1, tzinfo=UTC)
 # THE SERVICE AND THE STREAM'S GRAMMAR
 
 
-def test_fetch_dataset_is_one_server_stream_at_the_wire_path_the_design_names():
-    """The method, its direction and its wire path, which the servicer and the client seam both bind to.
+def test_the_service_is_submit_instance_and_quote_at_the_wire_paths_the_design_names():
+    """The methods, in declaration order, and their wire paths, which the servicer and the client seams bind to.
 
-    A unary FetchDataset would still generate and would still carry an ack; it could not carry pages.
-    The wire path is asserted as the string it is because that, not the Python symbol, is what a peer
-    dials -- and it is what the servicer registration (tj-3mk3u5.9) and the client seam
-    (tj-3mk3u5.28) must agree on.
+    The wire path is asserted as the string it is because that, not the Python symbol, is what a peer dials.
     """
     file = file_named(CONTRACT)
     assert file.package == 'trader_joe.proto.internal.ingest.v1'
     assert [service.name for service in file.service] == ['IngestService']
 
     methods = {method.name: method for method in file.service[0].method}
-    # Quote is tj-grna9p.44's second method (re-baseline item 2): data_ingest serves it on the same
-    # service, so the list is exactly these two, in declaration order.
-    assert list(methods) == ['FetchDataset', 'Quote']
-    fetch = methods['FetchDataset']
-    assert fetch.server_streaming is True, 'bar pages need a stream; a unary call cannot carry them'
-    assert fetch.client_streaming is False
-    assert fetch.input_type == f'{INGEST}.FetchDatasetRequest'
-    assert fetch.output_type == f'{INGEST}.FetchDatasetResponse'
+    # Quote is tj-grna9p.44's (re-baseline item 2); Submit and Instance are P07's (tj-7zjov1.13). The PR 4
+    # FetchDataset server stream is gone (P37, tj-7zjov1.280; owner ruling 2026-11-02 on tj-7zjov1.18).
+    assert list(methods) == ['Submit', 'Instance', 'Quote']
 
-    wire_path = f'/{file.package}.{file.service[0].name}/{fetch.name}'
-    assert wire_path == '/trader_joe.proto.internal.ingest.v1.IngestService/FetchDataset'
+    # Submit answers at once with an ack and nothing that is data, and Instance is a probe: both unary.
+    for name in ('Submit', 'Instance'):
+        method = methods[name]
+        assert (method.client_streaming, method.server_streaming) == (False, False), f'{name} is unary'
+        assert method.input_type == f'{INGEST}.{name}Request'
+        assert method.output_type == f'{INGEST}.{name}Response'
+        assert f'/{file.package}.{file.service[0].name}/{method.name}' == (
+            f'/trader_joe.proto.internal.ingest.v1.IngestService/{name}'
+        )
 
 
 def test_quote_is_unary_at_its_own_wire_path_with_the_buf_standard_names():
@@ -132,23 +145,6 @@ def test_quote_is_unary_at_its_own_wire_path_with_the_buf_standard_names():
         ('remaining', 3, ''),
         ('window_seconds', 4, ''),
         ('reset_at', 5, TIMESTAMP),
-    ]
-
-
-def test_the_stream_is_ack_then_pages_then_done_and_the_ack_is_arm_one():
-    """ADR tj-8konfu D7.1: the oneof exists from day one, and its arms ARE the stream's grammar.
-
-    Field numbers are asserted, not just names. The ack being arm 1 is how "an ack is always the first
-    event" is written down in a schema that cannot otherwise express ordering; a fourth arm appended
-    later is additive and fine, but renumbering or reordering these three is not.
-    """
-    response = messages(file_named(CONTRACT))['FetchDatasetResponse']
-
-    assert real_oneofs(response) == {'event': ['ack', 'page', 'done']}
-    assert [(field.name, field.number, field.type_name) for field in response.field] == [
-        ('ack', 1, f'{INGEST}.FetchAck'),
-        ('page', 2, f'{INGEST}.BarPage'),
-        ('done', 3, f'{INGEST}.FetchDone'),
     ]
 
 
@@ -191,7 +187,7 @@ def test_the_accepted_arm_carries_the_resolved_feed_and_the_quota_key_and_nothin
 def test_a_refusal_is_reachable_only_inside_the_ack_and_never_as_a_status_shape():
     """THE Q5 RULING, pinned structurally rather than by reading a comment.
 
-    An unservable feed is refused IN the ack; it is never a gRPC status, and the stream still ends OK.
+    An unservable feed is refused IN the ack; it is never a gRPC status, and the call still ends OK.
     What makes that true of the schema is that ``FetchRefused`` has exactly one referent in the whole
     contract -- ``FetchAck.refused`` -- so there is no second door it could arrive through. The
     failure this catches is a future edit that adds, say, ``FetchDatasetResponse.error`` or a status
@@ -255,7 +251,8 @@ def test_a_page_wraps_the_shared_bar_and_restates_none_of_it():
     A BarPage that redeclared the bar's fields -- or carried a second, page-local bar message -- is the
     duplicated structure the hierarchy exists to prevent; the two copies drift and nothing says so.
     """
-    page = messages(file_named(CONTRACT))['BarPage']
+    # store.proto's: the one BarPage since ingest.proto's left with the FetchDataset stream (P37).
+    page = messages(file_named(STORE))['BarPage']
 
     assert [(field.name, field.type_name, field.label) for field in page.field] == [
         ('bars', f'{MARKET}.Bar', page.field[0].LABEL_REPEATED)
@@ -263,39 +260,27 @@ def test_a_page_wraps_the_shared_bar_and_restates_none_of_it():
     assert not page.nested_type, f'a page declares no bar shape of its own: {[n.name for n in page.nested_type]}'
 
 
-def test_done_carries_the_count_and_the_served_provenance():
-    """ADR tj-fa1rpu D2 plus the 2026-10-02 addendum: what was actually served, not what was asked for.
+def test_the_served_range_is_two_timestamps_on_the_result_path():
+    """ADR tj-fa1rpu D2: what was actually served. FetchDone carried it until P37; the delivery trailer does now.
 
-    FetchDone existing at all is what makes a stream that merely stops distinguishable from one that
-    finished, and ``bar_count`` 0 with a served range is how "no data" stays a success carrying
-    provenance rather than an error.
+    The served window is the KEPT domain ServedRange's twin, and since ingest.proto's copy left with the
+    FetchDataset stream (tj-7zjov1.280) the message it twins is store.proto's.
     """
-    declared = messages(file_named(CONTRACT))
-    done = declared['FetchDone']
+    declared = messages(file_named(STORE))
 
-    # vendor_stats = 4 is tj-grna9p.44 re-baseline item 4: on the DONE and not the ack, because the
-    # stats exist only after the vendor calls were made.
-    assert [(field.name, field.number, field.type_name) for field in done.field] == [
-        ('bar_count', 1, ''),
-        ('served_range', 2, f'{INGEST}.ServedRange'),
-        ('as_of', 3, TIMESTAMP),
-        ('vendor_stats', 4, f'{INGEST}.VendorCallStats'),
-    ]
-    assert done.field[0].type == done.field[0].TYPE_UINT64
-
-    assert [(field.name, field.type_name) for field in declared['ServedRange'].field] == [
-        ('start', TIMESTAMP),
-        ('end', TIMESTAMP),
+    assert [(field.name, field.number, field.type_name) for field in declared['ServedRange'].field] == [
+        ('start', 1, TIMESTAMP),
+        ('end', 2, TIMESTAMP),
     ]
 
 
 def test_the_vendor_stats_are_ingests_count_with_the_vendors_figures_as_optional_corroboration():
-    """VendorCallStats and VendorReported as tj-grna9p.44 names them, numbers included.
+    """VendorCallStats and VendorReported as tj-grna9p.44 names them, numbers included, on store.proto (P37).
 
     The vendor's own limit and remaining are ``optional``: a vendor that reports nothing is not
     reporting a limit of zero, which would read as "throttled".
     """
-    declared = messages(file_named(CONTRACT))
+    declared = messages(file_named(STORE))
 
     assert [(field.name, field.number, field.type_name) for field in declared['VendorCallStats'].field] == [
         ('calls', 1, ''),
@@ -304,7 +289,7 @@ def test_the_vendor_stats_are_ingests_count_with_the_vendors_figures_as_optional
         ('retries', 4, ''),
         ('first_call_at', 5, TIMESTAMP),
         ('last_call_at', 6, TIMESTAMP),
-        ('vendor_reported', 7, f'{INGEST}.VendorReported'),
+        ('vendor_reported', 7, f'{STORE_PACKAGE}.VendorReported'),
     ]
     reported = declared['VendorReported']
     assert [(field.name, field.number, field.proto3_optional) for field in reported.field] == [
@@ -418,36 +403,56 @@ TWINS: list[tuple[str, str, type[BaseModel]]] = [
     (CONTRACT, 'FetchAck', FetchAck),
     (CONTRACT, 'FetchAccepted', FetchAccepted),
     (CONTRACT, 'FetchRefused', FetchRefused),
-    (CONTRACT, 'BarPage', BarPage),
-    (CONTRACT, 'FetchDone', FetchDone),
-    (CONTRACT, 'ServedRange', ServedRange),
+    # Kept as twins of store.proto's restatements, the only copies since P37 (tj-7zjov1.280).
+    (STORE, 'BarPage', BarPage),
+    (STORE, 'ServedRange', ServedRange),
     (BAR, 'Bar', Bar),
     # tj-grna9p.44 item 8b: the Quote answer's twins live in schemas/data_ingest/quote.py. The answer is
     # named QuoteResult on the domain side; its fields still match QuoteResponse name for name.
     (CONTRACT, 'QuoteResponse', QuoteResult),
     (CONTRACT, 'ScopeCapacity', ScopeCapacity),
+    # P07 (tj-7zjov1.13), domain side P08 (tj-7zjov1.15): the Submit and Instance contract, in
+    # schemas/data_ingest/submit.py. All seven are TWINS, none transport (architect ruling on tj-7zjov1.53):
+    # each has a domain model whose fields match its proto name for name, oneof arms included, which is
+    # what this list pins. SubmitResponse.ack is a FetchAck on the wire and a SubmitAck on the domain side;
+    # the field NAMES still match, and the refinement is excused below in NOT_A_TWIN.
+    (CONTRACT, 'SubmitRequest', SubmitRequest),
+    (CONTRACT, 'BarsRequest', BarsRequest),
+    (CONTRACT, 'AssetListRequest', AssetListRequest),
+    (CONTRACT, 'CorporateActionsRequest', CorporateActionsRequest),
+    (CONTRACT, 'SubmitResponse', SubmitResponse),
+    (CONTRACT, 'InstanceRequest', InstanceRequest),
+    (CONTRACT, 'InstanceResponse', InstanceResponse),
 ]
 
 # The contract messages with no domain twin, and why. Listed rather than merely absent, so "we forgot
 # one" cannot pass as "deliberate".
 NOT_MODELLED: dict[str, str] = {
-    # The stream's envelope is pure transport: the client seam dispatches the oneof and yields the ack,
-    # the pages and the done, so no domain model restates it.
-    'FetchDatasetResponse': 'transport envelope',
-    # A wrapper around the one FetchDatasetRequest, which is already twinned (tj-grna9p.44 item 2).
-    'QuoteRequest': 'wrapper around a twinned request',
-    # Deferred by tj-grna9p.44's re-baseline (item 8, FOLLOW-UP): mapped with FetchDone.vendor_stats,
-    # before tj-grna9p.48. common/rpc/mapping names the same two in ENVELOPE_MESSAGES until then.
-    'VendorCallStats': 'deferred: tj-grna9p.44 follow-up',
-    'VendorReported': 'deferred: tj-grna9p.44 follow-up',
+    # A wrapper around the one FetchDatasetRequest, which is already twinned (tj-grna9p.44 item 2). The
+    # stream's envelope and ingest.proto's two vendor-stats messages were listed here until P37 removed them.
+    'QuoteRequest': 'wrapper around a twinned request'
+}
+
+# The other direction's excuses: public classes of a twin module that twin no proto message, and why.
+# Listed rather than merely tolerated, in the NOT_MODELLED style, so a forgotten model cannot pass as a
+# deliberate one (architect ruling on tj-7zjov1.53, item 3).
+NOT_A_TWIN: dict[type, str] = {
+    # The Submit ack is the wire's FetchAck, refined: its accepted arm is a SubmitAccepted, not a
+    # FetchAccepted. Same two arms, same oneof, same names.
+    submit.SubmitAck: 'domain refinement of FetchAck',
+    # The resolved feed is a fact about bars only, so SubmitAccepted.feed is None for asset_list and
+    # corporate_actions (submit.py docstring); FetchAccepted.feed is required.
+    submit.SubmitAccepted: 'domain refinement of FetchAccepted: feed is None for non-bars kinds',
+    # Not a message: the arm of SubmitRequest.kind a request sets, which the oneof implies.
+    submit.RequestKind: 'enum the SubmitRequest.kind oneof implies',
+    # Not a message: the Python mirror of the AssetListStatus enum (tj-7zjov1.105), whose bijection with the
+    # proto values is checked at import by common/rpc/mapping (ENUM_MAPPINGS) and pinned in common/tests.
+    submit.AssetListStatus: 'mirror of the AssetListStatus proto enum, checked through ENUM_MAPPINGS',
 }
 
 # Proto fields whose twin field is DEFERRED by the same follow-up, and only these. Removing an entry is
 # the follow-up's job; test_a_domain_twin_declares_exactly_its_protos_fields keeps the rest exact.
-DEFERRED_TWIN_FIELDS: dict[str, frozenset[str]] = {
-    'FetchAccepted': frozenset({'quota_key'}),
-    'FetchDone': frozenset({'vendor_stats'}),
-}
+DEFERRED_TWIN_FIELDS: dict[str, frozenset[str]] = {'FetchAccepted': frozenset({'quota_key'})}
 
 
 @pytest.mark.parametrize(('file_name', 'message_name', 'model'), TWINS, ids=[name for _, name, _ in TWINS])
@@ -488,6 +493,19 @@ def test_every_contract_message_is_either_twinned_or_listed_as_transport():
     assert declared == covered
 
 
+@pytest.mark.parametrize('name', ['FetchDone', 'FetchEvent'])
+def test_the_streams_done_and_event_union_left_the_domain_module(name: str):
+    """P37 (tj-7zjov1.280): FetchDone and the FetchEvent alias existed only for the deleted FetchDataset stream.
+
+    The class check below would catch a FetchDone class coming back, but not FetchEvent: a PEP 695 alias is no
+    class, so it is named here.
+
+    Args:
+        name: The removed name.
+    """
+    assert not hasattr(fetch_dataset, name), f'schemas.data_ingest.fetch_dataset still exports {name}'
+
+
 def test_every_model_in_the_module_is_a_twin_of_something():
     """And the other direction: a domain model with no proto message behind it.
 
@@ -495,14 +513,17 @@ def test_every_model_in_the_module_is_a_twin_of_something():
     contract; a model here that nothing on the wire corresponds to is either dead or is a field the
     mapper will have to invent a value for.
     """
-    for module in (fetch_dataset, quote):
+    for module in (fetch_dataset, quote, submit):
         declared = {
             name
             for name, obj in vars(module).items()
             if not name.startswith('_') and inspect.isclass(obj) and obj.__module__ == module.__name__
         }
+        twinned = {model.__name__ for _, _, model in TWINS if model.__module__ == module.__name__}
+        excused = {cls.__name__ for cls in NOT_A_TWIN if cls.__module__ == module.__name__}
 
-        assert declared == {model.__name__ for _, _, model in TWINS if model.__module__ == module.__name__}
+        assert not twinned & excused, f'{module.__name__}: a class is both a twin and excused: {twinned & excused}'
+        assert declared == twinned | excused, module.__name__
 
 
 # ---------------------------------------------------------------------------------------------
@@ -543,6 +564,15 @@ _A_REQUEST: dict[str, Any] = {
     'update_type': UpdateType.STATIC,
 }
 
+_A_BARS_REQUEST: dict[str, Any] = {key: value for key, value in _A_REQUEST.items() if key in BarsRequest.model_fields}
+_A_CORPORATE_ACTIONS_REQUEST: dict[str, Any] = {'source': 'ALPACA', 'asset_symbol': 'VFV', 'start': WHEN, 'end': WHEN}
+# The asset_list arm is set because exactly one kind must be; it carries no time of its own.
+_A_SUBMIT: dict[str, Any] = {
+    'request_id': 'request-1',
+    'owner': 'rebalancer',
+    'asset_list': AssetListRequest(source='ALPACA', asset_type='stock', status=AssetListStatus.ACTIVE),
+}
+
 _NAIVE_CASES: list[tuple[type[BaseModel], str, dict[str, Any]]] = [
     (FetchDatasetRequest, 'start', _A_REQUEST),
     # `end` is OPTIONAL, and that is exactly why it was the one this sweep had missed (architect,
@@ -559,7 +589,14 @@ _NAIVE_CASES: list[tuple[type[BaseModel], str, dict[str, Any]]] = [
     ),
     (ServedRange, 'start', {'start': WHEN, 'end': WHEN}),
     (ServedRange, 'end', {'start': WHEN, 'end': WHEN}),
-    (FetchDone, 'as_of', {'bar_count': 0, 'served_range': ServedRange(start=WHEN, end=WHEN), 'as_of': WHEN}),
+    # The Submit and Instance twins (tj-7zjov1.15). ready_by and BarsRequest.end are optional, and refused
+    # naive all the same.
+    (SubmitRequest, 'ready_by', _A_SUBMIT),
+    (BarsRequest, 'start', _A_BARS_REQUEST),
+    (BarsRequest, 'end', _A_BARS_REQUEST),
+    (CorporateActionsRequest, 'start', _A_CORPORATE_ACTIONS_REQUEST),
+    (CorporateActionsRequest, 'end', _A_CORPORATE_ACTIONS_REQUEST),
+    (InstanceResponse, 'started_at', {'instance_id': 'ingest-1', 'started_at': WHEN}),
 ]
 
 

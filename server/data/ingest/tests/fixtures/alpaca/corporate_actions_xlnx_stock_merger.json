@@ -1,0 +1,20 @@
+{
+  "provenance": {
+    "kind": "recorded",
+    "recorded_at": "2026-10-24T19:42:04.874765+00:00",
+    "endpoint": "GET https://data.alpaca.markets/v1/corporate-actions",
+    "params": {
+      "symbols": "XLNX",
+      "types": "cash_merger,stock_merger,stock_and_cash_merger",
+      "start": "2015-01-01",
+      "end": "2026-10-24",
+      "limit": "1000",
+      "sort": "asc"
+    },
+    "byte_length": 316,
+    "sha256": "664219780b96a0db9e995187b9d5d3302f81bdcda0d98144ffad937d9cd894e0",
+    "note": "Captured through the dev vendor probe (P27a s10/s10x, tj-7zjov1.7). body_text is the body as served, byte for byte: its length and sha256 are the capture's own."
+  },
+  "status": 200,
+  "body_text": "{\"corporate_actions\":{\"stock_mergers\":[{\"acquiree_cusip\":\"983919101\",\"acquiree_rate\":1,\"acquiree_symbol\":\"XLNX\",\"acquirer_cusip\":\"007903107\",\"acquirer_rate\":1.7234,\"acquirer_symbol\":\"AMD\",\"effective_date\":\"2022-02-14\",\"id\":\"15459aa5-b297-4e33-9624-c9d59b75ba46\",\"process_date\":\"2022-02-14\"}]},\"next_page_token\":null}"
+}

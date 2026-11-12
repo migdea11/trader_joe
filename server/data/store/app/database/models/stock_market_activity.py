@@ -1,6 +1,7 @@
 from typing import Any
 
-from sqlalchemy import Column, Float, Index, Integer, UniqueConstraint
+from sqlalchemy import BigInteger, Column, Float, Index, UniqueConstraint
+from sqlalchemy.ext.hybrid import hybrid_property
 
 from common.enums.data_select import AssetType, DataType
 from data.store.app.database.models.base_market_activity import BaseMarketActivity
@@ -17,9 +18,7 @@ class StockMarketActivity(BaseMarketActivity):
     __tablename__ = TABLE_NAME
 
     # Named so the ON CONFLICT clause in the repository can target it by name rather than by
-    # column list; the name is the contract between this model and migration 8f41c2d7a3b9,
-    # kept unchanged by this revision's widening of the column list underneath it so the ON
-    # CONFLICT clause does not change shape across the upgrade.
+    # column list; the name is the contract between this model, the alpha baseline migration and that clause.
     NATURAL_KEY_CONSTRAINT = 'uq_stock_market_activity_natural_key'
 
     # Reads asset_symbol, granularity and a timestamp range and NEVER source or feed
@@ -40,14 +39,30 @@ class StockMarketActivity(BaseMarketActivity):
     high = Column(Float, nullable=False)
     low = Column(Float, nullable=False)
     close = Column(Float, nullable=False)
-    volume = Column(Integer, nullable=False)
-    trade_count = Column(Integer, nullable=False)
+    # BigInteger: a liquid symbol's monthly volume passes int32 (tj-1ov1p2; BIGINT in the alpha baseline).
+    volume = Column(BigInteger, nullable=False)
+    trade_count = Column(BigInteger, nullable=False)
 
     __table_args__ = (
         *BaseMarketActivity.__table_args__,
         UniqueConstraint(*BaseMarketActivity.NATURAL_KEY, name=NATURAL_KEY_CONSTRAINT),
         Index(SYMBOL_GRANULARITY_TIMESTAMP_INDEX, 'asset_symbol', 'granularity', 'timestamp'),
     )
+
+    @hybrid_property
+    def is_placeholder_bar(self) -> bool:
+        """THE PLACEHOLDER RULE, written once: volume 0 AND trade count 0 (tj-7zjov1.103, tj-26jt9w addendum 7).
+
+        The vendor serves a bar for a session in which nothing traded (PARA: 809 of them, every day of 2019-12 to
+        2020-12 at 0.206). The bar is stored raw, as served, and counts as NO TRADE: it covers no session in
+        completeness, it is not the newest bar health reads, and it is not a holder's first or last real bar in
+        the lineage report. Volume 0 with a trade count above 0, or the reverse, is a real (odd) bar and not a
+        placeholder.
+
+        On an instance it is a plain bool; on the class it is the SQL predicate, so a query and a Python check
+        cannot disagree. Every reader that must not count a placeholder uses this, never its own comparison.
+        """
+        return (self.volume == 0) & (self.trade_count == 0)
 
     @classmethod
     def from_batch_create(cls, batch_create: BatchStockDataMarketActivityCreate) -> list[dict[str, Any]]:

@@ -4,7 +4,7 @@ tj-iee6sn.31. Design: ADR tj-4rr0la addendum 29 and decision tj-oxxl8a option A:
 explicit compose project trader_joe_dev (the Makefile's DEV_PROJECT, tj-grna9p.161); PROD keeps compose's
 default project, the checkout directory's name, trader_joe, and no MCP verb may ever name it.
 
-What is pinned here, each across ALL fifteen verbs rather than per verb module:
+What is pinned here, each across ALL nineteen verbs rather than per verb module:
   * every recorded `docker compose` argv carries exactly one `-p trader_joe_dev` (the secret wrapper's
     compose argv included), every `docker ps` filters on project=trader_joe_dev, and every pinned
     COMPOSE_PROJECT_NAME is trader_joe_dev; no argv word, filter or env value names the bare project;
@@ -31,8 +31,11 @@ from tools.agent_mcp.tests.harness import (
     DEV_INGEST_CONTAINER_ID,
     DEV_MODE_LINE,
     REPO_ROOT,
+    SESSION_VERB_SAMPLES,
     SYSTEM_SUITE_VERBS,
     TEST_MODE_LINE,
+    TEST_RESET_VERBS,
+    TEST_SERVICE_VERBS,
     VERB_SAMPLES,
     FakeDocker,
     Rig,
@@ -40,6 +43,7 @@ from tools.agent_mcp.tests.harness import (
     is_dev_lookup,
     is_dev_up_wrapper,
     is_mode_guard,
+    is_service_lookup,
     make_rig,
     response_for,
 )
@@ -51,7 +55,7 @@ DOCKER = '/usr/local/bin/docker'
 DEV_PROJECT = 'trader_joe_dev'
 PROD_PROJECT = 'trader_joe'
 PROJECT_LABEL = 'label=com.docker.compose.project='
-# The fifteen verbs of ADR tj-4rr0la addenda 26 (5) and 27 (4), spelled out so a verb added or dropped
+# The sixteen verbs of ADR tj-4rr0la addenda 26 (5) and 27 (4) and addendum 32's three, spelled out so a verb added or dropped
 # is red here until this sweep is told about it.
 ALL_VERBS = (
     'up',
@@ -69,6 +73,11 @@ ALL_VERBS = (
     'migrate_status',
     'run_system_tests',
     'seed_dump',
+    'test_reset',
+    # ADR tj-4rr0la addendum 32 (tj-7zjov1.268): nineteen.
+    'test_stop',
+    'test_start',
+    'test_env',
 )
 # The bare name used AS A PROJECT: not followed by a character that would make it a longer identifier
 # (trader_joe_dev, trader_joe_devnet, trader_joe_agent_mcp, trader_joe_data_store:dev), a dotted label
@@ -96,13 +105,16 @@ def _project_filters(argv) -> list[str]:
 
 
 # ===============================================================================================
-# THE SWEEP OVER ALL FIFTEEN VERBS
+# THE SWEEP OVER ALL SIXTEEN VERBS
 # ===============================================================================================
 
 
 def test_the_sweep_covers_exactly_the_verbs_the_server_offers():
-    assert set(ALL_VERBS) == set(VERB_SAMPLES) == set(runner.VERB_SCHEMAS), sorted(VERB_SAMPLES)
-    assert len(ALL_VERBS) == 15
+    # The session verbs (addendum 34) run no docker step at all, so they have nothing to address; that they run
+    # none is test_session_grant.py's. Every verb with a step is in the sweep.
+    docker_verbs = set(runner.VERB_SCHEMAS) - set(SESSION_VERB_SAMPLES)
+    assert set(ALL_VERBS) == set(VERB_SAMPLES) == docker_verbs, sorted(VERB_SAMPLES)
+    assert len(ALL_VERBS) == 19 and len(runner.VERB_SCHEMAS) == 22
 
 
 @pytest.mark.parametrize('verb', ALL_VERBS)
@@ -216,8 +228,12 @@ class TwoProjectDaemon:
     step falls through to the harness's answer for the verb.
     """
 
-    def __init__(self, base: Callable[[stack.Step], runner.ProcessResult], dev_line: str) -> None:
+    def __init__(
+        self, base: Callable[[stack.Step], runner.ProcessResult], dev_line: str, state: str = 'running'
+    ) -> None:
         self.base = base
+        # What the any-state service lookup of test_stop, test_start and test_env prints after each id.
+        self.state = state
         self.containers = [
             *((DEV_PROJECT, service, dev_line, self._dev_id(service)) for service in stack.DEV_SERVICES),
             *((PROD_PROJECT, service, PROD_CONFIG_LINE, PROD_IDS[service]) for service in stack.DEV_SERVICES),
@@ -244,13 +260,19 @@ class TwoProjectDaemon:
         if is_dev_lookup(step):
             ids = ''.join(f'{container[3]}\n' for container in self._selected(step.argv))
             return runner.ProcessResult(0, ids.encode(), b'')
+        if is_service_lookup(step):
+            rows = ''.join(f'{container[3]} {self.state}\n' for container in self._selected(step.argv))
+            return runner.ProcessResult(0, rows.encode(), b'')
         return self.base(step)
 
 
 def _two_project_rig(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, verb: str, dev_line: str | None = None):
     rig = make_rig(tmp_path, monkeypatch, FakeDocker())
-    line = dev_line or (TEST_MODE_LINE if verb in SYSTEM_SUITE_VERBS else DEV_MODE_LINE).decode().rstrip('\n')
-    daemon = TwoProjectDaemon(response_for(verb, rig.layout), line)
+    line = dev_line or (
+        TEST_MODE_LINE if verb in SYSTEM_SUITE_VERBS | TEST_RESET_VERBS | TEST_SERVICE_VERBS else DEV_MODE_LINE
+    ).decode().rstrip('\n')
+    state = 'exited' if verb == 'test_start' else 'running'
+    daemon = TwoProjectDaemon(response_for(verb, rig.layout), line, state)
     rig.docker.respond = daemon
     return rig, daemon
 

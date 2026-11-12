@@ -46,10 +46,31 @@ export type {
   UiEventMessage,
   WebSocketFactory,
 } from './events'
+export {
+  createPanel,
+  dataSourceRouteName,
+  getAssetListHistory,
+  getCorporateActions,
+  getPanel,
+  getPanelBoundaries,
+  getPanelMembers,
+  getPanelSettingsVersions,
+  getSourceSettingsVersions,
+  listPanels,
+  savePanelSettings,
+  saveSourceSettings,
+} from './panels'
+export type {
+  CreatePanelParams,
+  PageParams,
+  SavePanelSettingsParams,
+  SaveSourceSettingsParams,
+  WindowParams,
+} from './panels'
 export { getLastReadBuckets, getStaleDatasets, getStorageCurrent, getUsageSummary } from './usageStats'
 export type { GetStaleParams, UsageStatsParams } from './usageStats'
 export { ApiError,apiErrorFromResponse } from './errors'
 export { int64ToNumber } from './int64'
 export { buildQuery } from './query'
 export type { QueryValue } from './query'
-export { DEFAULT_CLIENT_KINDS, EXPIRING_SOON_DAYS, OPERATOR_CLIENT_ID, STALE_DAYS } from './usage'
+export { DEFAULT_CLIENT_KINDS, EXPIRING_SOON_DAYS, OPERATOR_CLIENT_ID, PANEL_MANAGED_TEXT, PANEL_OWNER, STALE_DAYS } from './usage'

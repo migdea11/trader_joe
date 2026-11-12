@@ -7,8 +7,10 @@ adapter on the client's session for every scheme and fails the test on anything 
 
 The wire contract every assertion is written against is research tj-vhboky.57 (its FINAL SUMMARY
 and the architect's 16:44 UTC review): limit=10000 on every request, page_token only from page 2,
-4 attempts with 3 flat 3 s sleeps on 429 and 504, start and end sent with the query's own offset,
-errors as APIError(status_code, message). The fixtures were RECORDED from Alpaca at the host
+start and end sent with the query's own offset, errors as APIError(status_code, message). The retry
+facts changed on tj-7zjov1.56, which moved the page loop out of alpaca-py into broker_api: a 429 is
+never retried and surfaces at once; a 504 is asked again up to 3 times, 3 s apart (the SDK's own
+defaults), each time through the scheduler. The SDK's own retry loop is never entered. The fixtures were RECORDED from Alpaca at the host
 sitting (tj-irhy0a.3), except those that cannot be provoked; see fixtures/alpaca/README.md.
 
 The range rule is decision tj-j4wknb ADDENDUM 5 (ruling on tj-irhy0a.15): get_bars serves
@@ -18,7 +20,7 @@ exactly at end.
 FAILURE CONTRACT (TE-5 tj-3mk3u5.37.6, re-pointing these tests to TE-4 tj-3mk3u5.37.5): get_bars
 RETURNS a BarsFailure for every vendor failure, classified on the HTTP status alone (ADR tj-fa1rpu,
 the 2026-10-02 Q-EMPTY addendum item 3): 400 VENDOR_INVALID_REQUEST, another 4xx VENDOR_REJECTED, a 429
-after alpaca-py's own retries VENDOR_RATE_LIMITED with a reset_at, 500 and 504 VENDOR_UNAVAILABLE. The
+VENDOR_RATE_LIMITED with a reset_at, 500 and 504 (its retries spent) VENDOR_UNAVAILABLE. The
 SDK's APIError is kept as the error's __cause__ and never reaches the caller raised. Nothing of a
 failed fetch is served, never a partial range. Every 200 is SERVED, empty included. A body this
 reader cannot read (a non-whole trade_count, a null 'bars') is a bug and raises (D5).
@@ -57,6 +59,7 @@ from common.errors.vocabulary import (
 from data.ingest.app.brokers.alpaca import broker_api
 from data.ingest.app.brokers.alpaca.broker_codes import AlpacaGranularity
 from data.ingest.app.brokers.alpaca.classify import RATE_LIMIT_RESET_HEADER, RETRY_AFTER_HEADER
+from data.ingest.app.brokers.alpaca.handle import ALPACA_DATA_SCOPE
 from data.ingest.app.brokers.alpaca.read import AlpacaRead
 from data.ingest.app.brokers.interface import (
     Bar,
@@ -67,7 +70,8 @@ from data.ingest.app.brokers.interface import (
     Instrument,
     ServedRange,
 )
-from data.ingest.app.brokers.rate_budget import RateBudget, RequestPriority
+from data.ingest.app.brokers.rate_budget import RequestPriority
+from data.ingest.app.scheduler import Scheduler
 from data.ingest.tests.alpaca_recorded import (
     ALPACA_DATA_HOST,
     BARS_PATH,
@@ -78,9 +82,17 @@ from data.ingest.tests.alpaca_recorded import (
     load,
     paged,
     parse_rfc3339,
-    record_sdk_sleeps,
+    record_page_retry_sleeps,
     recorded_client,
+    sdk_retry_is_never_entered,
     with_headers,
+)
+from data.ingest.tests.scheduler_doubles import (
+    ONE_PER_MINUTE_OVER_AN_HOUR,
+    ONE_PER_SECOND,
+    RecordingScheduler,
+    alpaca_reader,
+    real_scheduler,
 )
 
 
@@ -102,9 +114,11 @@ WIRE_TIMEFRAME = {
     Granularity.ONE_MONTH: '1Month',
 }
 
-# alpaca-py 0.44.0's retry facts (tj-vhboky.54 16:44 UTC addendum; tj-vhboky.57 item 6).
-SDK_ATTEMPTS = 4
-SDK_SLEEPS = [3, 3, 3]
+# The reader's retry facts since tj-7zjov1.56, written out rather than read off broker_api so a changed constant
+# cannot agree with itself. They are alpaca-py 0.44.0's defaults (tj-vhboky.57 item 6), now applied by the reader:
+# a 504 page is asked 1 + 3 times, 3 s apart; a 429 once.
+PAGE_504_ATTEMPTS = 4
+PAGE_504_SLEEPS = [3.0, 3.0, 3.0]
 
 # The readers' clock: after every recorded bar (all in 2022).
 NOW = datetime(2026, 10, 2, 12, 0, tzinfo=UTC)
@@ -117,9 +131,15 @@ def executor() -> Iterator[ThreadPoolExecutor]:
 
 
 @pytest.fixture(autouse=True)
-def iex_deployment(monkeypatch):
-    """Pin the deployment's tape, so the feed asserted on the wire is not read from the host."""
-    monkeypatch.delenv('ALPACA_SIP_ENABLED', raising=False)
+def forgotten_resets(monkeypatch):
+    """Forget every remembered rate-limit reset around each test.
+
+    The reader keeps the last one per scope (tj-7zjov1.56), so a reset one case read off a header would otherwise be
+    another case's 429 fallback.
+    """
+    broker_api.forget_resets()
+    yield
+    broker_api.forget_resets()
 
 
 def build_query(
@@ -130,7 +150,10 @@ def build_query(
     exchange: str | None = None,
     currency: str | None = None,
     adjustment: str = 'raw',
+    feed: Feed | None = Feed.IEX,
 ) -> BarsQuery:
+    # IEX named by default: the recordings are IEX answers (tests/fakes/record_alpaca.py sends feed=iex, the tape
+    # paper keys are entitled to), and SIP is the default since tj-7zjov1.342, so each query names the recorded tape.
     return BarsQuery(
         instrument=Instrument(SYMBOL, asset_type, exchange=exchange, currency=currency),
         granularity=granularity,
@@ -138,11 +161,14 @@ def build_query(
         end=end,
         adjustment=adjustment,
         priority=RequestPriority.BACKFILL,
+        feed=feed,
     )
 
 
-def build_reader(client, executor: ThreadPoolExecutor) -> AlpacaRead:
-    return AlpacaRead(client=client, executor_provider=lambda: executor, clock=lambda: NOW)
+def build_reader(client, executor: ThreadPoolExecutor, scheduler=None) -> AlpacaRead:
+    # Paced by the given scheduler, or one that grants every call (P11, tj-7zjov1.20: the handle's scheduler
+    # paces every Alpaca call; broker_api has no budget of its own any more).
+    return alpaca_reader(client, executor, lambda: NOW, scheduler=scheduler)
 
 
 async def drain(response: BarsResponse) -> list[Bar]:
@@ -491,7 +517,13 @@ async def test_a_null_trade_count_is_served_as_none(executor):
 
 
 # --------------------------------------------------------------------------------------------
-# Retries: 4 attempts, 3 flat 3 s sleeps, codes 429 and 504, then get_bars RETURNS the failure.
+# Retries (tj-7zjov1.56): a 504 page is asked 1 + 3 times, 3 s apart, each through the scheduler; a 429 is
+# never retried. Either way get_bars then RETURNS the failure.
+#
+# RE-PINNED ON tj-7zjov1.56. These pinned alpaca-py's own loop: 4 attempts and 3 sleeps on its clock for
+# BOTH statuses, all under one scheduler token. The SDK loop is now bypassed (requirement 3: no request
+# outside the scheduler), so a 429 makes one request and a 504 four, each with its own acquire, and the
+# wait is the reader's. The SDK's own loop is asserted never entered, rather than its clock asserted idle.
 
 
 def whole_day_query() -> BarsQuery:
@@ -500,35 +532,58 @@ def whole_day_query() -> BarsQuery:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ('status', 'reason'),
-    [
-        pytest.param(429, Reason.VENDOR_RATE_LIMITED, id='429-documented'),
-        pytest.param(504, Reason.VENDOR_UNAVAILABLE, id='504-documented'),
-    ],
-)
-async def test_a_retried_status_on_every_attempt_makes_four_attempts_then_returns_the_failure(
-    executor, monkeypatch, status, reason
+async def test_a_504_on_every_attempt_makes_four_requests_each_paced_then_returns_vendor_unavailable(
+    executor, monkeypatch
 ):
-    sleeps = record_sdk_sleeps(monkeypatch)
-    client, transport = recorded_client(always(load(f'error_{status}')))
+    sleeps = record_page_retry_sleeps(monkeypatch)
+    sdk_loop = sdk_retry_is_never_entered(monkeypatch)
+    pacing = RecordingScheduler()
+    client, transport = recorded_client(always(load('error_504')))
 
-    error = failure_of(await build_reader(client, executor).get_bars(whole_day_query()))
+    error = failure_of(await build_reader(client, executor, scheduler=pacing).get_bars(whole_day_query()))
 
-    assert error.reason is reason
+    assert error.reason is Reason.VENDOR_UNAVAILABLE
     assert REASONS[error.reason].outcome is Outcome.NOT_READY
     assert isinstance(error.__cause__, APIError)
-    assert error.__cause__.status_code == status
-    assert len(transport.sent) == SDK_ATTEMPTS
-    assert sleeps == SDK_SLEEPS
+    assert error.__cause__.status_code == 504
+    assert len(transport.sent) == PAGE_504_ATTEMPTS
+    assert len(pacing.acquires) == PAGE_504_ATTEMPTS, 'a retried request went out without its own token'
+    assert sleeps == PAGE_504_SLEEPS
+    assert sdk_loop == []
+
+
+@pytest.mark.asyncio
+async def test_a_429_is_not_retried_it_makes_one_paced_request_and_returns_rate_limited(executor, monkeypatch):
+    sleeps = record_page_retry_sleeps(monkeypatch)
+    sdk_loop = sdk_retry_is_never_entered(monkeypatch)
+    pacing = RecordingScheduler()
+    client, transport = recorded_client(always(load('error_429')))
+
+    error = failure_of(await build_reader(client, executor, scheduler=pacing).get_bars(whole_day_query()))
+
+    assert error.reason is Reason.VENDOR_RATE_LIMITED
+    assert REASONS[error.reason].outcome is Outcome.NOT_READY
+    assert isinstance(error.__cause__, APIError)
+    assert error.__cause__.status_code == 429
+    assert len(transport.sent) == 1
+    assert len(pacing.acquires) == 1
+    assert sleeps == []
+    assert sdk_loop == []
 
 
 @pytest.fixture
-def deployed_budget(monkeypatch) -> RateBudget:
-    """Alpaca's budget at the deployed default (3/s, burst 3): it refills from empty in 1 s."""
-    budget = RateBudget('ALPACA', rate_per_sec=3.0, burst=3.0)
-    monkeypatch.setattr(broker_api, '__RATE_BUDGET', budget)
-    return budget
+def scope_scheduler() -> Scheduler:
+    """A real scheduler whose Alpaca scope declares a 60 s window (refilling in 1 s), beside a decoy declaring 3600 s.
+
+    Until P11 (tj-7zjov1.20) this was broker_api's own budget at its deployed default (3/s, burst 3, 1 s). That
+    budget is gone: the fallback is the reader's own scope window, Scheduler.window(scope), and since 18ff3f5 its
+    declared window rather than its refill. The decoy makes a reader that asked another scope's window red, and the
+    1 s refill one that read the refill. The fallback at the production limit is pinned in test_ack_gated_retry.py.
+    """
+    scheduler = real_scheduler({ALPACA_DATA_SCOPE: ONE_PER_SECOND, 'DECOY': ONE_PER_MINUTE_OVER_AN_HOUR})
+    assert scheduler.window(ALPACA_DATA_SCOPE).declared_window_seconds == 60.0
+    assert scheduler.window(ALPACA_DATA_SCOPE).full_refill_seconds == 1.0
+    return scheduler
 
 
 @pytest.mark.asyncio
@@ -541,42 +596,46 @@ def deployed_budget(monkeypatch) -> RateBudget:
             id='x-ratelimit-reset-wins',
         ),
         pytest.param({RETRY_AFTER_HEADER: '7'}, NOW + timedelta(seconds=7), id='retry-after-only'),
-        pytest.param({}, NOW + timedelta(seconds=1), id='no-header-the-budget-refill'),
+        pytest.param({}, NOW + timedelta(seconds=60), id='no-header-the-scopes-declared-window'),
     ],
 )
-async def test_a_429_after_one_plus_three_attempts_says_when_the_window_resets(
-    executor, monkeypatch, deployed_budget, headers, reset_at
+async def test_a_429_answered_at_once_says_when_the_window_resets(
+    executor, monkeypatch, scope_scheduler, headers, reset_at
 ):
-    """tj-vz1eta s3, TE-4 item 4: X-RateLimit-Reset, else Retry-After, else the budget's refill from empty.
+    """tj-vz1eta s3, TE-4 item 4: X-RateLimit-Reset, else Retry-After, else the scope's declared window.
 
-    The headers are ATTACHED to the documented 429 body: no recording shows which a real 429 sends.
+    The headers are ATTACHED to the documented 429 body: no recording shows which a real 429 sends. Until
+    tj-7zjov1.56 this was 'after one plus three attempts'; the 429 now surfaces on the first request.
     """
-    sleeps = record_sdk_sleeps(monkeypatch)
+    sleeps = record_page_retry_sleeps(monkeypatch)
     client, transport = recorded_client(always(with_headers(load('error_429'), headers)))
 
-    error = failure_of(await build_reader(client, executor).get_bars(whole_day_query()))
+    error = failure_of(await build_reader(client, executor, scheduler=scope_scheduler).get_bars(whole_day_query()))
 
     assert type(error) is ExogenousError
     assert error.reason is Reason.VENDOR_RATE_LIMITED
     assert error.reset_at == reset_at
     assert error.reset_at > NOW
     assert error.retry_after == math.ceil((reset_at - NOW).total_seconds())
-    assert len(transport.sent) == SDK_ATTEMPTS
-    assert sleeps == SDK_SLEEPS
+    assert len(transport.sent) == 1
+    assert sleeps == []
 
 
 @pytest.mark.asyncio
-async def test_one_429_then_a_page_is_served_after_one_retry(executor, monkeypatch):
-    sleeps = record_sdk_sleeps(monkeypatch)
-    recorded = load('bars_1Day')
-    client, transport = recorded_client(in_order([load('error_429'), recorded]))
-    query = build_query(recorded.timestamps[0], recorded.timestamps[-1] + Granularity.ONE_DAY.offset)
+async def test_a_429_ends_the_attempt_even_when_the_next_answer_would_have_served(executor, monkeypatch):
+    """INVERTED ON tj-7zjov1.56 from test_one_429_then_a_page_is_served_after_one_retry.
 
-    bars = await drain(await build_reader(client, executor).get_bars(query))
+    That was alpaca-py retrying the 429 itself, 3 s later, under the one token already spent. Now the 429 is
+    the attempt's answer: the executor waits for the reset, and the served page behind it is never asked for.
+    """
+    sleeps = record_page_retry_sleeps(monkeypatch)
+    client, transport = recorded_client(in_order([load('error_429'), load('bars_1Day')]))
 
-    assert stamps(bars) == recorded.timestamps
-    assert len(transport.sent) == 2
-    assert sleeps == SDK_SLEEPS[:1]
+    error = failure_of(await build_reader(client, executor).get_bars(whole_day_query()))
+
+    assert error.reason is Reason.VENDOR_RATE_LIMITED
+    assert len(transport.sent) == 1
+    assert sleeps == []
 
 
 # --------------------------------------------------------------------------------------------
@@ -585,7 +644,7 @@ async def test_one_429_then_a_page_is_served_after_one_retry(executor, monkeypat
 
 @pytest.mark.asyncio
 async def test_page_two_answering_500_returns_vendor_unavailable_and_no_bar_from_page_one(executor, monkeypatch):
-    sleeps = record_sdk_sleeps(monkeypatch)
+    sleeps = record_page_retry_sleeps(monkeypatch)
     page1, page2 = load('bars_1Day_page1'), load('bars_1Day_page2')
     client, transport = recorded_client(by_page_token({None: page1, page1.next_page_token: load('error_500')}))
     query = build_query(page1.timestamps[0], page2.timestamps[-1] + Granularity.ONE_DAY.offset)
@@ -683,7 +742,8 @@ async def test_get_bars_never_reads_api_error_code(executor, monkeypatch, fixtur
         raise AssertionError('APIError.code was read')
 
     monkeypatch.setattr(APIError, 'code', property(refuse))
-    record_sdk_sleeps(monkeypatch)
+    # The 504 is retried by the reader, 3 s apart: its wait is recorded so nothing really sleeps.
+    record_page_retry_sleeps(monkeypatch)
     client, _transport = recorded_client(always(load(fixture)))
 
     outcome = await build_reader(client, executor).get_bars(whole_day_query())
@@ -723,7 +783,7 @@ async def test_what_alpaca_cannot_serve_is_refused_with_zero_http_requests(execu
 @pytest.mark.parametrize(
     ('change', 'reason'),
     [
-        pytest.param({'feed': Feed.SIP}, Reason.FEED_NOT_AVAILABLE, id='named-sip-on-iex'),
+        pytest.param({'feed': Feed.NOT_APPLICABLE}, Reason.FEED_NOT_AVAILABLE, id='named-not-applicable'),
         pytest.param({'start': NOW, 'end': NOW + timedelta(days=1)}, Reason.RANGE_IN_FUTURE, id='range-in-future'),
     ],
 )

@@ -2,9 +2,8 @@
 
 Until tj-3mk3u5.11 this module also built a KafkaRpcFactory at import and decorated store_data with
 @rpc.add_server(InterfaceRpc.INGEST_DATASET), which dispatched into data/ingest/app/ingest_control.py.
-Both are gone with the Kafka transport. The dataset request is answered by the gRPC IngestService,
-whose domain handler is routers/data_ingest/fetch_dataset_handler.py::IngestFetchHandler and whose
-registration is data/ingest/app/grpc_host.py::registered_services.
+Both are gone with the Kafka transport. Dataset requests arrive over gRPC Submit (routers/data_ingest/submit_handler.py), registered in
+data/ingest/app/grpc_host.py::registered_services; the FetchDataset pull stream is gone (owner ruling 2026-11-02).
 
 The router itself stays because main.create_app mounts it, and because an HTTP route added to
 routers/data_ingest later belongs here -- which is also what the `none` declaration in

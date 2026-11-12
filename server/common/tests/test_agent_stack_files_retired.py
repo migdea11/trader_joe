@@ -8,7 +8,8 @@ tj-iee6sn.21) is pinned by tools/agent_mcp/tests/test_agent_stack_retired.py; th
   1. THE FAKE OVERLAY'S LOADERS, ENUMERATED (the release note's (C), REQUIRED). Every place a compose file set
      loads docker-compose.fake.yaml is read from where it is spelled and must be EXACTLY: the Makefile's
      SYSTEM_COMPOSE (and SEED_DUMP_COMPOSE, which is $(SYSTEM_COMPOSE) plus the client), used by the recipes
-     of system-launch, test-build and seed-dump alone; run_migrations.sh's TEST definition; the MCP's
+     of system-launch, test-build and seed-dump alone; run_migrations.sh's TEST definition; restore_dump.sh's
+     one set, the test pair in trader_joe_dev (tj-7zjov1.9: a dump is restored into the test stack only); the MCP's
      test_up and test_build sets in tools/agent_mcp/stack.py (the TEST migrate one-off runs on the first);
      and CI's lines through the test pair -- the render check, Migrate Database, the Instance Secret
      Lifecycle's recreate, and the System Testing job's `make system-launch` and `make seed-dump`. Nothing
@@ -80,6 +81,9 @@ EXPECTED_FAKE_SETS = Counter(
         ('Makefile', 'SYSTEM_COMPOSE', TEST_PAIR): 1,
         ('Makefile', 'SEED_DUMP_COMPOSE', (*TEST_PAIR, CLIENT)): 1,
         ('run_migrations.sh', 'TEST', TEST_PAIR): 1,
+        # restore_dump.sh (tj-7zjov1.9, migration-safety gate m5): a dump is restored into the TEST stack only,
+        # so its one set is the test pair, in trader_joe_dev.
+        ('restore_dump.sh', 'COMPOSE (-p $DEV_PROJECT)', TEST_PAIR): 1,
         ('stack.py', 'TEST_COMPOSE_FILES', TEST_PAIR): 1,
         ('stack.py', 'TEST_BUILD_COMPOSE_FILES', (*TEST_PAIR, MCP_TEST_OVERLAY)): 1,
         ('trader_joe_testing.yml', 'Image Build / Check Compose Renders: config', TEST_PAIR): 1,
@@ -93,14 +97,17 @@ EXPECTED_CI_FAKE_TARGETS = Counter(
     {
         ('trader_joe_testing.yml', 'System Testing / Start System', 'system-launch'): 1,
         ('trader_joe_testing.yml', 'System Testing / Seed Dump', 'seed-dump'): 1,
+        # The Migration Gate (bead tj-7zjov1.10) starts the same fake-mode test stack for its two paths.
+        ('trader_joe_testing.yml', 'Migration Gate / Start System', 'system-launch'): 1,
     }
 )
-# Every tracked file that names the overlay outside a comment, a docstring or a message: the five places
-# above, and the MCP image's bake of the file (its COPY and its ignore file's allow line), which loads no set.
+# Every tracked file that names the overlay outside a comment, a docstring or a message: the places above,
+# and the MCP image's bake of the file (its COPY and its ignore file's allow line), which loads no set.
 EXPECTED_FAKE_NAMING_FILES = frozenset(
     {
         'Makefile',
         'server/data/store/run_migrations.sh',
+        'server/data/store/restore_dump.sh',
         'tools/agent_mcp/stack.py',
         '.github/workflows/trader_joe_testing.yml',
         'tools/agent_mcp/Dockerfile',
@@ -211,6 +218,34 @@ def _migrations_fake_sets() -> list[tuple[str, str, tuple[str, ...]]]:
     return sites
 
 
+RESTORE_SCRIPT = MIGRATIONS_SCRIPT.with_name('restore_dump.sh')
+
+
+def _restore_fake_sets() -> list[tuple[str, str, tuple[str, ...]]]:
+    """restore_dump.sh's COMPOSE=(...) set, named with its project; its other overlay lines are a case or a message.
+
+    The project is read as spelled ($DEV_PROJECT) and that variable is held to trader_joe_dev here, so the loader
+    is pinned to the dev project's test stack and can never address the default (production) project.
+    """
+    lines = _run_lines(RESTORE_SCRIPT.read_text(encoding='utf-8'))
+    assert 'DEV_PROJECT=trader_joe_dev' in lines, f'{RESTORE_SCRIPT.name} must name its project trader_joe_dev'
+    sites, unclassified = [], []
+    for line in lines:
+        if FAKE not in line:
+            continue
+        if line.startswith('COMPOSE=(') and line.endswith(')'):
+            body = line[len('COMPOSE=(') : -1]
+            calls, projects = _compose_calls(body), _compose_projects(body)
+            assert len(calls) == 1 and not calls[0][1], line
+            sites.append(('restore_dump.sh', f'COMPOSE (-p {projects[0]})', _set_names(calls[0][0])))
+        elif re.match(rf'^{re.escape(FAKE)}\)\s', line) or line.startswith('echo '):
+            continue
+        else:
+            unclassified.append(line)
+    assert not unclassified, f'{RESTORE_SCRIPT.name} names the overlay outside its COMPOSE set: {unclassified}'
+    return sites
+
+
 def _mcp_fake_sets() -> list[tuple[str, str, tuple[str, ...]]]:
     """Every module-level tuple of file names in stack.py that holds the overlay."""
     return [
@@ -247,7 +282,7 @@ def test_every_compose_file_set_that_loads_the_fake_overlay_is_exactly_the_enume
     """
     makefile_sets, _ = _makefile_fake_sets()
     workflow_sets, _ = _workflow_fake_sites()
-    found = Counter(makefile_sets + _migrations_fake_sets() + _mcp_fake_sets() + workflow_sets)
+    found = Counter(makefile_sets + _migrations_fake_sets() + _restore_fake_sets() + _mcp_fake_sets() + workflow_sets)
     assert found == EXPECTED_FAKE_SETS, (
         f'the file sets that load {FAKE} are {sorted(found.elements())}, expected {sorted(EXPECTED_FAKE_SETS.elements())}'
     )

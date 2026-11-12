@@ -1,0 +1,19 @@
+{
+  "provenance": {
+    "kind": "recorded",
+    "recorded_at": "2026-10-24T19:42:27.133020+00:00",
+    "endpoint": "GET https://data.alpaca.markets/v1/corporate-actions",
+    "params": {
+      "symbols": "ABMD",
+      "start": "2015-01-01",
+      "end": "2026-10-24",
+      "limit": "1000",
+      "sort": "asc"
+    },
+    "byte_length": 47,
+    "sha256": "fea17f17380b7eb24c760478974fddd2b3525612ac6076eb0b5bc5ab078d3b08",
+    "note": "Captured through the dev vendor probe (P27a s10/s10x, tj-7zjov1.7). body_text is the body as served, byte for byte: its length and sha256 are the capture's own."
+  },
+  "status": 200,
+  "body_text": "{\"corporate_actions\":{},\"next_page_token\":null}"
+}

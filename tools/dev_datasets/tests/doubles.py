@@ -7,6 +7,19 @@ which work in flight may write (written_while_waiting); run_tool injects that wa
 tj-grna9p.194: it answers the database rail's identity query, the pg_settings row of cluster_name as (setting, source):
 stack and source by default, identity_rows to answer any rows at all (none, two). It records the query in statements
 and events like any other statement, so a test sees what ran before and after it.
+tj-grna9p.160: it accepts the reset's LOCK TABLE (answering nothing); writes() keeps it, so a lock taken by a run that
+must change nothing shows.
+tj-7zjov1.51: it answers the open-request count (PENDING or QUEUED ingest_request rows) from request_states, for
+exactly the state literals the statement names.
+tj-3kplhf (tj-7zjov1.293): eighteen tables (EIGHTEEN_TABLES), every table the store models declare.
+tj-7zjov1.295: the export's reads (alembic_version, information_schema columns, the dry run's estimates) and the two
+psycopg2 cursor calls it makes, mogrify and copy_expert; run_tool takes the seed root, so no test writes to output/.
+tj-7zjov1.297: the RELOAD (decision tj-7zjov1.291 D1, D3). It answers COPY <table> FROM STDIN (reading the file the tool
+streams, counting its rows into the transaction's uncommitted counts: a commit keeps them, a rollback drops them), the
+setval of stock_market_activity.id (the uncommitted sequence, set to max(id) of the rows loaded) and the serial-column
+query (serial_columns). The tables' uncommitted state is `pending`; TRUNCATE ... RESTART IDENTITY zeroes the tables it
+names there and the sequence. run_tool ALWAYS passes a seed root: a fresh directory under SEED_BASE (set per test by
+conftest.py to the test's tmp_path), so no test writes under output/ and two runs at the fixed clock never collide.
 
 Nothing here reaches a network or a database. Every credential is a fake with a distinctive canary inside it, so a
 leak shows up as a substring anywhere in the output, whatever the formatting around it.
@@ -15,13 +28,16 @@ leak shows up as a substring anywhere in the output, whatever the formatting aro
 import io
 import json
 import re
+import tempfile
 import urllib.parse
 from collections.abc import Callable
 from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 
+from tools.dev_datasets import dev_seed
 from tools.dev_datasets import request as tool
 
 
@@ -50,22 +66,67 @@ NO_RESET = '--no-reset'
 DEV_CONFIG = tool.Response(200, {'deploymentLabel': 'dev'})
 TEST_CONFIG = tool.Response(200, {'deploymentLabel': 'test'})
 
-# The seven tables a reset empties, written out here from the owner's ruling (tj-grna9p.148), not read from the tool.
-SEVEN_TABLES = (
+# The eighteen tables a reset empties, written out here from the design, not read from the tool: the seven of the
+# owner's ruling (tj-grna9p.148), every store data table then; tj-7zjov1.51's two request-record tables after
+# ingest_run; and tj-3kplhf's nine (owner ruling 2026-11-03, no dev guard): the asset-list, corporate-action and panel
+# tables, after dataset_deletion.
+EIGHTEEN_TABLES = (
     'stock_market_activity',
     'store_dataset_entry',
     'ingest_run',
+    'ingest_request',
+    'ingest_instance',
     'dataset_read',
     'dataset_read_daily',
     'dataset_override_log',
     'dataset_deletion',
+    'asset_list_snapshot',
+    'asset_list_row',
+    'asset_list_event',
+    'corporate_action',
+    'panel',
+    'panel_settings_version',
+    'panel_source_settings_version',
+    'panel_pass',
+    'panel_member_transition',
 )
 # Distinct non-zero counts, so a count printed against the wrong table shows.
-TABLE_COUNTS = dict(zip(SEVEN_TABLES, (5000, 14, 31, 22, 9, 3, 2), strict=True))
+TABLE_COUNTS = dict(
+    zip(EIGHTEEN_TABLES, (5000, 14, 31, 17, 4, 22, 9, 3, 2, 41, 1200, 57, 8, 6, 12, 13, 27, 19), strict=True)
+)
+# tj-7zjov1.297: what a dev export keeps of TABLE_COUNTS, distinct per table and fewer than the table holds; the five
+# tables O1 and O3 wipe keep none, the three whole panel tables (every row) keep all. seeded_copy_data() is the COPY text a
+# FakeDb streams for them, so a preserving reset reloads exactly these counts.
+SEED_ROWS = dict(zip(EIGHTEEN_TABLES, (3, 2, 5, 4, 0, 0, 0, 0, 0, 7, 11, 9, 1, 6, 12, 13, 15, 10), strict=True))
+# The bar ids the seed keeps, not contiguous and not in order, so max(id) is not the count or the last row.
+SEED_BAR_IDS = (4001, 4100, 4007)
+
+
+def seeded_copy_data() -> dict[str, bytes]:
+    data = {}
+    for table, rows in SEED_ROWS.items():
+        if table == 'stock_market_activity':
+            data[table] = b''.join(f'{bar}\t{table}\n'.encode() for bar in SEED_BAR_IDS)
+        else:
+            data[table] = b''.join(f'{table}-{n}\tv\\tx\n'.encode() for n in range(rows))
+    assert data['stock_market_activity'].count(b'\n') == SEED_ROWS['stock_market_activity']
+    return data
+
+
 _COUNT = re.compile(r'^SELECT count\(\*\) FROM ([a-z_]+)$', re.IGNORECASE)
+_TRUNCATED = re.compile(r'^TRUNCATE TABLE (?P<tables>[a-z_, ]+) RESTART IDENTITY$', re.IGNORECASE)
 # tj-grna9p.150 (5a): the reset's RUNNING count, written out from the design (the store writes the enum's value,
 # 'RUNNING', into ingest_run.state; test_reset.py checks that against the store model's source).
 RUNNING_COUNT_TEXT = "SELECT count(*) FROM ingest_run WHERE state = 'RUNNING'"
+# tj-7zjov1.51 (2): the open-request count, right after the RUNNING count, written out from the design: the requests
+# ingest may still answer (PENDING) or deliver (QUEUED). NOT_DELIVERED and the finished states do not block.
+OPEN_REQUEST_STATES = ('PENDING', 'QUEUED')
+OPEN_REQUESTS_TEXT = "SELECT count(*) FROM ingest_request WHERE state IN ('PENDING', 'QUEUED')"
+# Any count of ingest_request rows by a state list: the fake answers it from FakeDb.request_states for the literals the
+# statement itself names, so a statement that drops a state really lets that state through.
+_STATE_COUNT = re.compile(
+    r"^SELECT count\(\*\) FROM ingest_request WHERE state IN \((?P<states>'[A-Z_]+'(?:, '[A-Z_]+')*)\)$"
+)
 # tj-grna9p.194, THE DATABASE RAIL (architect's option 3): the identity query every connection runs first, written out
 # from the design. The built-in cluster_name, which the dev and test compose files put on the postgres command line;
 # pg_settings lists it with its source, and only 'command line' proves the server was started that way.
@@ -74,6 +135,58 @@ STACK_TEXT = "SELECT setting, source FROM pg_settings WHERE name = 'cluster_name
 COMMAND_LINE = 'command line'
 # tj-grna9p.150 (5b): the wait after a reset is two usage flush intervals of 5 s each.
 QUIESCE_SECONDS = 10
+# tj-7zjov1.295, THE EXPORT's reads, written out from the design (decision tj-7zjov1.291 D3): the revision from
+# alembic_version, a table's columns from information_schema in ordinal order, and the dry run's count-and-size wrap.
+ALEMBIC_TEXT = 'SELECT version_num FROM alembic_version'
+COLUMNS_TEXT = (
+    'SELECT column_name, data_type, udt_name FROM information_schema.columns '
+    "WHERE table_schema = 'public' AND table_name = %(table)s ORDER BY ordinal_position"
+)
+ESTIMATE_PREFIX = 'SELECT count(*), coalesce(sum(pg_column_size(k)), 0) FROM ('
+DEFAULT_COLUMNS = [('id', 'uuid', 'uuid')]
+# tj-7zjov1.297, THE RELOAD's statements, written out from the design (D1 and R3): one COPY FROM STDIN per table, the
+# setval of the one serial (stock_market_activity.id) to max(id), true only when a row was loaded, and the query that
+# proves the live schema has no other serial or identity column.
+LOAD_TEXT = re.compile(r'^COPY (?P<table>[a-z_]+) FROM STDIN$')
+SETVAL_TEXT = (
+    "SELECT setval(pg_get_serial_sequence('stock_market_activity', 'id'), "
+    'coalesce((SELECT max(id) FROM stock_market_activity), 1), '
+    '(SELECT count(*) > 0 FROM stock_market_activity))'
+)
+SERIAL_TEXT = (
+    'SELECT table_name, column_name FROM information_schema.columns '
+    "WHERE table_schema = 'public' AND table_name = ANY(%(tables)s) "
+    "AND (column_default LIKE 'nextval(%%' OR is_identity = 'YES') ORDER BY table_name, column_name"
+)
+SESSION_TEXTS = ("SET LOCAL TimeZone = 'UTC'", 'SET LOCAL extra_float_digits = 1')
+# The seed root run_tool hands the tool: conftest.py points it at each test's tmp_path. None outside a test.
+SEED_BASE: Path | None = None
+
+
+def fresh_seed_root() -> Path:
+    """A new, empty directory under SEED_BASE, for one run's export."""
+    assert SEED_BASE is not None, 'SEED_BASE is unset: conftest.py sets it for every test'
+    return Path(tempfile.mkdtemp(prefix='seed-', dir=SEED_BASE))
+
+
+def _ids(data: bytes) -> list[int]:
+    """The integer first column of COPY text rows (the bar ids a reload of stock_market_activity carries)."""
+    return [int(line.split(b'\t', 1)[0]) for line in data.splitlines() if line]
+
+
+def _table_of_trim(sql: str) -> str:
+    """The table whose trim statement this is: the double knows the statements only by identity, never by parsing."""
+    for table, statement in dev_seed.TRIM_SQL.items():
+        if statement == sql:
+            return table
+    raise AssertionError(f'not a trim statement: {sql[:80]}')
+
+
+def _table_of_estimate(sql: str) -> str:
+    for table, statement in dev_seed.ESTIMATE_SQL.items():
+        if statement == sql:
+            return table
+    raise AssertionError(f'not an estimate statement: {sql[:80]}')
 
 
 @dataclass
@@ -239,16 +352,45 @@ class FakeCursor:
         if self.db.execute_error is not None and (self.db.fail_on is None or self.db.fail_on in sql):
             raise self.db.execute_error
         count = _COUNT.match(text)
+        state_count = _STATE_COUNT.match(text)
         if text == RUNNING_COUNT_TEXT:
             self._result = [(self.db.running,)]
+        elif state_count:
+            named = re.findall(r"'([A-Z_]+)'", state_count.group('states'))
+            emptied = 'ingest_request' in self.db.truncated_tables
+            self._result = [(0 if emptied else sum(self.db.request_states.get(s, 0) for s in named),)]
         elif count:
-            table = count.group(1)
-            self._result = [(0 if self.db.truncated else self.db.counts.get(table, 0),)]
+            self._result = [(self.db.current(count.group(1)),)]
         elif text.upper().startswith('TRUNCATE'):
+            # Only the tables the statement names are emptied, so a table dropped from it keeps its rows.
             self.db.truncated = True
+            self.db.truncated_tables = set(_TRUNCATED.match(text).group('tables').replace(' ', '').split(','))
+            self.db.pending.update(dict.fromkeys(self.db.truncated_tables, 0))
+            for table in self.db.truncated_tables:
+                self.db.loaded.pop(table, None)
+            if 'stock_market_activity' in self.db.truncated_tables:
+                # RESTART IDENTITY: the sequence starts again at 1, not yet called.
+                self.db.pending_sequence = (1, False)
             self._result = []
-        elif text.upper().startswith('SET '):
+        elif text == SETVAL_TEXT:
+            ids = _ids(self.db.loaded.get('stock_market_activity', b''))
+            value = (max(ids), True) if ids else (1, False)
+            self.db.pending_sequence = value
+            self.db.setvals.append(value)
+            self._result = [(value[0],)]
+        elif text == SERIAL_TEXT:
+            self.db.serial_queries.append(dict(params))
+            self._result = list(self.db.serial_columns)
+        elif text.upper().startswith(('SET ', 'LOCK TABLE ')):
             self._result = []
+        elif text == ALEMBIC_TEXT:
+            self._result = list(self.db.alembic_rows) if self.db.alembic_rows is not None else [(self.db.revision,)]
+        elif text == COLUMNS_TEXT:
+            table = params['table']
+            self._result = list(self.db.columns.get(table, DEFAULT_COLUMNS))
+        elif text.startswith(ESTIMATE_PREFIX):
+            table = _table_of_estimate(sql)
+            self._result = [self.db.estimates.get(table, (0, 0))]
         elif text.upper().startswith('SELECT'):
             owner, symbol, granularity = params
             self._result = list(self.db.lookups.get((owner, symbol, granularity), []))
@@ -262,6 +404,53 @@ class FakeCursor:
 
     def fetchone(self):
         return self._result[0]
+
+    # tj-7zjov1.295: the export's two psycopg2 cursor calls. mogrify binds the cutoffs into a trim statement (here as
+    # quoted ISO literals, recorded with the parameters); copy_expert streams the table's scripted COPY text into the
+    # sink, or raises copy_error for the table named by copy_error_on.
+    def mogrify(self, sql, params):
+        self.db.mogrified.append((sql, dict(params)))
+        self.db.events.append(('mogrify', sql))
+        self._mogrified_from = sql
+        text = sql
+        for name, value in params.items():
+            text = text.replace(f'%({name})s', f"'{value.isoformat()}'::timestamptz")
+        return text.encode('utf-8')
+
+    def copy_expert(self, sql, sink):
+        load = LOAD_TEXT.match(' '.join(sql.split()))
+        if load:
+            self._copy_in(load.group('table'), sink)
+            return
+        table = _table_of_trim(self._mogrified_from)
+        self.db.copies.append((table, sql))
+        self.db.events.append(('copy', table))
+        if self.db.copy_error is not None and self.db.copy_error_on == table:
+            raise self.db.copy_error
+        data = self.db.copy_data.get(table, b'')
+        # In two writes when there is more than one row, as a driver's buffer may split it.
+        middle = len(data) // 2
+        for chunk in (data[:middle], data[middle:]):
+            if chunk:
+                sink.write(chunk)
+
+    # tj-7zjov1.297: COPY <table> FROM STDIN. The server reads the tool's source to its end, in small reads as psycopg2
+    # does; before the first read, before_load(table) may change the file on disk (a file edited after verification).
+    # The rows read become the table's uncommitted count, less load_shortfall (a server that loaded fewer rows).
+    def _copy_in(self, table, source):
+        self.db.events.append(('copy_in', table))
+        if self.db.before_load is not None:
+            self.db.before_load(table)
+        if self.db.load_error is not None and self.db.load_error_on == table:
+            raise self.db.load_error
+        chunks = []
+        while chunk := source.read(8192):
+            chunks.append(chunk)
+        data = b''.join(chunks)
+        self.db.loads.append((table, data))
+        self.db.loaded[table] = self.db.loaded.get(table, b'') + data
+        rows = data.count(b'\n') - self.db.load_shortfall.get(table, 0)
+        self.db.pending[table] = self.db.current(table) + rows
 
 
 @dataclass
@@ -279,8 +468,13 @@ class FakeDb:
     events: list[tuple[str, ...]] = field(default_factory=list)
     counts: dict[str, int] = field(default_factory=lambda: dict(TABLE_COUNTS))
     truncated: bool = False
+    # The tables the uncommitted TRUNCATE named (tj-7zjov1.51): a commit empties exactly these, a rollback none.
+    truncated_tables: set[str] = field(default_factory=set)
     # ingest_run rows in state RUNNING, as the reset's first count sees them (tj-grna9p.150 (5a)).
     running: int = 0
+    # ingest_request rows by state (tj-7zjov1.51 (2)): state -> count. The open-request count sums the states its
+    # statement names; a committed TRUNCATE empties them. The ingest_request entry of counts is a test's to keep in step.
+    request_states: dict[str, int] = field(default_factory=dict)
     # Rows that work in flight writes while the tool waits after a reset (tj-grna9p.150 (5b)): table -> count, applied
     # by sleep(). None: the stack stays quiet.
     written_while_waiting: dict[str, int] | None = None
@@ -298,6 +492,39 @@ class FakeDb:
     commits: int = 0
     rollbacks: int = 0
     closes: int = 0
+    # tj-7zjov1.295, the export. revision: what alembic_version holds (the checkout head by default); alembic_rows, when
+    # set, is the whole answer instead (none, two). columns: table -> information_schema rows (name, data_type, udt).
+    # copy_data: table -> the COPY text the server streams. estimates: table -> (rows, bytes) for a dry run.
+    revision: str = field(default_factory=lambda: dev_seed.head_revision())
+    alembic_rows: list[tuple] | None = None
+    columns: dict[str, list[tuple[str, str, str]]] = field(default_factory=dict)
+    copy_data: dict[str, bytes] = field(default_factory=dict)
+    copy_error: Exception | None = None
+    copy_error_on: str | None = None
+    estimates: dict[str, tuple[int, int]] = field(default_factory=dict)
+    mogrified: list[tuple[str, dict]] = field(default_factory=list)
+    copies: list[tuple[str, str]] = field(default_factory=list)
+    # tj-7zjov1.297, the reload. pending: the open transaction's table counts (a TRUNCATE zeroes the tables it names, a
+    # COPY FROM adds the rows it read); commit keeps them, rollback drops them. loaded: the bytes COPY FROM read per table
+    # in the open transaction; loads: every COPY FROM, (table, bytes), across transactions. sequence: the committed state
+    # of stock_market_activity's id sequence, (value, is_called), None when no test has moved it; pending_sequence the
+    # open transaction's. serial_columns: what the serial-column query answers (the design's one serial by default).
+    pending: dict[str, int] = field(default_factory=dict)
+    loaded: dict[str, bytes] = field(default_factory=dict)
+    loads: list[tuple[str, bytes]] = field(default_factory=list)
+    load_shortfall: dict[str, int] = field(default_factory=dict)
+    load_error: Exception | None = None
+    load_error_on: str | None = None
+    before_load: Callable[[str], object] | None = None
+    sequence: tuple[int, bool] | None = None
+    pending_sequence: tuple[int, bool] | None = None
+    setvals: list[tuple[int, bool]] = field(default_factory=list)
+    serial_columns: list[tuple[str, str]] = field(default_factory=lambda: [('stock_market_activity', 'id')])
+    serial_queries: list[dict] = field(default_factory=list)
+
+    def current(self, table: str) -> int:
+        """A table's row count as the open transaction sees it."""
+        return self.pending[table] if table in self.pending else self.counts.get(table, 0)
 
     @classmethod
     def with_plan_entries(cls, label: str = 'dev') -> 'FakeDb':
@@ -323,14 +550,24 @@ class FakeDb:
     def commit(self):
         self.commits += 1
         self.events.append(('commit',))
-        if self.truncated:
-            self.counts = dict.fromkeys(self.counts, 0)
-            self.truncated = False
+        if self.truncated and 'ingest_request' in self.truncated_tables:
+            self.request_states = {}
+        self.counts = {table: self.current(table) for table in self.counts}
+        if self.pending_sequence is not None:
+            self.sequence = self.pending_sequence
+        self._end()
+
+    def _end(self):
+        self.truncated = False
+        self.truncated_tables = set()
+        self.pending = {}
+        self.loaded = {}
+        self.pending_sequence = None
 
     def rollback(self):
         self.rollbacks += 1
         self.events.append(('rollback',))
-        self.truncated = False
+        self._end()
 
     def close(self):
         self.closes += 1
@@ -370,13 +607,17 @@ class Outcome:
     stderr: str
     # Every wait the tool asked for (seconds), in order.
     sleeps: list[float] = field(default_factory=list)
+    # The seed root the run was given (tj-7zjov1.297): where a dev reset's export landed.
+    seed_root: Path | None = None
 
     @property
     def text(self) -> str:
         return '\n'.join([*self.lines, self.stdout, self.stderr])
 
 
-def run_tool(argv, environ=None, *, http=None, connect=None, now=NOW, plan_path=None, sleep=None) -> Outcome:
+def run_tool(
+    argv, environ=None, *, http=None, connect=None, now=NOW, plan_path=None, sleep=None, seed_root=None
+) -> Outcome:
     """Run the tool's entry point with every side channel captured.
 
     Output goes through a Reporter that records each line; stdout and stderr are captured too, so a print or an
@@ -390,6 +631,9 @@ def run_tool(argv, environ=None, *, http=None, connect=None, now=NOW, plan_path=
     sleeps: list[float] = []
     out, err = io.StringIO(), io.StringIO()
     kwargs = {'plan_path': plan_path} if plan_path is not None else {}
+    # Never the tool's default (output/dev_seed): a fresh directory per run unless the test names one.
+    seed_root = fresh_seed_root() if seed_root is None else seed_root
+    kwargs['seed_root'] = seed_root
     db = getattr(connect, '__self__', None)
 
     def injected_sleep(seconds):
@@ -410,7 +654,7 @@ def run_tool(argv, environ=None, *, http=None, connect=None, now=NOW, plan_path=
             sleep=injected_sleep,
             **kwargs,
         )
-    return Outcome(status, lines, out.getvalue(), err.getvalue(), sleeps)
+    return Outcome(status, lines, out.getvalue(), err.getvalue(), sleeps, seed_root)
 
 
 def rendered_bodies(day=None, now=NOW) -> dict[str, dict]:

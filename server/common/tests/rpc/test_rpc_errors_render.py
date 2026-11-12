@@ -98,7 +98,13 @@ def test_every_reason_in_the_table_is_in_exactly_one_of_the_two_groups():
     """
     assert set(RENDERABLE) | set(CODELESS) == set(Reason)
     assert not set(RENDERABLE) & set(CODELESS)
-    assert len(RENDERABLE) == 18 and len(CODELESS) == 7, 'the table changed; check that the new row is gated here'
+    assert len(RENDERABLE) == 19 and len(CODELESS) == 7, 'the table changed; check that the new row is gated here'
+
+
+def test_range_too_recent_renders_with_its_code():
+    """tj-7zjov1.315: the newest row names FAILED_PRECONDITION, so it is in the gated group, not the codeless one."""
+    assert Reason.RANGE_TOO_RECENT in RENDERABLE
+    assert Reason.RANGE_TOO_RECENT not in CODELESS
 
 
 # -----------------------------------------------------------------------------------------------------

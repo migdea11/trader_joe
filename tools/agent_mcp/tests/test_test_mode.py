@@ -6,18 +6,21 @@ down and restart still act on an empty project), and ADR tj-4rr0la addendum 26 (
 and addendum 27 (1)-(3): test mode is make system-launch's set (base + docker-compose.fake.yaml) on the
 :test images, built by make test-build, never :latest; the MCP refuses while any PROD container exists.
 
-test_build (make test-build, 1800 s), a refusal running nothing after it and charging nothing:
+test_build (make test-build, 1800 s), a refusal running nothing after it:
 
     S6 stale copies (fake and test overlay included) -> generated-code freshness on gen/proto/python
-    ONLY -> ONE budget charge -> the two trusted digests -> the bases -> ONE file-based build of
+    ONLY -> the two trusted digests -> the bases -> ONE file-based build of
     data_store and data_ingest over base + fake + the MCP-only docker-compose.agent-test.yaml
 
 test_up (make system-launch, 600 s):
 
     mode guard (any non-PROD state) -> S6 -> D6 on tests/fakes -> D5 env preflight -> steering walk
     -> one inspect per :test image ('call test_build') -> the two digests -> the stamp read of each
-    :test image ('STALE: ... call test_build') -> ONE budget charge -> the bases -> the label-only down
+    :test image ('STALE: ... call test_build') -> the bases -> the label-only down
     -> ONE plain (unwrapped) up -d --wait --wait-timeout 300 over base + fake, DATA_DIR=./volume_data/test
+
+No call is counted or limited by volume (ADR tj-4rr0la addendum 33): CALL_VOLUME admitted calls of either
+verb each reach the build or the up, and none is refused.
 
 Every verb call goes through the REAL AgentStack over the fake-docker rig. Expected values are literals
 or parsed from the Makefile and the compose files, never read from stack.py.
@@ -34,11 +37,15 @@ from common.tests import compose_model
 from common.tests.test_ci_invariants import _compose_calls, _expanded_make_variable, _make_recipe, _subprocess_env
 from tools.agent_mcp import runner, stack
 from tools.agent_mcp.tests.harness import (
+    CALL_VOLUME,
     DEV_DIGESTS,
+    OLD_BUDGET_REFUSAL,
     REPO_ROOT,
     VERB_SAMPLES,
     FakeDocker,
     Rig,
+    assert_no_budget_wording,
+    assert_no_call_counter,
     default_response,
     is_dev_digest,
     is_dev_up_wrapper,
@@ -46,7 +53,6 @@ from tools.agent_mcp.tests.harness import (
 )
 from tools.agent_mcp.tests.test_dev_guards import EXPECTED_PLACEHOLDER
 from tools.agent_mcp.tests.test_dev_label_verbs import (
-    BUDGET_REFUSAL,
     DEV_LINE,
     GUARD,
     GUARD_REFUSAL,
@@ -78,7 +84,6 @@ STORE_DIGEST = DEV_DIGESTS[('data', 'store')]
 INGEST_DIGEST = DEV_DIGESTS[('data', 'ingest')]
 DIGESTS = {'trader_joe_data_store:test': STORE_DIGEST, 'trader_joe_data_ingest:test': INGEST_DIGEST}
 DOWN = (DOCKER, 'compose', '-p', PROJECT, 'down')
-BUDGET = 12
 STALE_PREFIX = 'the MCP image is stale: '
 TEST_GENERATE_HINT = 'run make proto in the root checkout'
 TEST_MODE_HINT = 'test mode is up: call up first'
@@ -194,16 +199,6 @@ def _argvs(rig: Rig) -> list[tuple[str, ...]]:
     return [step.argv for step in rig.docker.steps]
 
 
-def _charges_left(rig: Rig) -> int:
-    """How many more charges the budget takes before refusing (it is consumed by asking)."""
-    for taken in range(BUDGET + 1):
-        try:
-            rig.agent.dev_budget.charge()
-        except stack.Refused:
-            return taken
-    raise AssertionError('the budget never refused')
-
-
 # ===============================================================================================
 # THE TOOL LIST
 # ===============================================================================================
@@ -244,6 +239,8 @@ def test_the_descriptions_say_what_each_verb_never_touches():
         'call test_build',
     ):
         assert phrase in up, (phrase, up)
+    assert_no_budget_wording(build)
+    assert_no_budget_wording(up)
 
 
 # ===============================================================================================
@@ -260,7 +257,7 @@ def test_test_build_runs_the_digests_the_bases_then_one_build_over_the_test_buil
     assert result['message'] == BUILD_OK
     assert _argvs(rig) == build_run(rig.layout.repo_host_path)
     assert all(step.cwd == rig.layout.stack_dir for step in rig.docker.steps)
-    assert _charges_left(rig) == BUDGET - 1
+    assert_no_call_counter(rig)
 
 
 def test_test_build_runs_no_mode_guard_even_on_a_prod_project(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
@@ -344,31 +341,26 @@ def _missing_python(rig: Rig, responder: Responder) -> None:
     shutil.rmtree(rig.layout.repo / 'gen' / 'proto' / 'python')
 
 
-def _spent_budget(rig: Rig, responder: Responder) -> None:
-    for _ in range(BUDGET):
-        rig.agent.dev_budget.charge()
-
-
 @pytest.mark.parametrize('name', ['docker-compose.fake.yaml', 'docker-compose.agent-test.yaml', 'Dockerfile'])
-def test_test_build_refuses_a_stale_copy_of_its_own_files_with_no_step_and_no_charge(
+def test_test_build_refuses_a_stale_copy_of_its_own_files_with_no_step(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, name: str
 ):
     rig, responder = _rig(tmp_path, monkeypatch)
     _stale_copy(name)(rig, responder)
     result = rig.call('test_build', {})
     assert result['status'] == 'refused' and result['message'].startswith(f'{STALE_PREFIX}{name} differs'), result
-    assert _argvs(rig) == [] and _charges_left(rig) == BUDGET
+    assert _argvs(rig) == []
+    assert_no_call_counter(rig)
 
 
-def test_test_build_refuses_a_missing_python_tree_with_no_step_and_no_charge(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-):
+def test_test_build_refuses_a_missing_python_tree_with_no_step(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     rig, responder = _rig(tmp_path, monkeypatch)
     _missing_python(rig, responder)
     result = rig.call('test_build', {})
     assert result['status'] == 'refused', result
     assert result['message'] == f'gen/proto/python is missing or empty: {TEST_GENERATE_HINT}'
-    assert _argvs(rig) == [] and _charges_left(rig) == BUDGET
+    assert _argvs(rig) == []
+    assert_no_call_counter(rig)
 
 
 def test_test_build_does_not_need_the_typescript_tree(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
@@ -411,7 +403,8 @@ def test_test_build_refuses_a_bad_python_stamp_naming_make_proto(
     assert result['status'] == 'refused', result
     assert result['message'] == f'{reason}: {TEST_GENERATE_HINT}'
     assert TEST_GENERATE_HINT == 'run make proto in the root checkout'
-    assert _argvs(rig) == [] and _charges_left(rig) == BUDGET
+    assert _argvs(rig) == []
+    assert_no_call_counter(rig)
 
 
 @pytest.mark.parametrize('ts_stamp', [None, b'0' * 64 + b'\n'], ids=['ts stamp missing', 'ts stamp wrong'])
@@ -427,21 +420,32 @@ def test_test_build_does_not_read_the_typescript_stamp(
     assert rig.call('test_build', {})['status'] == 'ok'
 
 
-def test_test_build_refuses_on_a_spent_budget_before_any_step(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    rig, responder = _rig(tmp_path, monkeypatch)
-    _spent_budget(rig, responder)
-    result = rig.call('test_build', {})
-    assert result['status'] == 'refused' and result['message'] == BUDGET_REFUSAL, result
-    assert _argvs(rig) == []
+def test_call_volume_admitted_test_builds_each_run_the_build_and_none_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """No volume limit (ADR tj-4rr0la addendum 33): past the withdrawn 12 an hour, every call still builds."""
+    rig, _ = _rig(tmp_path, monkeypatch)
+    build = build_argv(rig.layout.repo_host_path)
+    for count in range(1, CALL_VOLUME + 1):
+        before = len(rig.docker.steps)
+        result = rig.call('test_build', {})
+        assert result['status'] == 'ok' and result['message'] == BUILD_OK, (count, result)
+        assert result['message'] != OLD_BUDGET_REFUSAL
+        assert [argv for argv in _argvs(rig)[before:] if argv == build] == [build], (count, _argvs(rig)[before:])
+    assert_no_call_counter(rig)
+
+
+def _failing_store_digest(rig: Rig, responder: Responder) -> None:
+    responder.digests['store'] = (1, b'')
 
 
 @pytest.mark.parametrize(
     ('first', 'second', 'answer'),
     [
         (_stale_copy('docker-compose.fake.yaml'), _missing_python, STALE_PREFIX),
-        (_missing_python, _spent_budget, 'gen/proto/python is missing'),
+        (_missing_python, _failing_store_digest, 'gen/proto/python is missing'),
     ],
-    ids=['S6 before freshness', 'freshness before the budget'],
+    ids=['S6 before freshness', 'freshness before the digests'],
 )
 def test_test_build_with_two_checks_failing_the_earlier_one_answers(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, first, second, answer: str
@@ -454,7 +458,7 @@ def test_test_build_with_two_checks_failing_the_earlier_one_answers(
 
 
 @pytest.mark.parametrize('service_name', ['store', 'ingest'])
-def test_a_failed_digest_fails_test_build_before_any_base_or_build_and_is_charged_once(
+def test_a_failed_digest_fails_test_build_before_any_base_or_build(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, service_name: str
 ):
     rig, responder = _rig(tmp_path, monkeypatch)
@@ -464,16 +468,16 @@ def test_a_failed_digest_fails_test_build_before_any_base_or_build_and_is_charge
     assert result['message'] == f'the source digest failed (data {service_name}); nothing was built'
     host = rig.layout.repo_host_path
     assert _argvs(rig) == build_run(host)[: 1 if service_name == 'store' else 2]
-    assert _charges_left(rig) == BUDGET - 1
+    assert_no_call_counter(rig)
 
 
-def test_a_failed_build_answers_failed_and_is_charged_once(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+def test_a_failed_build_answers_failed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     rig, responder = _rig(tmp_path, monkeypatch)
     responder.compose_exit = 1
     result = rig.call('test_build', {})
     assert result['status'] == 'failed', result
     assert result['message'] == 'compose build of the test images failed for the trader_joe_dev project'
-    assert _charges_left(rig) == BUDGET - 1
+    assert_no_call_counter(rig)
 
 
 # ===============================================================================================
@@ -494,7 +498,7 @@ def test_test_up_runs_every_step_in_the_designed_order_and_answers_ok(
     assert result['message'] == UP_OK
     assert _argvs(rig) == up_run(rig.layout.repo_host_path)
     assert all(step.cwd == rig.layout.stack_dir for step in rig.docker.steps)
-    assert _charges_left(rig) == BUDGET - 1
+    assert_no_call_counter(rig)
     assert 'job' not in json.dumps(result).lower()
 
 
@@ -602,9 +606,10 @@ def _parsed_bind_sources(files: tuple[str, ...]) -> tuple[set[str], set[str]]:
     return relative, other
 
 
-# The in-repo binds of base + fake: data_store's two alembic binds (docker-compose.yaml l.86-87) and the
-# fakes (docker-compose.fake.yaml). The data dir is the residual D6 cannot see, as for dev.
-EXPECTED_TEST_BIND_SOURCES = {'server/data/store/alembic.ini', 'server/data/store/migrations', 'tests/fakes'}
+# The in-repo binds of base + fake: the fakes (docker-compose.fake.yaml) alone. data_store's two alembic
+# binds left docker-compose.yaml with bead tj-7zjov1.10, which COPYs the revisions into the image. The
+# data dir is the residual D6 cannot see, as for dev.
+EXPECTED_TEST_BIND_SOURCES = {'tests/fakes'}
 # Every compose file the dev and tools sets load (the D6 pin for DEV_BIND_SOURCES lives in test_dev_guards.py).
 DEV_AND_TOOLS_FILES = (
     'docker-compose.yaml',
@@ -642,21 +647,27 @@ def test_every_in_repo_bind_of_every_compose_file_the_lifecycle_loads_is_checked
     assert test_relative <= set(stack.TEST_BIND_SOURCES), sorted(test_relative - set(stack.TEST_BIND_SOURCES))
 
 
-@pytest.mark.parametrize('source', ['server/data/store/migrations', 'server/data/store/alembic.ini'])
-def test_a_symlinked_alembic_bind_source_refuses_test_up(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, source: str):
-    """The daemon resolves data_store's alembic binds at every start: a link planted there must refuse, as up's does."""
+def test_a_symlink_above_the_fakes_bind_source_refuses_test_up(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """The daemon resolves the fakes bind through every parent: a link planted at tests/ must refuse too.
+
+    Retargeted for bead tj-7zjov1.10: this pinned data_store's alembic.ini and migrations binds, which left
+    docker-compose.yaml when the revisions moved into the image. tests/fakes is the one test bind left; the
+    link at the leaf is UP_REFUSALS' case, so this one covers the parent component on the way to it.
+    """
     rig, _ = _rig(tmp_path, monkeypatch)
-    path = rig.layout.repo / source
-    moved = rig.layout.root / 'moved'
+    path = rig.layout.repo / 'tests'
+    moved = rig.layout.root / 'moved-tests'
     shutil.move(str(path), str(moved))
-    path.symlink_to(moved, target_is_directory=moved.is_dir())
+    path.symlink_to(moved, target_is_directory=True)
     result = rig.call('test_up', {})
-    assert result['status'] == 'refused' and result['message'] == symlink_refusal(source, source), result
-    assert _argvs(rig) == [GUARD] and _charges_left(rig) == BUDGET
+    assert result['status'] == 'refused', result
+    assert result['message'] == symlink_refusal('tests', 'tests/fakes'), result
+    assert _argvs(rig) == [GUARD]
+    assert_no_call_counter(rig)
 
 
 # ===============================================================================================
-# test_up: each refusal runs only the steps before it and charges nothing
+# test_up: each refusal runs only the steps before it
 # ===============================================================================================
 
 
@@ -748,12 +759,11 @@ UP_REFUSALS = {
     'data_ingest:test stamp not hex': (_stamp(1, (0, b'<no value>\n')), _unstamped(1), 7),
     'data_store:test stamp unreadable': (_stamp(0, (1, b'')), _unreadable(0), 6),
     "data_store:test carries data_ingest's stamp": (_stamp(0, (0, f'{INGEST_DIGEST}\n'.encode())), None, 6),
-    'the budget spent': (_spent_budget, BUDGET_REFUSAL, 7),
 }
 
 
 @pytest.mark.parametrize(('breaks', 'message', 'ran'), list(UP_REFUSALS.values()), ids=list(UP_REFUSALS))
-def test_each_test_up_refusal_runs_only_the_steps_before_it_and_charges_nothing(
+def test_each_test_up_refusal_runs_only_the_steps_before_it(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, breaks, message: str | None, ran: int
 ):
     rig, responder = _rig(tmp_path, monkeypatch)
@@ -770,8 +780,7 @@ def test_each_test_up_refusal_runs_only_the_steps_before_it_and_charges_nothing(
         assert result['message'].startswith('STALE: trader_joe_data_store:test'), result
     assert _argvs(rig) == up_run(rig.layout.repo_host_path)[:ran]
     assert DOWN not in _argvs(rig) and not [argv for argv in _argvs(rig) if argv[-len(UP_TAIL) :] == UP_TAIL]
-    if breaks is not _spent_budget:
-        assert _charges_left(rig) == BUDGET, 'a refused call was charged'
+    assert_no_call_counter(rig)
 
 
 def test_a_symlinked_dev_only_bind_source_does_not_refuse_test_up(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
@@ -781,6 +790,10 @@ def test_a_symlinked_dev_only_bind_source_does_not_refuse_test_up(tmp_path: Path
     shutil.move(str(repo / 'server' / 'common'), str(rig.layout.root / 'moved-common'))
     (repo / 'server' / 'common').symlink_to(rig.layout.worktree / 'server' / 'common', target_is_directory=True)
     assert rig.call('test_up', {})['status'] == 'ok'
+
+
+def _failing_base_pull(rig: Rig, responder: Responder) -> None:
+    responder.missing_bases, responder.pull_exit = True, 1
 
 
 UP_PAIRS = {
@@ -794,7 +807,7 @@ UP_PAIRS = {
     'D5 before steering': (_env_file_a_directory, _steering_file, 'is not a regular file'),
     'steering before the images': (_steering_file, _missing(0), 'would steer compose'),
     'the images before the stamps': (_missing(1), _stamp(0, (0, b'\n')), 'is not on the daemon'),
-    'the stamps before the budget': (_stamp(0, (0, b'\n')), _spent_budget, 'CANNOT VERIFY'),
+    'the stamps before the bases': (_stamp(0, (0, b'\n')), _failing_base_pull, 'CANNOT VERIFY'),
 }
 
 
@@ -815,7 +828,8 @@ def test_a_failed_guard_listing_runs_nothing_else(tmp_path: Path, monkeypatch: p
     _stale_copy('docker-compose.fake.yaml')(rig, responder)
     result = rig.call('test_up', {})
     assert result['message'] == 'could not list the containers of project trader_joe_dev, so nothing was changed'
-    assert _argvs(rig) == [GUARD] and _charges_left(rig) == BUDGET
+    assert _argvs(rig) == [GUARD]
+    assert_no_call_counter(rig)
 
 
 # ===============================================================================================
@@ -824,7 +838,7 @@ def test_a_failed_guard_listing_runs_nothing_else(tmp_path: Path, monkeypatch: p
 
 
 @pytest.mark.parametrize('service_name', ['store', 'ingest'])
-def test_a_failed_digest_returns_before_the_stamps_and_the_down_and_charges_nothing(
+def test_a_failed_digest_returns_before_the_stamps_and_the_down(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, service_name: str
 ):
     rig, responder = _rig(tmp_path, monkeypatch)
@@ -833,7 +847,7 @@ def test_a_failed_digest_returns_before_the_stamps_and_the_down_and_charges_noth
     assert result['status'] == 'failed', result
     assert result['message'] == f'the source digest failed (data {service_name}); nothing was stopped or started'
     assert _argvs(rig) == up_run(rig.layout.repo_host_path)[: 4 if service_name == 'store' else 5]
-    assert _charges_left(rig) == BUDGET
+    assert_no_call_counter(rig)
 
 
 def test_a_failed_base_pull_stops_before_the_down(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
@@ -842,7 +856,23 @@ def test_a_failed_base_pull_stops_before_the_down(tmp_path: Path, monkeypatch: p
     result = rig.call('test_up', {})
     assert result['status'] == 'failed' and result['message'].startswith('test_up stopped: '), result
     assert DOWN not in _argvs(rig)
-    assert _charges_left(rig) == BUDGET - 1
+    assert_no_call_counter(rig)
+
+
+def test_call_volume_admitted_test_ups_each_run_the_up_and_none_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """No volume limit (ADR tj-4rr0la addendum 33): past the withdrawn 12 an hour, every call still reaches its up."""
+    rig, _ = _rig(tmp_path, monkeypatch)
+    up = up_argv(rig.layout.repo_host_path)
+    for count in range(1, CALL_VOLUME + 1):
+        before = len(rig.docker.steps)
+        result = rig.call('test_up', {})
+        assert result['status'] == 'ok' and result['message'] == UP_OK, (count, result)
+        assert result['message'] != OLD_BUDGET_REFUSAL
+        ran = _argvs(rig)[before:]
+        assert DOWN in ran and ran[-1] == up, (count, ran)
+    assert_no_call_counter(rig)
 
 
 def test_a_failed_down_starts_nothing(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
@@ -863,7 +893,7 @@ def test_a_failed_up_answers_failed(tmp_path: Path, monkeypatch: pytest.MonkeyPa
         result['message']
         == 'compose up failed for the trader_joe_dev project in test mode; see the steps and call logs'
     )
-    assert _charges_left(rig) == BUDGET - 1
+    assert_no_call_counter(rig)
 
 
 # ===============================================================================================
@@ -908,7 +938,21 @@ def test_the_mode_table_covers_every_state_changing_verb():
     The names carry no dev_ prefix to select by any more (tj-iee6sn.26), so the exclusions are spelled out.
     migrate_status is read-only but guarded (it acts on the mode that is up, tj-iee6sn.10), so it is here.
     """
-    state_changing = set(VERB_SAMPLES) - {'ps', 'logs', 'db_tables', 'http_get', 'run_system_tests', 'seed_dump'}
+    # test_reset (tj-w0rddi) is left out with the suite pair: it has their rails (TEST mode only, the test
+    # directory's mount, the stamps), tested in test_test_reset.py, not this table's guard-only responder.
+    state_changing = set(VERB_SAMPLES) - {
+        'ps',
+        'logs',
+        'db_tables',
+        'http_get',
+        'run_system_tests',
+        'seed_dump',
+        'test_reset',
+        # tj-7zjov1.268: the same, test_reset's rails and more; tested in test_test_service_verbs.py.
+        'test_stop',
+        'test_start',
+        'test_env',
+    }
     assert state_changing == {
         'up',
         'build',
@@ -938,7 +982,7 @@ def test_each_guarded_verb_accepts_exactly_its_modes(
     else:
         assert result['status'] == 'refused' and result['message'] == refusal, result
         assert _argvs(rig) == [GUARD], 'a refusal runs nothing after the guard'
-        assert _charges_left(rig) == BUDGET
+        assert_no_call_counter(rig)
 
 
 @pytest.mark.parametrize('verb', sorted(NO_GUARD))

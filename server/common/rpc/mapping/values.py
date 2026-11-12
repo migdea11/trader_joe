@@ -162,6 +162,26 @@ def _mapping[E: Enum](descriptor: EnumDescriptor, python_type: type[E]) -> EnumM
     return EnumMapping(descriptor=descriptor, python_type=python_type, prefix=prefix)
 
 
+def enum_mapping[E: Enum](descriptor: EnumDescriptor, python_type: type[E]) -> EnumMapping[E]:
+    """Pair a proto enum with its Python mirror, refusing at import a pair that could not round-trip.
+
+    The public door to the same check the market/v1 enums go through, for a contract file that declares
+    enums of its own (store.proto's delivery enums).
+
+    Args:
+        descriptor: The proto enum's descriptor.
+        python_type: The Python enum whose member names equal the proto values, prefix removed.
+
+    Returns:
+        EnumMapping[E]: The mapping, by member name in both directions.
+
+    Raises:
+        ValueError: If the zero is not <ENUM>_UNSPECIFIED, a value lacks the prefix, or the two vocabularies
+            name different members.
+    """
+    return _mapping(descriptor, python_type)
+
+
 ASSET_TYPE: Final = _mapping(enums_pb2.AssetType.DESCRIPTOR, AssetType)
 DATA_SOURCE: Final = _mapping(enums_pb2.DataSource.DESCRIPTOR, DataSource)
 DATA_TYPE: Final = _mapping(enums_pb2.DataType.DESCRIPTOR, DataType)
