@@ -1,4 +1,6 @@
+import functools
 import importlib
+import re
 import uuid
 from collections.abc import Mapping
 from datetime import UTC, datetime
@@ -13,6 +15,7 @@ from starlette.routing import NoMatchFound
 from common.database.postgres_tools import PostgresSessionFactory
 from common.enums.data_stock import DataSource, Granularity, UpdateType
 from common.errors.vocabulary import ExogenousError, Reason
+from common.tests.roots import REPO_ROOT
 from data.store.app.app_depends import get_ingest_submit_client
 from data.store.app.database.database import async_db
 from data.store.app.database.models.ingest_request import IngestRequest
@@ -1210,6 +1213,173 @@ def test_a_guarded_route_answers_401_before_it_validates_anything(address: str, 
         f'and malformed ({response.text}); validation now runs in front of the credential check.'
     )
     assert response.json()['detail'] == INSTANCE_SECRET_REJECTION_DETAIL
+
+
+# ---------------------------------------------------------------------------------------------
+# THE CI STEP "Instance Secret Lifecycle", REPLAYED OFFLINE (tj-7zjov1.381)
+#
+# .github/workflows/trader_joe_testing.yml (System Testing job) recreates data_store with
+# INSTANCE_WRITE_SECRET blank and sends every write route four requests -- no header, an empty
+# header, an arbitrary value and the secret that was valid a minute earlier -- each with
+# Content-Type application/json and, on POST and PATCH, the body {}. Each must answer 401 with the
+# fixed detail, and the body must not carry the former secret. That step needs the stack and runs
+# only in CI, after the whole system suite, so a route that answers 422 there is found late. The
+# cases below send the same requests to the same app, in process.
+#
+# The two cases above leave the secret CONFIGURED and omit the header. These BLANK it, which is the
+# state the step creates and the template ships: a guard that only failed closed when a value was
+# configured would pass both of those and fail the step.
+#
+# THE PATHS ARE THE STEP'S LITERALS, copied, not built from CASES: the point is to send what the
+# step sends, zero UUIDs and DATA_SOURCE_ALPACA_API included. server/common/tests/test_ci_invariants.py
+# pins the list in the workflow; test_the_lifecycle_probes_resolve_to_the_guarded_routes below pins
+# that these nine resolve to exactly GUARDED_ADDRESSES, so a tenth guarded route fails here until the
+# step (and this list) carries it.
+#
+# NOT PROVEN HERE: that compose really blanks the variable in the recreated container, the step's
+# health wait, and its scan of the container logs (uvicorn's access log does not run under
+# TestClient). The caplog assertion covers the application's own log records only.
+# ---------------------------------------------------------------------------------------------
+
+LIFECYCLE_PROBES = (
+    'POST /store/stock/market-activity/LIFECYCLE',
+    'DELETE /store/00000000-0000-0000-0000-000000000000?owner=ci-secret-lifecycle',
+    'POST /internal/asset-data/stock/market-activity',
+    'PATCH /ui/v1/datasets/00000000-0000-0000-0000-000000000000/expiry',
+    'PATCH /ui/v1/datasets/00000000-0000-0000-0000-000000000000/collecting',
+    'DELETE /ui/v1/datasets/00000000-0000-0000-0000-000000000000',
+    'POST /ui/v1/panels',
+    'POST /ui/v1/panels/00000000-0000-0000-0000-000000000000/settings-versions',
+    'POST /ui/v1/panel-sources/DATA_SOURCE_ALPACA_API/settings-versions',
+)
+
+# The step's former secret is the value the stack ran with; the arbitrary one is `openssl rand -hex
+# 32`. Fixtures here, deliberately unlike a real secret, but the same SHAPE as the arbitrary one.
+LIFECYCLE_FORMER_SECRET = 'lifecycle-former-instance-secret-not-real'
+LIFECYCLE_ARBITRARY_SECRET = '0123456789abcdef' * 4
+
+# None is curl with no -H; '' is curl's `-H 'X-Instance-Secret;'`, a header present with no value.
+LIFECYCLE_HEADERS = {
+    'no header': None,
+    'empty header': '',
+    'arbitrary header': LIFECYCLE_ARBITRARY_SECRET,
+    'former secret': LIFECYCLE_FORMER_SECRET,
+}
+
+
+# THE STEP MATCHES BYTES, NOT JSON. It sets want_detail='"detail":"..."' (single quotes: a shell
+# literal, no expansion) and refuses a body unless `[[ "${body}" != *"${want_detail}"* ]]` is false.
+# The quoted operand makes that a plain substring test, so the step depends on how the body is
+# RENDERED -- no space after the colon, these separators, no escaped character -- which a parsed
+# response.json()['detail'] comparison cannot see. Both the literal and the comparison are read from
+# the workflow rather than copied, so the step and this test cannot drift apart silently.
+LIFECYCLE_WORKFLOW = REPO_ROOT / '.github' / 'workflows' / 'trader_joe_testing.yml'
+LIFECYCLE_STEP_COMPARISON = '[[ "${body}" != *"${want_detail}"* ]]'
+
+
+@functools.cache
+def lifecycle_step_want_detail() -> bytes:
+    """The exact bytes the Instance Secret Lifecycle step requires in every 401 body.
+
+    Returns:
+        bytes: The value of the step's single-quoted want_detail assignment, UTF-8 encoded.
+    """
+    workflow = LIFECYCLE_WORKFLOW.read_text(encoding='utf-8')
+    found = re.findall(r"^\s*want_detail='([^']*)'\s*$", workflow, flags=re.MULTILINE)
+    assert len(found) == 1, f'expected one want_detail assignment in {LIFECYCLE_WORKFLOW}, found {found}'
+    assert LIFECYCLE_STEP_COMPARISON in workflow, (
+        f'the step no longer matches with {LIFECYCLE_STEP_COMPARISON}; re-derive how this test must match'
+    )
+    return found[0].encode('utf-8')
+
+
+def lifecycle_address(probe: str) -> str:
+    """Name the one manifest address a literal request of the step falls on.
+
+    Matched against EVERY manifest address, open reads included, so a probe that could also be
+    served by another route is refused here rather than counted for the guarded one. A template
+    segment matches one path segment, as Starlette's default path convertor does.
+
+    Args:
+        probe (str): 'METHOD /path?query', as the step writes it.
+
+    Returns:
+        str: The manifest address, 'METHOD /template'.
+    """
+    method, target = probe.split(' ', 1)
+    path = target.split('?', 1)[0]
+    matching = [
+        address
+        for address in http_addresses()
+        if address.split(' ', 1)[0] == method
+        and re.fullmatch(re.sub(r'\\\{[^/]+?\\\}', '[^/]+', re.escape(mount_prefix() + address.split(' ', 1)[1])), path)
+    ]
+    assert len(matching) == 1, f'{probe} matches {matching}, not exactly one manifest address'
+    return matching[0]
+
+
+def test_the_lifecycle_probes_resolve_to_the_guarded_routes():
+    """The nine requests the step sends land on the nine guarded routes, each once, and no other."""
+    resolved = [lifecycle_address(probe) for probe in LIFECYCLE_PROBES]
+
+    assert sorted(resolved) == sorted(GUARDED_ADDRESSES), (
+        'the Instance Secret Lifecycle step does not probe exactly the guarded write routes: '
+        f'{sorted(set(resolved) ^ set(GUARDED_ADDRESSES))}'
+    )
+
+
+@pytest.mark.parametrize('blank', ['empty', 'unset'])
+@pytest.mark.parametrize('header', list(LIFECYCLE_HEADERS))
+@pytest.mark.parametrize('probe', LIFECYCLE_PROBES)
+def test_a_blank_secret_refuses_every_lifecycle_probe(
+    probe: str,
+    header: str,
+    blank: str,
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+):
+    """The step's request, exactly: 401, the fixed detail, and no secret in the body or a log record.
+
+    'empty' is what the step's sed leaves in the env file; 'unset' is the other reading of a blank
+    the step's own check (`os.environ.get(...)` falsy) accepts.
+
+    Args:
+        probe: 'METHOD /path' as the step writes it.
+        header: Which of the step's four header variants to send.
+        blank: Whether INSTANCE_WRITE_SECRET is set empty or absent.
+        client: The store app with its database and RPC clients replaced.
+        monkeypatch: Blanks the secret over the module's autouse fixture.
+        caplog: Captures the application's log records.
+    """
+    if blank == 'empty':
+        monkeypatch.setenv(INSTANCE_SECRET_ENV_VAR, '')
+    else:
+        monkeypatch.delenv(INSTANCE_SECRET_ENV_VAR, raising=False)
+    method, path = probe.split(' ', 1)
+    headers = {'Content-Type': 'application/json'}
+    if LIFECYCLE_HEADERS[header] is not None:
+        headers[INSTANCE_SECRET_HEADER] = LIFECYCLE_HEADERS[header]
+    content = '{}' if method in ('POST', 'PATCH') else None
+
+    with caplog.at_level('DEBUG'):
+        response = client.request(method, path, headers=headers, content=content)
+
+    assert response.status_code == 401, (
+        f'{method} {path} ({header}, secret {blank}) answered {response.status_code}: {response.text}. '
+        f'The CI step expects 401 here; a 422 means body or path validation ran before the guard.'
+    )
+    assert response.json()['detail'] == INSTANCE_SECRET_REJECTION_DETAIL
+    assert lifecycle_step_want_detail() in response.content, (
+        f'the CI step requires the literal bytes {lifecycle_step_want_detail()!r} in the body, as a '
+        f'substring; the app rendered {response.content!r}'
+    )
+    for value in (LIFECYCLE_FORMER_SECRET, LIFECYCLE_ARBITRARY_SECRET):
+        assert value not in response.text, 'a presented secret reached the response body'
+    assert caplog.records, 'nothing was logged, so the scan below is vacuous'
+    logged = '\n'.join(record.getMessage() for record in caplog.records)
+    for value in (LIFECYCLE_FORMER_SECRET, LIFECYCLE_ARBITRARY_SECRET):
+        assert value not in logged, 'a presented secret reached a log record'
 
 
 @pytest.mark.parametrize('address', unbound_path_addresses())
